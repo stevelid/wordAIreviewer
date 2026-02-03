@@ -1,0 +1,170 @@
+QUICK REFERENCE: Form Control Properties for frmSuggestionPreview
+================================================================
+
+FORM PROPERTIES:
+- Name: frmSuggestionPreview
+- Caption: Review AI Suggestion
+- Width: 460
+- Height: 400
+- StartUpPosition: 0 - Manual (positions on right side of screen)
+- ShowModal: False (allows document scrolling while form is open)
+- KeyPreview: True (IMPORTANT for keyboard shortcuts)
+
+CONTROLS TO ADD (in order from top to bottom):
+================================================================
+
+1. lblProgress (Label)
+   - Name: lblProgress
+   - Caption: Suggestion 1 of 10
+   - Font: Bold, 10pt
+   - TextAlign: 2 - fmTextAlignCenter
+   - Top: 10
+   - Left: 10
+   - Width: 440
+   - Height: 20
+
+2. lblActionType (Label)
+   - Name: lblActionType
+   - Caption: Action: change
+   - Font: Bold, 9pt
+   - Top: 35
+   - Left: 10
+   - Width: 440
+   - Height: 18
+
+3. Label1 (Label)
+   - Caption: Context:
+   - Font: Bold, 9pt
+   - Top: 60
+   - Left: 10
+   - Width: 100
+   - Height: 15
+
+4. txtContext (TextBox)
+   - Name: txtContext
+   - MultiLine: True
+   - ScrollBars: 2 - fmScrollBarsVertical
+   - Locked: True
+   - BackColor: &H00E0E0E0& (light gray)
+   - Top: 78
+   - Left: 10
+   - Width: 440
+   - Height: 80
+
+5. Label2 (Label)
+   - Caption: Target:
+   - Font: Bold, 9pt
+   - Top: 165
+   - Left: 10
+   - Width: 100
+   - Height: 15
+
+6. txtTarget (TextBox)
+   - Name: txtTarget
+   - MultiLine: True
+   - ScrollBars: 2 - fmScrollBarsVertical
+   - Locked: True
+   - BackColor: &H00E0E0E0& (light gray)
+   - Top: 183
+   - Left: 10
+   - Width: 440
+   - Height: 50
+
+7. Label3 (Label)
+   - Caption: Replacement:
+   - Font: Bold, 9pt
+   - Top: 240
+   - Left: 10
+   - Width: 100
+   - Height: 15
+
+8. txtReplace (TextBox)
+   - Name: txtReplace
+   - MultiLine: True
+   - ScrollBars: 2 - fmScrollBarsVertical
+   - Locked: True
+   - BackColor: &H00C0FFC0& (light green - shows it's the new text)
+   - Top: 258
+   - Left: 10
+   - Width: 440
+   - Height: 60
+
+9. Label4 (Label)
+   - Caption: Explanation:
+   - Font: Bold, 9pt
+   - Top: 325
+   - Left: 10
+   - Width: 100
+   - Height: 15
+
+10. txtExplanation (TextBox)
+    - Name: txtExplanation
+    - MultiLine: True
+    - ScrollBars: 2 - fmScrollBarsVertical
+    - Locked: True
+    - BackColor: &H00FFFFC0& (light yellow - highlights the reason)
+    - Top: 343
+    - Left: 10
+    - Width: 440
+    - Height: 70
+
+11. cmdAccept (CommandButton)
+    - Name: cmdAccept
+    - Caption: Accept (A)
+    - Default: True
+    - Top: 425
+    - Left: 10
+    - Width: 75
+    - Height: 28
+
+12. cmdReject (CommandButton)
+    - Name: cmdReject
+    - Caption: Reject (R)
+    - Top: 425
+    - Left: 95
+    - Width: 75
+    - Height: 28
+
+13. cmdSkip (CommandButton)
+    - Name: cmdSkip
+    - Caption: Skip (S)
+    - Top: 425
+    - Left: 180
+    - Width: 75
+    - Height: 28
+
+14. cmdAcceptAll (CommandButton)
+    - Name: cmdAcceptAll
+    - Caption: Accept All
+    - Top: 425
+    - Left: 265
+    - Width: 90
+    - Height: 28
+
+15. cmdStop (CommandButton)
+    - Name: cmdStop
+    - Caption: Stop (ESC)
+    - Cancel: True
+    - Top: 425
+    - Left: 365
+    - Width: 85
+    - Height: 28
+
+================================================================
+TIPS FOR SETTING UP:
+
+1. Use the Properties Window (F4) to set properties precisely
+2. Use the grid and alignment tools to line things up
+3. Test the tab order: Tools > Tab Order (should go Accept > Reject > Skip > Accept All > Stop)
+4. Set form's KeyPreview to True for keyboard shortcuts to work
+5. Color coding helps:
+   - Gray = read-only info
+   - Green = new/replacement text
+   - Yellow = explanation/reason
+
+TESTING:
+- Run ApplyLlmReview_V3
+- Paste test JSON
+- Click Process
+- Form should appear with all fields populated
+- Try keyboard shortcuts: A, R, S, ESC

@@ -1,0 +1,1596 @@
+This file is a merged representation of a subset of the codebase, containing specifically included files, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Only files matching these patterns are included: wordAIreviewer.bas, prompt.txt, frmReviewer.frm, frmJsonInput.frm
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+frmJsonInput.frm
+frmReviewer.frm
+prompt.txt
+wordAIreviewer.bas
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="frmJsonInput.frm">
+VERSION 5.00
+Begin {C62A69F0-16DC-11CE-9E98-00AA00574A4F} frmJsonInput 
+   Caption         =   "Paste LLM Review JSON"
+   ClientHeight    =   6660
+   ClientLeft      =   120
+   ClientTop       =   465
+   ClientWidth     =   5235
+   OleObjectBlob   =   "frmJsonInput.frx":0000
+   StartUpPosition =   1  'CenterOwner
+End
+Attribute VB_Name = "frmJsonInput"
+Attribute VB_GlobalNameSpace = False
+Attribute VB_Creatable = False
+Attribute VB_PredeclaredId = True
+Attribute VB_Exposed = False
+' Code for frmJsonInput UserForm (Version 3)
+Option Explicit
+
+' Public properties to be read by the main module
+Public JsonText As String
+Public IsCancelled As Boolean
+Public UseCaseSensitive As Boolean
+
+' --- Event Handlers for Controls ---
+
+Private Sub cmdProcess_Click()
+    Debug.Print "User clicked: Process"
+    ' User wants to run the review.
+    If Trim(Me.txtJson.value) = "" Then
+        MsgBox "JSON text cannot be empty.", vbExclamation, "Input Required"
+        Exit Sub
+    End If
+    
+    ' --- REFINEMENT: Update UI to show progress ---
+    Me.lblProgress.Caption = "Initializing..."
+    Me.txtJson.Enabled = False
+    Me.chkCaseSensitive.Enabled = False
+    Me.cmdValidate.Enabled = False
+    Me.cmdProcess.Enabled = False
+    DoEvents ' Allow the UI to update
+
+    ' --- Call the main processing logic from the module ---
+    RunReviewProcess Me
+    
+    ' When finished, close the form. The final report will be a MsgBox.
+    Me.Hide
+End Sub
+
+Private Sub cmdCancel_Click()
+    Debug.Print "User clicked: Cancel"
+    Me.IsCancelled = True
+    Me.Hide
+End Sub
+
+Private Sub cmdValidate_Click()
+    Debug.Print "User clicked: Validate"
+    ' --- NEW: Validate JSON without running the full process ---
+    Dim jsonString As String
+    Dim suggestions As Object
+    
+    jsonString = Me.txtJson.value
+    If Trim(jsonString) = "" Then
+        MsgBox "Nothing to validate. The textbox is empty.", vbInformation, "Validation"
+        Exit Sub
+    End If
+    
+    ' Pre-process the string to clean it up
+    jsonString = PreProcessJson(jsonString)
+    
+    ' Attempt to parse
+    On Error GoTo ErrorHandler
+    Set suggestions = LLM_ParseJson(jsonString)
+    On Error GoTo 0 ' Turn off error handling if parse is successful
+    
+    If suggestions Is Nothing Or Not TypeName(suggestions) = "Collection" Then
+        MsgBox "JSON Validation Failed!" & vbCrLf & vbCrLf & "The text is not a valid JSON array. Check for missing brackets, commas, or quotes.", vbCritical, "Validation Failed"
+    Else
+        MsgBox "JSON is valid! Found " & suggestions.Count & " items to process.", vbInformation, "Validation Successful"
+    End If
+    
+    Exit Sub
+
+ErrorHandler:
+    HandleError "cmdValidate_Click", Err
+End Sub
+
+Private Sub UserForm_Activate()
+    Debug.Print "Form activated, setting initial state."
+    ' Set initial state when form loads
+    Me.JsonText = ""
+    Me.IsCancelled = False
+    Me.UseCaseSensitive = False
+    Me.txtJson.value = ""
+    Me.lblProgress.Caption = "Ready"
+End Sub
+
+Private Sub UserForm_QueryClose(Cancel As Integer, CloseMode As Integer)
+    Debug.Print "User clicked form's 'X' button (CloseMode: " & CloseMode & ")"
+    ' Handle the user clicking the "X" button
+    If CloseMode = vbFormControlMenu Then
+        If Not Me.IsCancelled Then
+            cmdCancel_Click
+        End If
+        Cancel = 1 ' Prevent form destruction, just hide it
+    End If
+End Sub
+</file>
+
+<file path="frmReviewer.frm">
+VERSION 5.00
+Begin {C62A69F0-16DC-11CE-9E98-00AA00574A4F} frmReviewer 
+   Caption         =   "AI Review Tool"
+   ClientHeight    =   2025
+   ClientLeft      =   120
+   ClientTop       =   465
+   ClientWidth     =   1800
+   OleObjectBlob   =   "frmReviewer.frx":0000
+   ShowModal       =   0   'False
+   StartUpPosition =   1  'CenterOwner
+End
+Attribute VB_Name = "frmReviewer"
+Attribute VB_GlobalNameSpace = False
+Attribute VB_Creatable = False
+Attribute VB_PredeclaredId = True
+Attribute VB_Exposed = False
+' =========================================================================================
+' === CODE FOR frmReviewer (FINAL VERSION with Grouping, Shortcuts, and Exit Check) =====
+' =========================================================================================
+
+Option Explicit
+
+' This range tracks the currently selected suggestion group.
+Private m_CurrentRange As Range
+' This will store the name of the user who ran the script.
+Private m_ReviewerName As String
+
+
+Private Sub UserForm_Initialize()
+    ' Capture the current user's name when the form is launched.
+    ' All subsequent searches will look for changes made by this specific user.
+    m_ReviewerName = Application.UserName
+    
+    If m_ReviewerName = "" Then
+        MsgBox "Warning: Your user name is not set in Word's options. The review tool may not find any changes.", vbExclamation
+    End If
+    
+    ' Start the search from the beginning of the document.
+    Set m_CurrentRange = ActiveDocument.Content
+    m_CurrentRange.Collapse wdCollapseStart
+End Sub
+
+' --- BUTTON CLICK HANDLERS ---
+Private Sub btnFindNext_Click()
+    FindNextSuggestion
+End Sub
+
+Private Sub btnAccept_Click()
+    ProcessCurrentSuggestion True ' True = Accept
+    FindNextSuggestion
+End Sub
+
+Private Sub btnReject_Click()
+    ProcessCurrentSuggestion False ' False = Reject
+    FindNextSuggestion
+End Sub
+
+Private Sub btnClose_Click()
+    ' This just triggers the form's closing process.
+    ' The actual final check happens in the QueryClose event.
+    Unload Me
+End Sub
+
+' --- NEW: Automatically run the final check when the form is closed ---
+Private Sub UserForm_QueryClose(Cancel As Integer, CloseMode As Integer)
+    ' This event fires whenever the form is about to close, for any reason.
+    ' We call our standalone checking macro from here.
+    FinalCheckForRemainingChanges
+End Sub
+
+
+' --- CORE LOGIC ---
+
+Private Sub FindNextSuggestion()
+    Dim nextGroup As Range
+    ' Find the next group of changes starting after the end of the last group.
+    Set nextGroup = FindNextGroup(m_CurrentRange.End)
+    
+    If nextGroup Is Nothing Then
+        MsgBox "No more suggestions by '" & m_ReviewerName & "' were found.", vbInformation
+        ' Reset to the beginning for the next session
+        Set m_CurrentRange = ActiveDocument.Content
+        m_CurrentRange.Collapse wdCollapseStart
+        Exit Sub
+    End If
+    
+    ' Update our current range to the new group and select it
+    Set m_CurrentRange = nextGroup
+    m_CurrentRange.Select
+    
+    ' Ensure the selection is visible to the user
+    ActiveWindow.ScrollIntoView m_CurrentRange, True
+End Sub
+
+Private Sub ProcessCurrentSuggestion(ByVal Accept As Boolean)
+    If m_CurrentRange Is Nothing Then Exit Sub
+
+    Dim i As Long
+    
+    ' Disable screen updates for a flicker-free, faster experience
+    Application.ScreenUpdating = False
+    On Error Resume Next ' In case an item is deleted out of sequence
+
+    ' --- Process Revisions that overlap with the group ---
+    For i = ActiveDocument.Revisions.Count To 1 Step -1
+        With ActiveDocument.Revisions(i)
+            If .Author = m_ReviewerName And RangesOverlap(.Range, m_CurrentRange) Then
+                If Accept Then .Accept Else .Reject
+            End If
+        End With
+    Next i
+
+    ' --- Process Comments that overlap with the group ---
+    For i = ActiveDocument.Comments.Count To 1 Step -1
+        With ActiveDocument.Comments(i)
+            If .Author = m_ReviewerName And RangesOverlap(.Range, m_CurrentRange) Then
+                .Delete ' Comments are deleted whether you accept or reject
+            End If
+        End With
+    Next i
+
+    Application.ScreenUpdating = True
+    On Error GoTo 0
+End Sub
+
+
+' --- HELPER FUNCTIONS for Grouping and Finding ---
+
+Private Function FindNextGroup(ByVal startPos As Long) As Range
+    ' Finds the EARLIEST next revision or comment, then expands it to a full group.
+    Dim bestPos As Long: bestPos = -1
+    Dim candidateRange As Range
+    Dim rev As Revision, com As Comment
+
+    ' Find the earliest revision after the start position
+    For Each rev In ActiveDocument.Revisions
+        If rev.Author = m_ReviewerName And rev.Range.Start >= startPos Then
+            If bestPos = -1 Or rev.Range.Start < bestPos Then
+                bestPos = rev.Range.Start
+                Set candidateRange = rev.Range.Duplicate
+            End If
+        End If
+    Next rev
+
+    ' Find the earliest comment after the start position (and see if it's earlier than the revision)
+    For Each com In ActiveDocument.Comments
+        If com.Author = m_ReviewerName And com.Range.Start >= startPos Then
+            If bestPos = -1 Or com.Range.Start < bestPos Then
+                bestPos = com.Range.Start
+                Set candidateRange = com.Range.Duplicate
+            End If
+        End If
+    Next com
+
+    ' If we found a candidate, expand it to include its neighbors.
+    If Not candidateRange Is Nothing Then
+        Set FindNextGroup = ExpandToGroup(candidateRange)
+    End If
+End Function
+
+Private Function ExpandToGroup(ByVal seedRange As Range) As Range
+    ' Expands a given range to include all adjacent/overlapping revisions and comments by the same author.
+    Dim groupRange As Range: Set groupRange = seedRange.Duplicate
+    Dim hasChanged As Boolean
+    Dim rev As Revision, com As Comment
+    
+    Do
+        hasChanged = False
+        ' Check all revisions to see if they should be part of the group
+        For Each rev In ActiveDocument.Revisions
+            If rev.Author = m_ReviewerName Then
+                ' If a revision is adjacent or overlapping...
+                If rev.Range.Start <= groupRange.End + 1 And rev.Range.End >= groupRange.Start - 1 Then
+                    ' ...then expand our group range to include it.
+                    If rev.Range.Start < groupRange.Start Then groupRange.Start = rev.Range.Start: hasChanged = True
+                    If rev.Range.End > groupRange.End Then groupRange.End = rev.Range.End: hasChanged = True
+                End If
+            End If
+        Next rev
+        
+        ' Do the same for all comments
+        For Each com In ActiveDocument.Comments
+            If com.Author = m_ReviewerName Then
+                If com.Range.Start <= groupRange.End + 1 And com.Range.End >= groupRange.Start - 1 Then
+                    If com.Range.Start < groupRange.Start Then groupRange.Start = com.Range.Start: hasChanged = True
+                    If com.Range.End > groupRange.End Then groupRange.End = com.Range.End: hasChanged = True
+                End If
+            End If
+        Next com
+    Loop While hasChanged ' Keep looping until the group stops growing
+    
+    Set ExpandToGroup = groupRange
+End Function
+
+Private Function RangesOverlap(ByVal rangeA As Range, ByVal rangeB As Range) As Boolean
+    ' Returns True if two ranges touch or overlap.
+    If rangeA Is Nothing Or rangeB Is Nothing Then Exit Function
+    RangesOverlap = (rangeA.Start <= rangeB.End) And (rangeA.End >= rangeB.Start)
+End Function
+</file>
+
+<file path="prompt.txt">
+**Role and Goal:**
+You are an expert technical document editor. Your task is to analyze the provided text and identify all issues, from simple typos to major structural problems. Your goal is to produce a machine-readable JSON array of corrections that can rebuild and reformat the document.
+
+**Primary Directive:**
+Generate a single, valid JSON array of objects as your response. Do not include any introductory text, explanations, or summaries outside of the JSON structure.
+
+---
+**JSON Object Structure (Choose one per issue):**
+
+**1. Simple Action (for single changes)**
+Use this for a single, straightforward correction.
+*   `action`: The type of change (e.g., `"change"`, `"comment"`).
+*   `context`: The exact text to locate the area of the change.
+*   `target`: The specific text within the `context` to be changed. Can be `""` if the action applies to the whole context.
+*   `replace`: The new text or style name.
+*   `explanation`: A description of the change.
+
+**2. Compound Action (for multiple changes in one location)**
+Use this when you need to perform several actions on the same `context` (e.g., changing a heading's text AND applying a style).
+*   `context`: The single, overarching text to locate the area for all changes.
+*   `explanation`: A summary description for the entire group of changes.
+*   `actions`: An array of action objects to be performed in order. Each object contains:
+    *   `action`: The type of change.
+    *   `target`: The specific text within the `context`.
+    *   `replace`: The new text or style name.
+    *   (Optional) `explanation`: A specific note for this sub-action.
+
+---
+**Action Types and Rules:**
+
+1.  **`"change"`:** For simple text replacement (spelling, grammar).
+    *   `replace` field: Contains the new text.
+    *   Use the character formatting rules below for sub/sup, bold, italic.
+
+2.  **`"comment"`:** For complex logical or methodological issues that need human review.
+    *   The comment is always applied to the entire `context` block. The `target` field is ignored for this action.
+    *   `replace` field: Must be `""`.
+    *   `explanation` field: Contains the full text for the comment.
+
+3.  **`"replace_with_table"`:** For converting poorly structured text into a clean, formatted table.
+    *   `context` field: The entire block of text that should be replaced by the table.
+    *   `target` field: `""`.
+    *   `replace` field: A valid Markdown-formatted table as a single string.
+
+4.  **`"apply_heading_style"`:** For applying a Word paragraph style.
+    *   `context` field: The full text of the heading.
+    *   `target` field: `""`.
+    *   `replace` field: The name of the style to apply (e.g., "Heading 1", "Heading 2").
+
+**Character Formatting Rules (for the "change" action):**
+When replacing text, use the following HTML-style tags for formatting.
+*   Subscript: `<sub>...</sub>` (e.g., `L<sub>Aeq</sub>`)
+*   Superscript: `<sup>...</sup>` (e.g., `m<sup>2</sup>`)
+*   Italic: `<i>...</i>`
+*   Bold: `<b>...</b>`
+
+---
+**CRITICAL RULE: AVOIDING UNNECESSARY FORMATTING CORRECTIONS**
+
+The text you are reviewing is plain text converted from a formatted document. You cannot see the original formatting. Therefore, you **MUST NOT** suggest a change if the *only* correction is to add character formatting (sub, sup, bold, italic) to a term that is otherwise spelled and capitalized correctly. Only apply formatting as part of a fix for a genuine error (like a typo or a factual correction).
+
+---
+**Constraint Checklist & Final Rules:**
+1.  **JSON Only:** The entire output must be a single, valid JSON array.
+2.  **Action Rules:** Follow the rules for the `replace` field for each `action` type.
+3.  **Context is Verbatim:** The `context` string must be an exact copy.
+4.  **Avoid Cosmetic Formatting:** Do not suggest formatting-only changes to correct terms.
+5.  **Use Standard Characters Only:** Use standard ASCII quotes (`"`) and characters. No smart quotes.
+6.  **Order:** The objects in the main JSON array must be in the order they appear in the original text to allow search and find.
+
+**High-Quality Examples:**
+
+**Example 1: Simple Text Change**
+```json
+{
+  "action": "change",
+  "context": "The results indicates that the garden level is exceeded.",
+  "target": "results indicates",
+  "replace": "results indicate",
+  "explanation": "Grammar: Subject-verb agreement error. 'Results' is plural."
+}
+```
+
+**Example 2: Simple Table Replacement**
+```json
+{
+  "action": "replace_with_table",
+  "context": "Location, Criterion, Predicted Level\nFacade of House A, 45dB LAeq, 42dB LAeq\nGarden of House B, 40dB LAeq, 41dB LAeq",
+  "target": "",
+  "replace": "| Assessment Location | Criterion dB L<sub>Aeq</sub> | Predicted dB L<sub>Aeq</sub> |\n|---|---|---|\n| Facade of House A | 45 | 42 |\n| Garden of House B | 40 | 41 |",
+  "explanation": "Converting comma-separated text into a structured, clear table."
+}
+```
+
+**Example 3: Compound Action (Style and Text Change)**
+```json
+{
+  "context": "5.1 Results",
+  "explanation": "Applying heading style and correcting typo.",
+  "actions": [
+    {
+      "action": "apply_heading_style",
+      "target": "",
+      "replace": "Heading 1"
+    },
+    {
+      "action": "change",
+      "target": "Results",
+      "replace": "Key Results"
+    }
+  ]
+}
+```
+
+**Example 4: Compound Action (Change and Comment)**
+```json
+{
+  "context": "The device is misconfigured, which poses a security risk.",
+  "explanation": "Correcting typo and adding a comment for human review.",
+  "actions": [
+    {
+      "action": "change",
+      "target": "misconfigured",
+      "replace": "mis-configured"
+    },
+    {
+      "action": "comment",
+      "target": "",
+      "replace": "",
+      "explanation": "Please verify the nature of this security risk and cite the relevant security policy."
+    }
+  ]
+}
+```
+
+Final Instruction:
+Review the following document text and provide your complete findings in the specified JSON format.
+[PASTE YOUR FULL DOCUMENT TEXT HERE]
+</file>
+
+<file path="wordAIreviewer.bas">
+Const LLM_REVIEWER_NAME As String = "LLM Reviewer"
+    Const LLM_REVIEWER_INITIALS As String = "AI"
+
+    Private Const PARSE_SUCCESS As Long = 0
+    Private Const PARSE_UNEXPECTED_END_OF_INPUT As Long = 1
+    Private Const PARSE_INVALID_CHARACTER As Long = 2
+    Private Const PARSE_INVALID_JSON_TYPE As Long = 3
+    Private Const PARSE_INVALID_NUMBER As Long = 4
+    Private Const PARSE_INVALID_KEY As Long = 5
+    Private Const PARSE_INVALID_ESCAPE_CHARACTER As Long = 6
+
+    Private p_Json As String
+    Private p_Index As Long
+    Private p_ParseError As Long
+
+Option Explicit
+
+' VBA Module to Apply LLM Review Suggestions (Version 3 - Production)
+'
+' REFINEMENTS:
+' - Sets a distinct "AI Reviewer" identity for all changes.
+' - Anchors comments to the full context for better visibility.
+' - Pre-processes JSON to handle common errors (smart quotes, trailing commas).
+' - UI now provides a progress indicator and validation.
+' - Case sensitivity is now a user-configurable option.
+
+' Always returns a new Scripting.Dictionary without requiring a reference
+
+Private Function NewDictionary() As Object
+    Set NewDictionary = CreateObject("Scripting.Dictionary")
+End Function
+
+' =========================================================================================
+
+' === MAIN SUBROUTINE TO RUN ==============================================================
+
+' =========================================================================================
+
+Sub ApplyLlmReview_V3()
+
+    ' This sub now only serves to launch the UserForm.
+
+    ' The form's code-behind now controls the workflow.
+
+    Dim inputForm As New frmJsonInput
+    Debug.Print vbCrLf & "================ RUN START: " & Now() & " ================"
+    inputForm.Show vbModal
+    Unload inputForm
+End Sub
+
+' =========================================================================================
+
+' === CORE WORKFLOW (Called by the Form) ==================================================
+
+' =========================================================================================
+
+Sub RunReviewProcess(ByVal TheForm As frmJsonInput)
+    Dim jsonString As String
+    Dim suggestions As Object
+    Dim startTime As Single
+    Debug.Print "Starting RunReviewProcess"
+
+    ' --- Store original user details ---
+
+'    Dim originalUserName As String, originalUserInitials As String
+
+'    originalUserName = Application.UserName
+
+'    originalUserInitials = Application.UserInitials
+
+    ' --- Store original Track Revisions state ---
+
+    Dim originalTrackRevisions As Boolean
+    originalTrackRevisions = ActiveDocument.TrackRevisions
+
+    ' --- Counters for the final report ---
+
+    Dim successCount As Long, notFoundCount As Long, errorCount As Long
+    Dim totalCount As Long
+    Dim notFoundLog As String, errorLog As String
+    On Error GoTo FinalCleanup ' Ensure original settings are always restored
+    startTime = Timer
+
+    ' --- 1. Get and Pre-Process JSON from the form ---
+
+    Debug.Print "Preprocessing JSON..."
+    jsonString = PreProcessJson(TheForm.txtJson.value)
+
+    ' --- 2. Parse the JSON ---
+
+    Debug.Print "JSON head: " & Left$(jsonString, 200)
+    Debug.Print "Parsing JSON now..."
+    On Error Resume Next ' temporarily catch errors from the parser call
+    Set suggestions = LLM_ParseJson(jsonString)
+    If Err.Number <> 0 Then
+        Debug.Print "Parser call failed. Err " & Err.Number & ": " & Err.Description
+        On Error GoTo FinalCleanup ' restore main handler
+        GoTo FinalCleanup
+    End If
+
+    On Error GoTo FinalCleanup ' restore main handler
+    If suggestions Is Nothing Or Not TypeName(suggestions) = "Collection" Then
+        Debug.Print "INFO: Failed to parse JSON. Please validate the format first."
+        MsgBox "Failed to parse JSON. Please validate the format first.", vbCritical, "JSON Error"
+        GoTo FinalCleanup
+    End If
+
+    totalCount = suggestions.Count
+    Debug.Print "Found " & totalCount & " suggestions to process."
+
+    ' --- 3. NEW: Set AI Reviewer Identity ---
+
+'    Application.UserName = LLM_REVIEWER_NAME
+
+'    Application.UserInitials = LLM_REVIEWER_INITIALS
+
+    ActiveDocument.TrackRevisions = True
+
+    ' --- 4. Process each suggestion sequentially ---
+
+    Dim searchRange As Range
+    Set searchRange = ActiveDocument.Content
+    Dim suggestion As Object
+    Dim i As Long
+    i = 1
+    For Each suggestion In suggestions
+
+        ' --- NEW: Update progress indicator on the form ---
+
+        Debug.Print "  - Processing item " & i & "/" & totalCount & "..."
+        TheForm.lblProgress.Caption = "Processing " & i & " of " & totalCount & "..."
+        DoEvents
+
+        ' --- REFACTORED LOGIC ---
+
+        Err.Clear
+        On Error Resume Next ' Isolate errors to a single item
+        Dim processedOk As Boolean
+        processedOk = ProcessSuggestion(searchRange, suggestion, CBool(TheForm.chkCaseSensitive.value))
+        If Err.Number <> 0 Then
+
+            ' An error occurred inside ProcessSuggestion
+
+            errorCount = errorCount + 1
+            errorLog = errorLog & vbCrLf & "- Context: '" & GetSuggestionContextText(suggestion) & "' (Error: " & Err.Description & ")"
+            Err.Clear
+        ElseIf processedOk Then
+
+            ' The function executed successfully and found/processed the item
+
+            successCount = successCount + 1
+        Else
+
+            ' The function executed successfully but did not find the context
+
+            notFoundCount = notFoundCount + 1
+            notFoundLog = notFoundLog & vbCrLf & "- '" & GetSuggestionContextText(suggestion) & "'"
+        End If
+
+        On Error GoTo FinalCleanup ' Restore the main error handler
+        i = i + 1
+    Next suggestion
+
+    ' --- 5. Display the final report ---
+
+    Dim report As String
+    report = "LLM Review Processing Complete!" & vbCrLf & vbCrLf
+    report = report & "Summary:" & vbCrLf
+    report = report & "  - Total Suggestions: " & totalCount & vbCrLf
+    report = report & "  - Successfully Applied: " & successCount & vbCrLf
+    report = report & "  - Context Not Found: " & notFoundCount & vbCrLf
+    report = report & "  - Errors During Processing: " & errorCount & vbCrLf
+    report = report & "  - Duration: " & Format(Timer - startTime, "0.0") & " seconds" & vbCrLf
+    If notFoundCount > 0 Then report = report & vbCrLf & "The following contexts could not be found:" & notFoundLog
+    If errorCount > 0 Then report = report & vbCrLf & "The following items caused errors:" & errorLog
+    Debug.Print "--- FINAL REPORT ---" & vbCrLf & report
+    report = report & vbCrLf & vbCrLf & "Do you want to begin reviewing the changes now?"
+
+    ' Hide the input form before showing the next message box
+
+    TheForm.Hide
+    userResponse = MsgBox(report, vbQuestion + vbYesNo, "Processing Complete")
+    If userResponse = vbYes Then
+
+        ' If the user clicks "Yes", launch the review tool.
+
+        ' The cleanup will still run after this call.
+
+        StartAiReview
+    End If
+
+FinalCleanup:
+
+    ' --- 6. ALWAYS restore original user settings ---
+
+'    Application.UserName = originalUserName
+
+'    Application.UserInitials = originalUserInitials
+
+    ActiveDocument.TrackRevisions = originalTrackRevisions
+    If Err.Number <> 0 Then
+        HandleError "RunReviewProcess", Err
+    End If
+
+End Sub
+
+' =========================================================================================
+
+' === GENERIC ERROR HANDLER ===============================================================
+
+' =========================================================================================
+
+Public Sub HandleError(ByVal procedureName As String, ByVal errSource As ErrObject)
+
+    ' Provides a detailed, consistent error message and logs to the Immediate Window.
+
+    Dim msg As String
+    msg = "An unexpected error occurred in: " & procedureName & vbCrLf & vbCrLf
+    msg = msg & "Error Number: " & errSource.Number & vbCrLf
+    msg = msg & "Description: " & errSource.Description & vbCrLf & vbCrLf
+    msg = msg & "The macro will now stop."
+
+    ' --- NEW: Output to Immediate Window for easy copy/paste ---
+
+    Debug.Print "--- ERROR --- " & Now() & " ---"
+    Debug.Print "Procedure: " & procedureName
+    Debug.Print "Error #: " & errSource.Number
+    Debug.Print "Description: " & errSource.Description
+    Debug.Print "---------------------------------"
+    MsgBox msg, vbCritical, "Runtime Error in " & procedureName
+
+    ' Optional: Uncomment the line below to automatically break at the error location
+
+    ' when debugging from the VBA editor.
+
+    ' Stop
+
+End Sub
+
+' =========================================================================================
+
+' === CORE LOGIC AND HELPERS ==============================================================
+
+' =========================================================================================
+
+Private Function HasDictionaryKey(ByVal dict As Object, ByVal keyName As String) As Boolean
+    On Error GoTo CleanFail
+    HasDictionaryKey = False
+    If dict Is Nothing Then Exit Function
+    If TypeName(dict) = "Collection" Then Exit Function
+    If TypeName(dict) = "Dictionary" Or TypeName(dict) = "Scripting.Dictionary" Then
+        If dict.Exists(keyName) Then HasDictionaryKey = True
+        Exit Function
+    End If
+    If dict.Exists(keyName) Then HasDictionaryKey = True
+    Exit Function
+CleanFail:
+    HasDictionaryKey = False
+End Function
+
+Private Function GetSuggestionContextText(ByVal suggestion As Object) As String
+    On Error GoTo CleanFail
+    GetSuggestionContextText = "<missing context>"
+    If suggestion Is Nothing Then Exit Function
+    If TypeName(suggestion) = "Collection" Then Exit Function
+    If HasDictionaryKey(suggestion, "context") Then
+        Dim ctxValue As Variant
+        ctxValue = suggestion("context")
+        If IsNull(ctxValue) Then
+            GetSuggestionContextText = "<missing context>"
+        Else
+            GetSuggestionContextText = CStr(ctxValue)
+        End If
+    End If
+    Exit Function
+CleanFail:
+    GetSuggestionContextText = "<context error>"
+End Function
+
+Private Function ProcessSuggestion(ByRef searchRange As Range, ByVal suggestion As Object, ByVal matchCase As Boolean) As Boolean
+    On Error GoTo ErrorHandler
+    
+    If TypeName(suggestion) = "Collection" Then
+        Err.Raise vbObjectError + 509, "ProcessSuggestion", "Each suggestion must be a JSON object, not an array."
+    End If
+    
+    If Not HasDictionaryKey(suggestion, "context") Then
+        Err.Raise vbObjectError + 510, "ProcessSuggestion", "Suggestion is missing the required 'context' field."
+    End If
+
+    Dim context As String
+    context = suggestion("context")
+    
+    Dim contextForSearch As String
+    contextForSearch = NormalizeForDocument(context)
+
+    ' Find the main context range just once.
+    Dim contextRange As Range
+    Set contextRange = FindLongString(contextForSearch, searchRange, matchCase)
+
+    If contextRange Is Nothing Then
+        Debug.Print "  - RESULT: Context '" & Left(context, 100) & "...' not found in the remaining document."
+        ProcessSuggestion = False
+        Exit Function
+    End If
+    Debug.Print "  - RESULT: Context anchor found at position " & contextRange.Start
+
+    ' Now, decide which kind of suggestion this is.
+    If suggestion.Exists("actions") Then
+        ' === COMPOUND ACTION PATH ===
+        Debug.Print "  - Processing as Compound Action..."
+        Dim subActions As Object
+        Set subActions = suggestion("actions")
+
+        If TypeName(subActions) <> "Collection" Then
+            Err.Raise vbObjectError + 511, "ProcessSuggestion", "The 'actions' field must be an array of sub-actions."
+        End If
+        If subActions.Count = 0 Then
+            Err.Raise vbObjectError + 515, "ProcessSuggestion", "The 'actions' array must contain at least one sub-action."
+        End If
+
+        Dim actionObject As Object
+        For Each actionObject In subActions
+            ' Execute each sub-action, passing in the main context range as the boundary.
+            Call ExecuteSingleAction(contextRange, actionObject, suggestion, matchCase)
+        Next actionObject
+        
+    Else
+        ' === SINGLE ACTION PATH (BACKWARDS COMPATIBILITY) ===
+        Debug.Print "  - Processing as Single Action..."
+        Call ExecuteSingleAction(contextRange, suggestion, suggestion, matchCase)
+    End If
+
+    ' If we get here without an error, it was successful.
+    ' Advance the main search range PAST the context we just processed.
+    searchRange.Start = contextRange.End
+    ProcessSuggestion = True
+    Debug.Print "-> SUCCESS: Suggestion block applied for context '" & Left(context, 50) & "...'"
+    Exit Function
+
+ErrorHandler:
+    ' Errors from ExecuteSingleAction will bubble up and be caught here.
+    HandleError "ProcessSuggestion", Err
+    ProcessSuggestion = False
+End Function
+
+Private Sub ExecuteSingleAction(ByVal overallContextRange As Range, ByVal actionObject As Object, ByVal topLevelSuggestion As Object, ByVal matchCase As Boolean)
+    On Error GoTo ErrorHandler
+    
+    Dim target As String, action As String, replaceText As String, explanation As String
+    Dim actionRange As Range
+    Dim targetStyle As Style
+    Dim styleLookupError As Long
+    Dim newTable As Table
+    Dim actionValue As Variant, targetValue As Variant, replaceValue As Variant, explanationValue As Variant
+    
+    ' 1. Extract details from the actionObject
+    If Not actionObject.Exists("action") Then
+        Err.Raise vbObjectError + 512, "ExecuteSingleAction", "Sub-action is missing the required 'action' field."
+    End If
+
+    actionValue = actionObject("action")
+    If IsNull(actionValue) Then
+        Err.Raise vbObjectError + 512, "ExecuteSingleAction", "Sub-action 'action' value cannot be Null."
+    End If
+    action = Trim$(CStr(actionValue))
+    If Len(action) = 0 Then
+        Err.Raise vbObjectError + 512, "ExecuteSingleAction", "Sub-action 'action' value cannot be empty."
+    End If
+
+    If actionObject.Exists("target") Then
+        targetValue = actionObject("target")
+        If IsNull(targetValue) Then
+            target = ""
+        Else
+            target = CStr(targetValue)
+        End If
+    Else
+        target = ""
+    End If
+
+    If actionObject.Exists("replace") Then
+        replaceValue = actionObject("replace")
+        If IsNull(replaceValue) Then
+            replaceText = ""
+        Else
+            replaceText = CStr(replaceValue)
+        End If
+    Else
+        replaceText = ""
+    End If
+
+    If actionObject.Exists("explanation") Then
+        explanationValue = actionObject("explanation")
+    ElseIf HasDictionaryKey(topLevelSuggestion, "explanation") Then
+        explanationValue = topLevelSuggestion("explanation")
+    Else
+        explanationValue = ""
+    End If
+    If IsNull(explanationValue) Then
+        explanation = ""
+    Else
+        explanation = CStr(explanationValue)
+    End If
+
+    ' 2. Define the Action Range based on the target
+    If target <> "" Then
+        Dim targetForSearch As String
+        targetForSearch = NormalizeForDocument(target)
+        
+        ' IMPORTANT: Search for the target ONLY within the overallContextRange
+        Set actionRange = FindLongString(targetForSearch, overallContextRange, matchCase)
+        
+        If actionRange Is Nothing Then
+            Err.Raise vbObjectError + 517, "ExecuteSingleAction", "Target '" & target & "' not found within its context."
+        End If
+    Else
+        ' If no target, the action range IS the whole context range
+        Set actionRange = overallContextRange.Duplicate
+    End If
+    
+    ' 3. Handle context located inside a table cell
+    If actionRange.Information(wdWithInTable) Then
+        Set actionRange = actionRange.Cells(1).Range
+        actionRange.End = actionRange.End - 1 ' Trim end-of-cell marker
+        Debug.Print "Adjusted for table cell. New range: " & actionRange.Start & "-" & actionRange.End
+    End If
+
+    ' 4. Perform the specified action
+    Select Case LCase(action)
+        Case "change"
+            Debug.Print "Action 'change': Replacing '" & actionRange.Text & "' with '" & replaceText & "'"
+            ApplyFormattedReplacement actionRange, replaceText
+            If explanation <> "" Then
+                ActiveDocument.Comments.Add Range:=actionRange, Text:="AI Suggestion: " & explanation
+            End If
+
+        Case "comment"
+            ' Special case: a comment action always applies to the OVERALL context range.
+            If Len(Trim$(explanation)) = 0 Then
+                Err.Raise vbObjectError + 516, "ExecuteSingleAction", "Comment actions require an explanation."
+            End If
+            Debug.Print "Action 'comment': Adding comment to '" & overallContextRange.Text & "'"
+            ActiveDocument.Comments.Add Range:=overallContextRange, Text:=explanation
+            
+        Case "apply_heading_style"
+            Debug.Print "Action 'apply_heading_style': Applying style '" & replaceText & "' to '" & actionRange.Text & "'"
+            If Len(Trim$(replaceText)) = 0 Then
+                Err.Raise vbObjectError + 518, "ExecuteSingleAction", "Heading style actions require a style name in the 'replace' field."
+            End If
+            replaceText = Trim$(replaceText)
+            Err.Clear
+            On Error Resume Next ' Temporarily handle missing style error
+            Set targetStyle = ActiveDocument.Styles(replaceText)
+            styleLookupError = Err.Number
+            On Error GoTo ErrorHandler ' Restore main handler
+            If styleLookupError <> 0 Or targetStyle Is Nothing Then
+                Err.Raise vbObjectError + 513, "ExecuteSingleAction", "Style '" & replaceText & "' not found in the document."
+            End If
+
+            actionRange.Style = targetStyle
+            If explanation <> "" Then
+                ActiveDocument.Comments.Add Range:=actionRange, Text:="AI Suggestion: " & explanation
+            End If
+
+        Case "replace_with_table"
+            Debug.Print "Action 'replace_with_table': Replacing content with a table."
+            If Len(Trim$(replaceText)) = 0 Then
+                Err.Raise vbObjectError + 519, "ExecuteSingleAction", "Table actions require markdown content in the 'replace' field."
+            End If
+            Set newTable = ConvertMarkdownToTable(actionRange, replaceText)
+            If newTable Is Nothing Then
+                Err.Raise vbObjectError + 521, "ExecuteSingleAction", "Markdown table conversion failed or returned no data."
+            End If
+
+            Set actionRange = newTable.Range ' Important: update actionRange to the new table
+            If explanation <> "" Then
+                ActiveDocument.Comments.Add Range:=actionRange, Text:="AI Suggestion: " & explanation
+            End If
+
+        Case Else
+            Err.Raise vbObjectError + 514, "ExecuteSingleAction", "Unsupported action type: '" & action & "'"
+    End Select
+    
+    Exit Sub ' Success
+    
+ErrorHandler:
+    ' Let the error bubble up to the caller (ProcessSuggestion) to be handled there.
+    Err.Raise Err.Number, "ExecuteSingleAction: " & Err.Source, Err.Description
+End Sub
+
+Private Sub pv_EatWhitespace()
+    On Error GoTo ErrorHandler
+
+'    Debug.Print "    >> pv_EatWhitespace (start index=" & p_Index & ")"
+
+    Do While p_Index <= Len(p_Json)
+        Select Case Mid$(p_Json, p_Index, 1)
+            Case " ", vbCr, vbLf, vbTab
+                p_Index = p_Index + 1
+            Case Else
+                Exit Do
+        End Select
+
+    Loop
+
+'    Debug.Print "    << pv_EatWhitespace (end index=" & p_Index & ")"
+
+    Exit Sub
+ErrorHandler:
+    HandleError "pv_EatWhitespace", Err
+End Sub
+
+Private Function pv_ParseObject() As Object
+    On Error GoTo ErrorHandler
+    Dim dict As Object
+    Set dict = NewDictionary()
+    p_Index = p_Index + 1 ' skip "{"
+    Do
+        pv_EatWhitespace
+        If p_Index > Len(p_Json) Then
+            p_ParseError = PARSE_UNEXPECTED_END_OF_INPUT
+            Exit Function
+        End If
+
+        Dim NextChar As String
+        NextChar = Mid$(p_Json, p_Index, 1)
+        If NextChar = "}" Then
+            p_Index = p_Index + 1
+            Exit Do
+        End If
+
+        Dim Key As String
+        Key = pv_ParseString()
+        If p_ParseError <> PARSE_SUCCESS Then Exit Function
+
+'        Debug.Print "       object: key='" & Key & "' at index=" & p_Index
+
+        pv_EatWhitespace
+
+'        Debug.Print "       object: expecting ':' got '" & Mid$(p_Json, p_Index, 1) & "' at index=" & p_Index
+
+        If Mid$(p_Json, p_Index, 1) <> ":" Then
+            p_ParseError = PARSE_INVALID_CHARACTER
+            Exit Function
+        End If
+
+        p_Index = p_Index + 1
+        Dim vVal As Variant
+
+'        Debug.Print "       object: parsing value for key '" & Key & "' at index=" & p_Index
+
+        llm_ParseValue vVal
+        If p_ParseError <> PARSE_SUCCESS Then Exit Function
+        dict.Add Key, vVal
+        pv_EatWhitespace
+        NextChar = Mid$(p_Json, p_Index, 1)
+
+'        Debug.Print "       object: post-value next='" & NextChar & "' at index=" & p_Index
+
+        If NextChar = "," Then
+            p_Index = p_Index + 1
+        ElseIf NextChar <> "}" Then
+            p_ParseError = PARSE_INVALID_CHARACTER
+            Exit Function
+        End If
+
+    Loop
+    Set pv_ParseObject = dict
+    Exit Function
+ErrorHandler:
+    HandleError "pv_ParseObject", Err
+End Function
+
+Private Function pv_ParseArray() As Object
+    On Error GoTo ErrorHandler
+    Dim arr As VBA.Collection
+    Set arr = New VBA.Collection
+    p_Index = p_Index + 1 ' skip "["
+    Do
+        pv_EatWhitespace
+        If p_Index > Len(p_Json) Then
+            p_ParseError = PARSE_UNEXPECTED_END_OF_INPUT
+            Exit Function
+        End If
+
+        Dim NextChar As String
+        NextChar = Mid$(p_Json, p_Index, 1)
+        If NextChar = "]" Then
+            p_Index = p_Index + 1
+            Exit Do
+        End If
+
+        Dim vElem As Variant
+        llm_ParseValue vElem
+        If p_ParseError <> PARSE_SUCCESS Then Exit Function
+
+'        Debug.Print "       array: adding element"
+
+        arr.Add vElem
+        If Err.Number <> 0 Then
+            Debug.Print "       array: arr.Add failed Err " & Err.Number & ": " & Err.Description
+            On Error GoTo ErrorHandler
+            HandleError "pv_ParseArray_Add", Err
+            Exit Function
+        End If
+
+        On Error GoTo ErrorHandler
+        pv_EatWhitespace
+        NextChar = Mid$(p_Json, p_Index, 1)
+
+'        Debug.Print "       array: post-elem next='" & NextChar & "' at index=" & p_Index
+
+        If NextChar = "," Then
+            p_Index = p_Index + 1
+        ElseIf NextChar = "]" Then
+            p_Index = p_Index + 1
+            Exit Do
+        Else
+            p_ParseError = PARSE_INVALID_CHARACTER
+            Exit Function
+        End If
+
+    Loop
+    Set pv_ParseArray = arr
+    Exit Function
+ErrorHandler:
+    HandleError "pv_ParseArray", Err
+End Function
+
+Private Function pv_ParseString() As String
+    On Error GoTo ErrorHandler
+
+    ' advance past opening quote
+
+    p_Index = p_Index + 1
+    Dim EndIndex As Long
+    EndIndex = InStr(p_Index, p_Json, Chr$(34))
+    Do While EndIndex > 0 And Mid$(p_Json, EndIndex - 1, 1) = "\"
+        EndIndex = InStr(EndIndex + 1, p_Json, Chr$(34))
+    Loop
+    pv_ParseString = Mid$(p_Json, p_Index, EndIndex - p_Index)
+    p_Index = EndIndex + 1
+
+    ' Use explicit characters to avoid any name/escape ambiguity
+
+    Dim bs As String: bs = Chr$(92) ' backslash
+    pv_ParseString = VBA.Replace(pv_ParseString, bs & Chr$(34), Chr$(34)) ' \" -> "
+    pv_ParseString = VBA.Replace(pv_ParseString, bs & bs, bs)             ' \\ -> \
+    pv_ParseString = VBA.Replace(pv_ParseString, bs & "/", "/")         ' \/ -> /
+    pv_ParseString = VBA.Replace(pv_ParseString, bs & "b", vbBack)
+    pv_ParseString = VBA.Replace(pv_ParseString, bs & "f", vbFormFeed)
+    pv_ParseString = VBA.Replace(pv_ParseString, bs & "n", vbLf)
+    pv_ParseString = VBA.Replace(pv_ParseString, bs & "r", vbCr)
+    pv_ParseString = VBA.Replace(pv_ParseString, bs & "t", vbTab)
+    Exit Function
+ErrorHandler:
+    HandleError "pv_ParseString", Err
+End Function
+
+Private Function pv_ParseBoolean() As Boolean
+    If LCase$(Mid$(p_Json, p_Index, 4)) = "true" Then
+        pv_ParseBoolean = True
+        p_Index = p_Index + 4
+    Else
+        pv_ParseBoolean = False
+        p_Index = p_Index + 5
+    End If
+
+End Function
+
+Private Function pv_ParseNull() As Variant
+    p_Index = p_Index + 4
+    pv_ParseNull = Null
+End Function
+
+Private Function ConvertMarkdownToTable(ByVal targetRange As Range, ByVal markdown As String) As Table
+
+    ' This helper function converts a Markdown table string into a Word table.
+
+    On Error GoTo ErrorHandler
+    Dim lines() As String
+    Dim processedLines As String
+    Dim line As Variant
+    Dim i As Long
+    Dim tempLine As String
+    Dim normalizedMarkdown As String
+    Dim newTable As Table
+
+    ' 1. Normalize incoming line endings and split into individual lines.
+
+    normalizedMarkdown = Replace(markdown, vbCrLf, vbLf)
+    normalizedMarkdown = Replace(normalizedMarkdown, vbCr, vbLf)
+    lines = Split(normalizedMarkdown, vbLf)
+    processedLines = ""
+    i = 0
+    For Each line In lines
+        tempLine = Replace(line, vbCr, "")
+        tempLine = Trim$(tempLine)
+
+        ' 2. Skip the markdown separator line (e.g., |---|---| or |:---|:---:|)
+
+        If InStr(1, tempLine, "---") > 0 And Left$(tempLine, 1) = "|" Then
+
+            ' Skip separator rows
+
+        ElseIf Len(tempLine) > 0 Then
+
+            ' 3. Process a content line
+
+            If Left$(tempLine, 1) = "|" Then tempLine = Mid$(tempLine, 2)
+            If Right$(tempLine, 1) = "|" Then tempLine = Left$(tempLine, Len(tempLine) - 1)
+            tempLine = Replace(tempLine, "|", vbTab)
+            Dim parts() As String
+            Dim j As Long
+            parts = Split(tempLine, vbTab)
+            For j = LBound(parts) To UBound(parts)
+                parts(j) = Trim$(parts(j))
+            Next j
+            tempLine = Join(parts, vbTab)
+            If i > 0 Then processedLines = processedLines & vbCr
+            processedLines = processedLines & tempLine
+            i = i + 1
+        End If
+
+    Next line
+    If Len(processedLines) = 0 Then
+        Err.Raise vbObjectError + 520, "ConvertMarkdownToTable", "No usable markdown rows were found in the replacement text."
+    End If
+
+    targetRange.Text = processedLines
+    Set newTable = targetRange.ConvertToTable(Separator:=vbTab, AutoFitBehavior:=wdAutoFitContent)
+    On Error Resume Next
+    newTable.Style = "Table Grid"
+    On Error GoTo ErrorHandler
+    ApplyFormattingToTableCells newTable
+    Set ConvertMarkdownToTable = newTable
+    Exit Function
+ErrorHandler:
+    Debug.Print "An error occurred in ConvertMarkdownToTable: " & Err.Description
+    Set ConvertMarkdownToTable = Nothing
+    Err.Raise Err.Number, "ConvertMarkdownToTable", Err.Description
+End Function
+
+Private Sub ApplyFormattingToTableCells(ByVal sourceTable As Table)
+    Dim tblCell As Cell
+    Dim cellContent As Range
+    Dim cellText As String
+    For Each tblCell In sourceTable.Range.Cells
+        Set cellContent = tblCell.Range
+        If cellContent.End > cellContent.Start Then
+            cellContent.End = cellContent.End - 1
+        End If
+
+        If cellContent.End > cellContent.Start And Right$(cellContent.Text, 1) = Chr$(13) Then
+            cellContent.End = cellContent.End - 1
+        End If
+
+        cellText = cellContent.Text
+        If Len(cellText) > 0 Then
+            ApplyFormattedReplacement cellContent, cellText
+        End If
+
+    Next tblCell
+End Sub
+
+Private Function FindLongString(ByVal searchString As String, ByVal searchRange As Range, _
+
+    Optional ByVal matchCase As Boolean = False) As Range
+
+    On Error GoTo ErrorHandler
+    Dim findInRange As Range
+    Set findInRange = searchRange.Duplicate
+    If Len(searchString) <= 255 Then
+        With findInRange.Find
+            .ClearFormatting
+            .Text = searchString
+            .MatchCase = matchCase
+            .Wrap = wdFindStop
+            .Forward = True
+            If .Execute Then
+                Set FindLongString = findInRange
+            Else
+                Set FindLongString = Nothing
+            End If
+
+        End With
+
+        Exit Function
+    End If
+
+    Dim startPart As String
+    Dim endPart As String
+    Dim tempRange As Range
+    Dim checkRange As Range
+    startPart = Left$(searchString, 255)
+    endPart = Mid$(searchString, 256)
+    Set tempRange = findInRange.Duplicate
+    With tempRange.Find
+        .ClearFormatting
+        .Text = startPart
+        .MatchCase = matchCase
+        .Wrap = wdFindStop
+        .Forward = True
+        Do While .Execute
+            Set checkRange = tempRange.Duplicate
+            checkRange.Start = tempRange.End
+            checkRange.End = checkRange.Start + Len(endPart)
+            If checkRange.End > searchRange.End Then
+                checkRange.End = searchRange.End
+            End If
+
+            If checkRange.End - checkRange.Start = Len(endPart) Then
+                If checkRange.Text = endPart Then
+                    findInRange.Start = tempRange.Start
+                    findInRange.End = checkRange.End
+                    Set FindLongString = findInRange
+                    Exit Function
+                End If
+
+            End If
+
+            tempRange.Collapse wdCollapseEnd
+        Loop
+    End With
+
+    Set FindLongString = Nothing
+    Exit Function
+ErrorHandler:
+    Debug.Print "An error occurred in FindLongString: " & Err.Description
+    Set FindLongString = Nothing
+End Function
+
+Private Function pv_ParseNumber() As Double
+    Dim StartIndex As Long
+    StartIndex = p_Index
+    Do While p_Index <= Len(p_Json)
+        Select Case Mid$(p_Json, p_Index, 1)
+            Case "0" To "9", ".", "e", "E", "+", "-"
+                p_Index = p_Index + 1
+            Case Else
+                Exit Do
+        End Select
+
+    Loop
+    pv_ParseNumber = CDbl(Mid$(p_Json, StartIndex, p_Index - StartIndex))
+End Function
+
+' =========================================================================================
+
+' === HELPER FUNCTIONS FOR INLINE FORMATTING TAGS ============================================
+
+' =========================================================================================
+
+Private Sub ApplyFormattedReplacement(ByVal targetRange As Range, ByVal replaceText As String)
+    Debug.Print "    - Applying formatting tags..."
+    Dim plainText As String
+    Dim segments As Collection
+    ParseFormattingTags replaceText, plainText, segments
+    targetRange.Text = plainText
+    targetRange.Font.Reset
+    If segments Is Nothing Then
+        Debug.Print "    -> Formatting tags applied (none detected)."
+        Exit Sub
+    End If
+
+    If segments.Count = 0 Then
+        Debug.Print "    -> No inline formatting detected."
+        Exit Sub
+    End If
+
+    Dim baseStart As Long
+    baseStart = targetRange.Start
+    Dim segment As Object
+    For Each segment In segments
+        Dim formattedRange As Range
+        Set formattedRange = targetRange.Duplicate
+        formattedRange.Start = baseStart + CLng(segment("Start")) - 1
+        formattedRange.End = formattedRange.Start + CLng(segment("Length"))
+        With formattedRange.Font
+            If segment("Bold") Then .Bold = True
+            If segment("Italic") Then .Italic = True
+            If segment("Subscript") And segment("Superscript") Then
+                .Subscript = False
+                .Superscript = True
+            Else
+                If segment("Subscript") Then .Subscript = True
+                If segment("Superscript") Then .Superscript = True
+            End If
+
+        End With
+
+    Next segment
+    Debug.Print "    -> Formatting tags applied."
+End Sub
+
+Private Sub ParseFormattingTags(ByVal source As String, ByRef plainText As String, ByRef segments As Collection)
+    Dim i As Long
+    Dim ch As String
+    Dim closePos As Long
+    Dim tagContent As String
+    Dim boldLevel As Long
+    Dim italicLevel As Long
+    Dim subLevel As Long
+    Dim supLevel As Long
+    plainText = ""
+    Set segments = New Collection
+    i = 1
+    Do While i <= Len(source)
+        ch = Mid$(source, i, 1)
+        If ch = "<" Then
+            closePos = InStr(i, source, ">")
+            If closePos = 0 Then
+                plainText = plainText & ch
+                AddFormattedChar segments, Len(plainText), (boldLevel > 0), (italicLevel > 0), (subLevel > 0), (supLevel > 0)
+                i = i + 1
+            Else
+                tagContent = Mid$(source, i + 1, closePos - i - 1)
+                Select Case LCase$(tagContent)
+                    Case "b"
+                        boldLevel = boldLevel + 1
+                        i = closePos + 1
+                    Case "/b"
+                        If boldLevel > 0 Then boldLevel = boldLevel - 1
+                        i = closePos + 1
+                    Case "i"
+                        italicLevel = italicLevel + 1
+                        i = closePos + 1
+                    Case "/i"
+                        If italicLevel > 0 Then italicLevel = italicLevel - 1
+                        i = closePos + 1
+                    Case "sub"
+                        subLevel = subLevel + 1
+                        i = closePos + 1
+                    Case "/sub"
+                        If subLevel > 0 Then subLevel = subLevel - 1
+                        i = closePos + 1
+                    Case "sup"
+                        supLevel = supLevel + 1
+                        i = closePos + 1
+                    Case "/sup"
+                        If supLevel > 0 Then supLevel = supLevel - 1
+                        i = closePos + 1
+                    Case Else
+                        plainText = plainText & ch
+                        AddFormattedChar segments, Len(plainText), (boldLevel > 0), (italicLevel > 0), (subLevel > 0), (supLevel > 0)
+                        i = i + 1
+                    End Select
+
+            End If
+
+        Else
+            plainText = plainText & ch
+            AddFormattedChar segments, Len(plainText), (boldLevel > 0), (italicLevel > 0), (subLevel > 0), (supLevel > 0)
+            i = i + 1
+        End If
+
+    Loop
+End Sub
+
+Private Sub AddFormattedChar(ByRef segments As Collection, ByVal charIndex As Long, ByVal isBold As Boolean, ByVal isItalic As Boolean, ByVal isSubscript As Boolean, ByVal isSuperscript As Boolean)
+    If segments Is Nothing Then Exit Sub
+    If Not (isBold Or isItalic Or isSubscript Or isSuperscript) Then Exit Sub
+    Dim segment As Object
+    If segments.Count > 0 Then
+        Set segment = segments(segments.Count)
+        If CLng(segment("Start")) + CLng(segment("Length")) = charIndex _
+            And CBool(segment("Bold")) = isBold _
+            And CBool(segment("Italic")) = isItalic _
+            And CBool(segment("Subscript")) = isSubscript _
+            And CBool(segment("Superscript")) = isSuperscript Then
+            segment("Length") = CLng(segment("Length")) + 1
+            Exit Sub
+        End If
+
+    End If
+
+    Set segment = NewDictionary()
+    segment("Start") = charIndex
+    segment("Length") = 1
+    segment("Bold") = isBold
+    segment("Italic") = isItalic
+    segment("Subscript") = isSubscript
+    segment("Superscript") = isSuperscript
+    segments.Add segment
+End Sub
+
+Public Sub UndoLlmReview()
+
+    ' This subroutine will reject all tracked changes and delete all comments
+
+    ' made by the specific "LLM Reviewer" user identity.
+
+    Dim rev As Revision
+    Dim com As Comment
+    Dim rejectedChangesCount As Long
+    Dim deletedCommentsCount As Long
+    Dim i As Long
+    Dim userResponse As VbMsgBoxResult
+    On Error GoTo ErrorHandler
+
+    ' --- 1. Confirm with the user before making irreversible changes ---
+
+    userResponse = MsgBox("Are you sure you want to reject all tracked changes and delete all comments made by '" & LLM_REVIEWER_NAME & "'?" & _
+                          vbCrLf & vbCrLf & "This action cannot be undone.", _
+                          vbQuestion + vbYesNo, "Confirm Undo Action")
+    If userResponse = vbNo Then
+        MsgBox "Operation cancelled by user.", vbInformation
+        Exit Sub
+    End If
+
+    Debug.Print "--- Starting UndoLlmReview process at " & Now() & " ---"
+
+    ' --- 2. Turn off screen updating for better performance on large documents ---
+
+    Application.ScreenUpdating = False
+
+    ' --- 3. Reject Tracked Changes from the LLM Reviewer ---
+
+    ' We must loop through the revisions collection backwards. If you loop forwards
+
+    ' and reject an item, the collection's indices shift, causing you to skip the next item.
+
+    Debug.Print "Searching for revisions by '" & LLM_REVIEWER_NAME & "'..."
+    For i = ActiveDocument.Revisions.Count To 1 Step -1
+        Set rev = ActiveDocument.Revisions(i)
+        If rev.Author = LLM_REVIEWER_NAME Then
+            rev.Reject
+            rejectedChangesCount = rejectedChangesCount + 1
+        End If
+
+    Next i
+    Debug.Print "  - Rejected " & rejectedChangesCount & " revisions."
+
+    ' --- 4. Delete Comments from the LLM Reviewer ---
+
+    ' The same principle of looping backwards applies to the comments collection.
+
+    Debug.Print "Searching for comments by '" & LLM_REVIEWER_NAME & "'..."
+    For i = ActiveDocument.Comments.Count To 1 Step -1
+        Set com = ActiveDocument.Comments(i)
+
+        ' Check both Author and Initials for robustness
+
+        If com.Author = LLM_REVIEWER_NAME Or com.Initial = LLM_REVIEWER_INITIALS Then
+            com.Delete
+            deletedCommentsCount = deletedCommentsCount + 1
+        End If
+
+    Next i
+    Debug.Print "  - Deleted " & deletedCommentsCount & " comments."
+
+    ' --- 5. Show a final report to the user ---
+
+    MsgBox "Undo process complete!" & vbCrLf & vbCrLf & _
+           "Summary:" & vbCrLf & _
+           " - Revisions Rejected: " & rejectedChangesCount & vbCrLf & _
+           " - Comments Deleted: " & deletedCommentsCount, _
+           vbInformation, "Undo Complete"
+CleanExit:
+
+    ' --- 6. Always restore application settings ---
+
+    Application.ScreenUpdating = True
+    Debug.Print "--- Undo process finished. ---"
+    Exit Sub
+ErrorHandler:
+    MsgBox "An unexpected error occurred during the undo process." & vbCrLf & vbCrLf & _
+           "Error: " & Err.Description, vbCritical, "Undo Error"
+
+    ' Ensure ScreenUpdating is turned back on even if an error occurs
+
+    Resume CleanExit
+End Sub
+
+' =========================================================================================
+
+' === LAUNCHER FOR THE REVIEW TOOL ========================================================
+
+' =========================================================================================
+
+Sub StartAiReview()
+
+    ' This sub launches the modeless review form.
+
+    Dim reviewForm As New frmReviewer
+    reviewForm.Show
+End Sub
+</file>
+
+</files>

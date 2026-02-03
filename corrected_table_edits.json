@@ -1,0 +1,196 @@
+[
+  {
+    "action": "replace",
+    "context": "The nearest receptors are located approximately 30m to the east on the opposite side of Birmingham Road.",
+    "target": "30m to the east on the opposite side of Birmingham Road",
+    "replace": "85m to the east on Crosby Way and Whitlet Close",
+    "explanation": "Updating receptor location and distance for the Farnham site."
+  },
+  {
+    "action": "replace",
+    "context": "discharge ducted via a ground floor louvre on the southern façade of the building.",
+    "target": "southern façade",
+    "replace": "east facing façade of the north wing",
+    "explanation": "Correcting plant location based on site plan."
+  },
+  {
+    "action": "replace",
+    "context": "Dwellings to South",
+    "tableCell": {
+      "rowHeader": "Results",
+      "adjacentCells": {
+        "left": "Results",
+        "right": "Relevant"
+      }
+    },
+    "target": "Dwellings to South",
+    "replace": "Dwellings to East",
+    "explanation": "Updating receptor direction for Kitchen Extract table (Table 6.3)"
+  },
+  {
+    "action": "replace",
+    "context": "Distance loss",
+    "tableCell": {
+      "rowHeader": "Distance loss",
+      "columnHeader": "Dwellings to East",
+      "adjacentCells": {
+        "left": "Distance loss"
+      }
+    },
+    "target": "-20 dB (30m)",
+    "replace": "-29 dB (85m)",
+    "explanation": "Updating distance loss for 85m to eastern receptors (Table 6.3)"
+  },
+  {
+    "action": "replace",
+    "context": "Specific Sound Level",
+    "tableCell": {
+      "rowHeader": "Specific Sound Level",
+      "columnHeader": "Dwellings to East"
+    },
+    "target": "35 dB",
+    "replace": "26 dB",
+    "explanation": "Recalculated specific sound level based on new distance (Table 6.3)"
+  },
+  {
+    "action": "replace",
+    "context": "Rating level",
+    "tableCell": {
+      "rowHeader": "Rating level",
+      "columnHeader": "Dwellings to East",
+      "adjacentCells": {
+        "below": "Background sound level"
+      }
+    },
+    "target": "LAr 38 dB",
+    "replace": "LAr 29 dB",
+    "explanation": "Recalculated rating level with acoustic feature correction (Table 6.3)"
+  },
+  {
+    "action": "replace",
+    "context": "Excess of rating over",
+    "tableCell": {
+      "rowHeader": "Excess of rating over",
+      "columnHeader": "Dwellings to East"
+    },
+    "target": "-16 dB",
+    "replace": "-25 dB",
+    "explanation": "Updated excess calculation (54 - 29 = 25 dB below background) (Table 6.3)"
+  },
+  {
+    "action": "replace",
+    "context": "However, the sound is identifiable as a fan and therefore the \"other characteristics\" penalty of 3dB stated in BS4142 will be applied.",
+    "target": "applied.",
+    "replace": "applied.\n\nMeasurements of the proposed kitchen extract system have been undertaken at an existing operational care home by the same developer. These measurements were conducted in the room directly above the extract fan with the window open on standard LNT opening limiters. The sound from the fan was neither measurable nor identifiable within the room above. Consequently, self-noise / structure-borne noise from the unit is not considered to be an issue for the proposed development.",
+    "explanation": "Inserting required confirmation regarding self-noise measurements."
+  },
+  {
+    "action": "replace",
+    "context": "The assessment is therefore undertaken against the more stringent night-time background sound level of 34 dB LA90.",
+    "target": "34 dB LA90",
+    "replace": "37 dB LA90",
+    "explanation": "Updating background level to match the Headway House survey results (Table 5.2)"
+  },
+  {
+    "action": "replace",
+    "context": "The nearest receptor is the property to the south at 30m.",
+    "target": "south at 30m",
+    "replace": "east at approximately 61m",
+    "explanation": "Updating receptor location and distance for Battery Storage."
+  },
+  {
+    "action": "replace",
+    "context": "Dwellings to South",
+    "tableCell": {
+      "rowHeader": "Results",
+      "adjacentCells": {
+        "cellContent": "Dwellings to South"
+      }
+    },
+    "target": "Dwellings to South",
+    "replace": "Dwellings to East",
+    "occurrenceIndex": 2,
+    "explanation": "Updating receptor direction for Battery Storage table (Table 6.4) - second occurrence in document"
+  },
+  {
+    "action": "replace",
+    "context": "Distance loss",
+    "tableCell": {
+      "rowHeader": "Distance loss",
+      "adjacentCells": {
+        "above": "Assume constant"
+      }
+    },
+    "target": "-30 dB (30m)",
+    "replace": "-36 dB (61m)",
+    "explanation": "Updating distance loss for 61m distance (Table 6.4)"
+  },
+  {
+    "action": "replace",
+    "context": "Specific Sound Level",
+    "tableCell": {
+      "rowHeader": "Specific Sound Level",
+      "adjacentCells": {
+        "above": "Distance loss",
+        "below": "Acoustic feature"
+      }
+    },
+    "target": "30 dB",
+    "replace": "24 dB",
+    "explanation": "Recalculated specific sound level (60 - 36 = 24 dB) (Table 6.4)"
+  },
+  {
+    "action": "replace",
+    "context": "Rating level",
+    "tableCell": {
+      "rowHeader": "Rating level",
+      "adjacentCells": {
+        "above": "Acoustic feature",
+        "cellContent": "LAr 30 dB"
+      }
+    },
+    "target": "LAr 30 dB",
+    "replace": "LAr 24 dB",
+    "explanation": "Updated rating level (no acoustic correction for this source) (Table 6.4)"
+  },
+  {
+    "action": "replace",
+    "context": "Background sound level",
+    "tableCell": {
+      "rowHeader": "Background sound level",
+      "adjacentCells": {
+        "right": "Night time background"
+      }
+    },
+    "target": "LA90 34 dB",
+    "replace": "LA90 37 dB",
+    "explanation": "Correcting to use Headway House night-time background level (Table 6.4)"
+  },
+  {
+    "action": "replace",
+    "context": "Excess of rating over",
+    "tableCell": {
+      "rowHeader": "Excess of rating over",
+      "adjacentCells": {
+        "above": "Background sound level"
+      }
+    },
+    "target": "-4 dB",
+    "replace": "-13 dB",
+    "explanation": "Updated excess calculation (37 - 24 = 13 dB below background) (Table 6.4)"
+  },
+  {
+    "action": "replace",
+    "context": "Four Winds, Birmingham Road, Mappleborough Green.",
+    "target": "Four Winds, Birmingham Road, Mappleborough Green",
+    "replace": "Headway House, Crosby Way, Farnham",
+    "explanation": "Correcting site address in Conclusion."
+  },
+  {
+    "action": "replace",
+    "context": "principally influenced by traffic on Birmingham Road.",
+    "target": "Birmingham Road",
+    "replace": "the A31 Farnham Bypass",
+    "explanation": "Correcting dominant noise source in Conclusion."
+  }
+]
