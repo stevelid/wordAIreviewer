@@ -278,12 +278,16 @@ Private Function FindTableByTitle(ByVal tableTitle As String, ByRef matchCount A
     Dim i As Long
     Dim matches As New Collection
     Dim normalizedTitle As String
+    Dim normalizedTitleStripped As String
 
     normalizedTitle = NormalizeForDocument(tableTitle)
+    normalizedTitleStripped = NormalizeForDocument(StripTableNumberPrefix(tableTitle))
 
     ' First pass: exact match on title below
     For i = 1 To g_TableIndexCount
         If TextMatchesHeuristic(normalizedTitle, g_TableIndex(i).TitleBelow) Then
+            matches.Add i
+        ElseIf TextMatchesHeuristic(normalizedTitleStripped, StripTableNumberPrefix(g_TableIndex(i).TitleBelow)) Then
             matches.Add i
         End If
     Next i
@@ -292,6 +296,8 @@ Private Function FindTableByTitle(ByVal tableTitle As String, ByRef matchCount A
     If matches.Count = 0 Then
         For i = 1 To g_TableIndexCount
             If TextMatchesHeuristic(normalizedTitle, g_TableIndex(i).CaptionAbove) Then
+                matches.Add i
+            ElseIf TextMatchesHeuristic(normalizedTitleStripped, StripTableNumberPrefix(g_TableIndex(i).CaptionAbove)) Then
                 matches.Add i
             End If
         Next i
@@ -327,12 +333,16 @@ Private Function GetMatchingTableCandidates(ByVal tableTitle As String) As Colle
     Dim i As Long
     Dim matches As New Collection
     Dim normalizedTitle As String
+    Dim normalizedTitleStripped As String
 
     normalizedTitle = NormalizeForDocument(tableTitle)
+    normalizedTitleStripped = NormalizeForDocument(StripTableNumberPrefix(tableTitle))
 
     ' Check title below
     For i = 1 To g_TableIndexCount
         If TextMatchesHeuristic(normalizedTitle, g_TableIndex(i).TitleBelow) Then
+            matches.Add i
+        ElseIf TextMatchesHeuristic(normalizedTitleStripped, StripTableNumberPrefix(g_TableIndex(i).TitleBelow)) Then
             matches.Add i
         End If
     Next i
@@ -341,6 +351,8 @@ Private Function GetMatchingTableCandidates(ByVal tableTitle As String) As Colle
     If matches.Count = 0 Then
         For i = 1 To g_TableIndexCount
             If TextMatchesHeuristic(normalizedTitle, g_TableIndex(i).CaptionAbove) Then
+                matches.Add i
+            ElseIf TextMatchesHeuristic(normalizedTitleStripped, StripTableNumberPrefix(g_TableIndex(i).CaptionAbove)) Then
                 matches.Add i
             End If
         Next i
@@ -682,6 +694,188 @@ Private Function ExtractStableTokens(ByVal segment As String) As Collection
     Next p
 
     Set ExtractStableTokens = tokens
+End Function
+
+Private Function ExtractAnchorTokens(ByVal segment As String) As Collection
+    Dim normalized As String
+    normalized = NormalizeForDocument(segment)
+
+    Dim parts() As String
+    Dim tokens As New Collection
+    Dim p As Variant
+
+    parts = Split(Trim$(normalized), " ")
+    For Each p In parts
+        Dim cleaned As String
+        cleaned = CleanAnchorToken(CStr(p))
+
+        If Len(cleaned) > 0 Then tokens.Add cleaned
+    Next p
+
+    Set ExtractAnchorTokens = tokens
+End Function
+
+Private Function CleanAnchorToken(ByVal token As String) As String
+    Dim t As String
+    t = Trim$(token)
+    If Len(t) = 0 Then
+        CleanAnchorToken = ""
+        Exit Function
+    End If
+
+    Dim startIdx As Long
+    Dim endIdx As Long
+    startIdx = 1
+    endIdx = Len(t)
+
+    Do While startIdx <= endIdx
+        Dim ch As String
+        ch = Mid$(t, startIdx, 1)
+        If ch Like "[A-Za-z0-9]" Then Exit Do
+        startIdx = startIdx + 1
+    Loop
+
+    Do While endIdx >= startIdx
+        ch = Mid$(t, endIdx, 1)
+        If ch Like "[A-Za-z0-9]" Then Exit Do
+        endIdx = endIdx - 1
+    Loop
+
+    If startIdx > endIdx Then
+        CleanAnchorToken = ""
+        Exit Function
+    End If
+
+    t = Mid$(t, startIdx, endIdx - startIdx + 1)
+
+    Dim hasLetter As Boolean
+    Dim hasDigit As Boolean
+    Dim i As Long
+    For i = 1 To Len(t)
+        ch = Mid$(t, i, 1)
+        If ch Like "[A-Za-z]" Then hasLetter = True
+        If ch Like "[0-9]" Then hasDigit = True
+    Next i
+
+    If Not hasLetter Then
+        CleanAnchorToken = ""
+        Exit Function
+    End If
+
+    CleanAnchorToken = t
+End Function
+
+Private Function SelectAnchorTokens(ByVal tokens As Collection, Optional ByVal maxTokens As Long = 8) As Collection
+    Dim selected As New Collection
+    If tokens Is Nothing Then
+        Set SelectAnchorTokens = selected
+        Exit Function
+    End If
+
+    If tokens.Count <= maxTokens Then
+        Dim t As Variant
+        For Each t In tokens
+            selected.Add t
+        Next t
+        Set SelectAnchorTokens = selected
+        Exit Function
+    End If
+
+    Dim stepSize As Double
+    stepSize = (tokens.Count - 1) / (maxTokens - 1)
+
+    Dim i As Long
+    For i = 0 To maxTokens - 1
+        Dim indexPos As Long
+        indexPos = CLng(1 + (i * stepSize))
+        If indexPos < 1 Then indexPos = 1
+        If indexPos > tokens.Count Then indexPos = tokens.Count
+        selected.Add tokens(indexPos)
+    Next i
+
+    Set SelectAnchorTokens = selected
+End Function
+
+Private Function FindTokenSequenceInRange(ByVal tokens As Collection, ByVal searchRange As Range, ByVal matchCase As Boolean, ByVal windowSize As Long) As Range
+    On Error GoTo Fail
+    If tokens Is Nothing Then
+        Set FindTokenSequenceInRange = Nothing
+        Exit Function
+    End If
+    If tokens.Count = 0 Then
+        Set FindTokenSequenceInRange = Nothing
+        Exit Function
+    End If
+
+    Dim firstToken As String
+    firstToken = CStr(tokens(1))
+
+    Dim searchCursor As Range
+    Set searchCursor = searchRange.Duplicate
+
+    Dim loopCounter As Long
+    Dim lastPos As Long
+    lastPos = -1
+
+    Do While searchCursor.Start < searchCursor.End
+        loopCounter = loopCounter + 1
+        If loopCounter > LOOP_SAFETY_LIMIT Then Exit Do
+
+        Dim firstFound As Range
+        Set firstFound = FindLongString(firstToken, searchCursor, matchCase)
+        If firstFound Is Nothing Then Exit Do
+
+        If firstFound.Start = lastPos Then
+            Exit Do
+        End If
+        lastPos = firstFound.Start
+
+        Dim lastFound As Range
+        Set lastFound = firstFound
+
+        Dim success As Boolean
+        success = True
+
+        Dim i As Long
+        For i = 2 To tokens.Count
+            Dim look As Range
+            Set look = searchRange.Duplicate
+            look.Start = lastFound.End
+            look.End = firstFound.Start + windowSize
+            If look.End > searchRange.End Then look.End = searchRange.End
+            If look.Start >= look.End Then
+                success = False
+                Exit For
+            End If
+
+            Dim found As Range
+            Set found = FindLongString(CStr(tokens(i)), look, matchCase)
+            If found Is Nothing Then
+                success = False
+                Exit For
+            End If
+            Set lastFound = found
+        Next i
+
+        If success Then
+            Set FindTokenSequenceInRange = ActiveDocument.Range(firstFound.Start, lastFound.End)
+            Exit Function
+        End If
+
+        searchCursor.Start = firstFound.End + 1
+        If searchCursor.Start >= searchCursor.End Then Exit Do
+    Loop
+
+Fail:
+    Set FindTokenSequenceInRange = Nothing
+End Function
+
+Private Function CalculateTokenWindowSize(ByVal searchString As String) As Long
+    Dim size As Long
+    size = CLng(Len(searchString) * 1.5)
+    If size < 400 Then size = 400
+    If size > 8000 Then size = 8000
+    CalculateTokenWindowSize = size
 End Function
 
 Private Function TextMatchesHeuristic(ByVal expected As String, ByVal actual As String) As Boolean
@@ -3324,10 +3518,12 @@ Private Function FindWithProgressiveFallback(ByVal searchString As String, ByVal
     Optional ByVal matchCase As Boolean = False, Optional ByVal suggestion As Object = Nothing) As Range
     ' HIGH-IMPACT FEATURE: Tries multiple strategies to find text, reducing "not found" errors
     ' 0. Table cell structure (if provided in suggestion)
+    ' 0.5 Pipe-delimited table row sequence
     ' 1. Exact match (normalized)
-    ' 2. Progressive shortening (80%, 60%, 40% of context from start)
-    ' 3. Case-insensitive if case-sensitive was requested
-    ' 4. Anchor word search as last resort
+    ' 2. Anchor token sequence (order-preserving, gap-tolerant)
+    ' 3. Progressive shortening (90%, 75% of context from start)
+    ' 4. Case-insensitive if case-sensitive was requested
+    ' 5. Anchor word (disabled to avoid false positives)
 
     On Error GoTo ErrorHandler
 
@@ -3336,6 +3532,8 @@ Private Function FindWithProgressiveFallback(ByVal searchString As String, ByVal
     Dim searchLen As Long
     Dim cutoffPercent As Variant
     Dim cutoffPercentages As Variant
+    Dim normalizedSearch As String
+    normalizedSearch = NormalizeForDocument(searchString)
 
     ' Strategy 0: Check for tableCell structure (NEW!)
     If Not suggestion Is Nothing Then
@@ -3364,25 +3562,42 @@ Private Function FindWithProgressiveFallback(ByVal searchString As String, ByVal
 
     ' Strategy 1: Try exact match with normalization
     Debug.Print "  - Strategy 1: Exact match (normalized, " & IIf(matchCase, "case-sensitive", "case-insensitive") & ")"
-    Set result = FindLongString(searchString, searchRange, matchCase)
+    Set result = FindLongString(normalizedSearch, searchRange, matchCase)
     If Not result Is Nothing Then
         Debug.Print "    -> SUCCESS: Found with exact match"
         Set FindWithProgressiveFallback = result
         Exit Function
     End If
+
+    ' Strategy 2: Anchor token sequence (handles numbering, headings, and longer contexts)
+    Dim anchorTokens As Collection
+    Set anchorTokens = SelectAnchorTokens(ExtractAnchorTokens(normalizedSearch), 8)
+    If Not anchorTokens Is Nothing Then
+        If anchorTokens.Count >= 2 Then
+            Dim windowSize As Long
+            windowSize = CalculateTokenWindowSize(normalizedSearch)
+            Debug.Print "  - Strategy 2: Anchor token sequence (" & anchorTokens.Count & " tokens, window " & windowSize & " chars)..."
+            Set result = FindTokenSequenceInRange(anchorTokens, searchRange, matchCase, windowSize)
+            If Not result Is Nothing Then
+                Debug.Print "    -> SUCCESS: Found with anchor token sequence"
+                Set FindWithProgressiveFallback = result
+                Exit Function
+            End If
+        End If
+    End If
     
-    ' Strategy 2: Progressive context shortening (for overly specific contexts)
+    ' Strategy 3: Progressive context shortening (for overly specific contexts)
     ' Try 90%, 75% of the original context length from the START
     ' REDUCED from 80%, 60%, 40%, 25% to minimize false positives
-    If Len(searchString) > 50 Then ' Only for longer contexts
-        Debug.Print "  - Strategy 2: Progressive shortening..."
+    If Len(normalizedSearch) > 50 Then ' Only for longer contexts
+        Debug.Print "  - Strategy 3: Progressive shortening..."
         cutoffPercentages = Array(0.9, 0.75)
 
         For Each cutoffPercent In cutoffPercentages
-            searchLen = CLng(Len(searchString) * cutoffPercent)
+            searchLen = CLng(Len(normalizedSearch) * cutoffPercent)
             If searchLen < 40 Then Exit For ' Require at least 40 chars for reliability
             
-            shortenedContext = Left$(searchString, searchLen)
+            shortenedContext = Left$(normalizedSearch, searchLen)
             ' Trim to word boundary for cleaner matching
             shortenedContext = TrimToWordBoundary(shortenedContext)
             
@@ -3403,10 +3618,10 @@ Private Function FindWithProgressiveFallback(ByVal searchString As String, ByVal
         Next cutoffPercent
     End If
     
-    ' Strategy 3: Case-insensitive fallback (if original was case-sensitive)
+    ' Strategy 4: Case-insensitive fallback (if original was case-sensitive)
     If matchCase Then
-        Debug.Print "  - Strategy 3: Case-insensitive fallback..."
-        Set result = FindLongString(searchString, searchRange, False)
+        Debug.Print "  - Strategy 4: Case-insensitive fallback..."
+        Set result = FindLongString(normalizedSearch, searchRange, False)
         If Not result Is Nothing Then
             ' Verify match quality before accepting
             If VerifyMatchQuality(searchString, result, 3) Then
@@ -3420,13 +3635,13 @@ Private Function FindWithProgressiveFallback(ByVal searchString As String, ByVal
         End If
 
         ' Try shortened contexts case-insensitive too
-        If Len(searchString) > 50 Then
+        If Len(normalizedSearch) > 50 Then
             cutoffPercentages = Array(0.9)
             For Each cutoffPercent In cutoffPercentages
-                searchLen = CLng(Len(searchString) * cutoffPercent)
+                searchLen = CLng(Len(normalizedSearch) * cutoffPercent)
                 If searchLen < 40 Then Exit For
 
-                shortenedContext = TrimToWordBoundary(Left$(searchString, searchLen))
+                shortenedContext = TrimToWordBoundary(Left$(normalizedSearch, searchLen))
                 Set result = FindLongString(shortenedContext, searchRange, False)
 
                 If Not result Is Nothing Then
@@ -3444,12 +3659,12 @@ Private Function FindWithProgressiveFallback(ByVal searchString As String, ByVal
         End If
     End If
     
-    ' Strategy 4: Anchor word as last resort (DISABLED - high false positive risk)
+    ' Strategy 5: Anchor word as last resort (DISABLED - high false positive risk)
     ' This strategy is disabled because matching a single word has extremely high
     ' false positive rates. It will almost always match the wrong location.
     ' If you need this fallback, the HandleNotFoundContext function will place
     ' a comment at a keyword location instead.
-    Debug.Print "  - Strategy 4: Anchor word fallback SKIPPED (disabled to prevent false positives)"
+    Debug.Print "  - Strategy 5: Anchor word fallback SKIPPED (disabled to prevent false positives)"
 
     ' UNCOMMENT BELOW TO RE-ENABLE (not recommended):
     ' Dim anchorWord As String
@@ -5174,5 +5389,3 @@ Sub StartAiReview()
     Dim reviewForm As New frmReviewer
     reviewForm.Show
 End Sub
-
-
