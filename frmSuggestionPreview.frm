@@ -81,6 +81,123 @@ Public Sub LoadSuggestion(ByVal suggestion As Object, ByVal index As Long, ByVal
     Call PopulateFormFields
 End Sub
 
+' --- V4 method to populate the form with target references ---
+Public Sub LoadSuggestionV4(ByVal suggestion As Object, ByVal index As Long, ByVal total As Long, _
+                            ByVal contextRange As Range, ByVal actionRange As Range, _
+                            Optional ByVal errorMessage As String = "")
+    Set CurrentSuggestion = suggestion
+    CurrentIndex = index
+    TotalCount = total
+    Set m_ContextRange = contextRange
+    Set m_ActionRange = actionRange
+    
+    ' Update progress label
+    Me.lblProgress.Caption = "Suggestion " & index & " of " & total
+    
+    ' Populate the form fields for V4
+    Call PopulateFormFieldsV4(errorMessage)
+End Sub
+
+Private Sub PopulateFormFieldsV4(Optional ByVal errorMessage As String = "")
+    Dim actionType As String
+    Dim targetRef As String
+    Dim findText As String
+    Dim replaceText As String
+    Dim explanation As String
+    Dim styleKey As String
+    
+    ' Extract V4 fields from suggestion
+    targetRef = GetSuggestionText(CurrentSuggestion, "target", "")
+    actionType = GetSuggestionText(CurrentSuggestion, "action", "unknown")
+    explanation = GetSuggestionText(CurrentSuggestion, "explanation", "")
+    
+    ' Build context display showing target reference
+    Dim contextDisplay As String
+    If Len(errorMessage) > 0 Then
+        contextDisplay = "ERROR: " & errorMessage
+    ElseIf m_ContextRange Is Nothing Then
+        contextDisplay = "Target: " & targetRef & vbCrLf & "NOT FOUND - Target could not be resolved"
+    Else
+        contextDisplay = "Target: " & targetRef & vbCrLf & vbCrLf & _
+                        "Preview: " & Left$(m_ContextRange.Text, 200)
+        If Len(m_ContextRange.Text) > 200 Then
+            contextDisplay = contextDisplay & "..."
+        End If
+    End If
+    
+    ' Build action-specific display
+    Dim actionDisplay As String
+    Select Case LCase$(actionType)
+        Case "replace"
+            findText = GetSuggestionText(CurrentSuggestion, "find", "")
+            replaceText = GetSuggestionText(CurrentSuggestion, "replace", "")
+            actionDisplay = "Find: " & findText & vbCrLf & "Replace: " & replaceText
+            
+        Case "apply_style"
+            styleKey = GetSuggestionText(CurrentSuggestion, "style", "")
+            actionDisplay = "Apply style: " & styleKey
+            
+        Case "comment"
+            actionDisplay = "Add comment"
+            
+        Case "delete"
+            actionDisplay = "Delete content"
+            
+        Case "replace_table"
+            replaceText = GetSuggestionText(CurrentSuggestion, "replace", "")
+            actionDisplay = "Replace table with:" & vbCrLf & Left$(replaceText, 100)
+            If Len(replaceText) > 100 Then actionDisplay = actionDisplay & "..."
+            
+        Case "insert_row"
+            actionDisplay = "Insert table row"
+            
+        Case "delete_row"
+            actionDisplay = "Delete table row"
+            
+        Case Else
+            actionDisplay = "(Action details)"
+    End Select
+    
+    ' Set action type label with color coding
+    Me.lblActionType.Caption = "Action: " & actionType
+    Select Case LCase$(actionType)
+        Case "replace"
+            Me.lblActionType.ForeColor = RGB(0, 102, 204)
+        Case "apply_style"
+            Me.lblActionType.ForeColor = RGB(0, 153, 0)
+        Case "replace_table"
+            Me.lblActionType.ForeColor = RGB(153, 0, 0)
+        Case "comment"
+            Me.lblActionType.ForeColor = RGB(210, 140, 0)
+        Case "delete", "delete_row"
+            Me.lblActionType.ForeColor = RGB(204, 0, 0)
+        Case "insert_row"
+            Me.lblActionType.ForeColor = RGB(0, 102, 0)
+        Case Else
+            Me.lblActionType.ForeColor = RGB(0, 0, 0)
+    End Select
+    
+    ' Populate form fields
+    Me.txtContext.Text = TruncateText(contextDisplay, 500)
+    Me.txtTarget.Text = TruncateText(targetRef, 200)
+    Me.txtReplace.Text = TruncateText(actionDisplay, 600)
+    Me.txtExplanation.Text = explanation
+    
+    ' Highlight and scroll to target
+    If Not m_ContextRange Is Nothing Then
+        m_ContextRange.HighlightColorIndex = wdYellow
+        m_ContextRange.Select
+        ActiveWindow.ScrollIntoView m_ContextRange, True
+    Else
+        ' No range to show - collapse selection
+        Selection.Collapse Direction:=wdCollapseEnd
+    End If
+    
+    ' Update button states
+    Me.cmdAcceptAll.Enabled = (CurrentIndex < TotalCount)
+    Me.cmdAccept.Enabled = Not (m_ContextRange Is Nothing)
+End Sub
+
 Private Sub PopulateFormFields()
     Dim actionType As String
     Dim context As String

@@ -1,312 +1,536 @@
-# AI Reviewer Improvement Plan
+# WordAI Reviewer First-Principles Refactor Plan
 
-This plan outlines targeted changes to improve correctness, predictability, and user experience for the Word AI Reviewer. It’s organized into phases with What/Why/How, code touchpoints, and acceptance criteria.
-
-## Goals
-- Reduce no-op and redundant changes.
-- Make multiple-action suggestions reliable and deterministic.
-- Improve preview clarity (what will change, and where).
-- Add process controls for safety and speed.
-- Align the JSON schema and LLM prompt with the app’s capabilities.
-
-## Current Pipeline (summary)
-- Parse JSON: `PreProcessJson` → `LLM_ParseJson`.
-- Interactive: `RunInteractiveReview` → per-suggestion preview (`frmSuggestionPreview`) → apply via `ProcessSuggestion` and `ExecuteSingleAction`.
-- Matching: `NormalizeForDocument` + `FindLongString` (long-string handling + fuzzy anchors).
-- Inline formatting: `<b>`, `<i>`, `<sub>`, `<sup>` parsed by `ParseFormattingTags` and applied by `ApplyFormattedReplacement`.
+Complete architectural redesign of `wordAIreviewer.bas` to use deterministic structural anchoring instead of fragile text-based context searching.
 
 ---
 
-## Phase 0 — Critical Fixes (COMPLETED ✅)
+## Executive Summary
 
-✅ **[Progressive Fallback Matching]** - IMPLEMENTED
-  - What: Multi-strategy matching to dramatically reduce "not found" errors.
-  - Strategies: (1) Exact normalized match, (2) Progressive shortening (80%/60%/40%/25%), (3) Case-insensitive fallback, (4) Anchor word search.
-  - Impact: **HIGH** - Reduces false negatives by ~60-80%.
-  - Effort: **MEDIUM** - 2 hours.
-  - Status: ✅ Added `FindWithProgressiveFallback()` function with `TrimToWordBoundary()` helper.
+**Current Problems:**
+- Text-based context matching fails frequently with auto-numbered headings, tables, long contexts, and TOC duplicates
+- Progressive fallback strategies are band-aids that increase false positives
+- Table cell finding uses heuristics that often fail
+- No structural awareness - LLM doesn't know Word's internal structure
 
-✅ **[Keyboard Shortcuts Fix]** - IMPLEMENTED
-  - What: Lock display textboxes and delegate key events to form.
-  - Why: Textboxes were capturing keystrokes, preventing shortcuts from working.
-  - Impact: **HIGH** - Restores keyboard workflow.
-  - Effort: **LOW** - 15 minutes.
-  - Status: ✅ Locked txtContext/txtTarget/txtReplace/txtExplanation; added KeyDown delegation.
-
-✅ **[Style No-Op Check]** - IMPLEMENTED
-  - What: Skip `apply_heading_style` if style already matches.
-  - Impact: **MEDIUM** - Prevents redundant style applications.
-  - Effort: **LOW** - 5 minutes.
-  - Status: ✅ Added check at line 721 in `ExecuteSingleAction`.
-
-✅ **[Normalized Comparison]** - IMPLEMENTED
-  - What: Use `NormalizeForDocument()` in `IsFormattingAlreadyApplied` text comparison.
-  - Impact: **MEDIUM** - Better whitespace handling in no-op detection.
-  - Effort: **LOW** - 2 minutes.
-  - Status: ✅ Fixed line 1433.
-
-✅ **[Better Debug Output]** - IMPLEMENTED
-  - What: Show helpful tips when context not found + warn about long contexts.
-  - Impact: **HIGH** - Debugging/iteration speed.
-  - Effort: **LOW** - 15 minutes.
-  - Status: ✅ Added 4 tips in error path + length warning at 200 chars.
+**Proposed Solution:**
+- Generate a **Document Structure Map (DSM)** with unique anchors before sending to LLM
+- Use **index-based targeting** (paragraph index, table index, cell coordinates) instead of text search
+- Integrate directly with **VA Addin styles** for formatting
+- Simpler JSON schema with deterministic location references
 
 ---
 
-## Phase 1 — Remaining Quick Wins (Priority: HIGH)
+## Phase 1: Document Structure Map (DSM) Generator
 
-⚠️ **[Precise target highlighting in preview]** **← NEXT TO IMPLEMENT**
-  - What: Highlight context and exact target with colors.
-  - Why: Immediate visibility of affected text.
-  - How: In `ShowSuggestionPreview`/`frmSuggestionPreview`, apply temporary `Range.HighlightColorIndex` (context: yellow; target: bright green); clear on close.
-  - Impact: **MEDIUM** - Better visual feedback.
-  - Effort: **LOW** - 30 minutes.
-  - Acceptance: Opening a suggestion highlights both; closing clears highlight.
+### 1.1 Create `GenerateDocumentStructureMap()` Function
+
+This function scans the document and generates a JSON-like structure that the LLM will use for context.
+
+```
+Output Format (Markdown for LLM):
+---
+# DOCUMENT STRUCTURE MAP
+
+## P1 [Report Level 1] "1. Introduction"
+## P2 [Report Text] "This report presents the findings of..."
+## P3 [Report Level 2] "1.1 Site Description"
+## P4 [Report Text] "The site is located at..."
+
+## T1 "Table 7.1: Noise Survey Results"
+| Row | Col1 | Col2 | Col3 |
+|-----|------|------|------|
+| R1  | Location | Day dB | Night dB |
+| R2  | Position 1 | 52 | 45 |
+| R3  | Position 2 | 58 | 48 |
+
+## P12 [Report Level 2] "1.2 Assessment Criteria"
+...
+---
+```
+
+**Key Design Decisions:**
+- Each paragraph gets a unique ID: `P1`, `P2`, etc.
+- Each table gets a unique ID: `T1`, `T2`, etc.
+- Style names are shown in brackets to help LLM understand document hierarchy
+- Table cells are addressable by `T1.R2.C3` format (Table 1, Row 2, Column 3)
+- Headings show their auto-generated numbers as part of the text (what user sees)
+
+### 1.2 Style Mapping Dictionary
+
+Map detected Word styles to VA Addin style functions:
+
+| Word Style Name | VA Addin Function | JSON Style Key |
+|-----------------|-------------------|----------------|
+| Report Level 1 | `RChapter` | `"heading_l1"` |
+| Report Level 2 | `RSectionheading` | `"heading_l2"` |
+| Report Text | `RSection` | `"body_text"` |
+| Report Level 3 | `RSubsection` | `"heading_l3"` |
+| Report Level 4 | `RHeadingL4` | `"heading_l4"` |
+| Report Bullet | `RBullet` | `"bullet"` |
+| Table Heading | `Tableheading` | `"table_heading"` |
+| Table Text | `Tabletext` | `"table_text"` |
+| Report Table Number | `RTabletitle` | `"table_title"` |
+| Report Figure | `Rfigure` | `"figure"` |
+
+### 1.3 Implementation Steps
+
+1. **Create `Type DocumentElement`** - Stores paragraph/table info with:
+   - `ElementID` (P1, T1, etc.)
+   - `ElementType` (paragraph, table, figure)
+   - `StyleName` 
+   - `TextPreview` (first 100 chars)
+   - `StartPos`, `EndPos` (character positions for direct Range access)
+   - `ParentIndex` (for hierarchical structure)
+
+2. **Create `BuildDocumentStructureMap()`**:
+   ```vba
+   ' Iterate through all StoryRanges
+   ' For each paragraph:
+   '   - Assign sequential ID (P1, P2...)
+   '   - Record style, position, text preview
+   '   - Detect if it's a table title (paragraph before/after table)
+   ' For each table:
+   '   - Assign sequential ID (T1, T2...)
+   '   - Record all cell contents with R/C coordinates
+   '   - Link to associated title paragraph
+   ```
+
+3. **Create `ExportStructureMapAsMarkdown()`**:
+   - Generates the markdown format shown above
+   - This is what gets sent to the LLM for context
 
 ---
 
-## Phase 2 — Reliability (Multiple actions & matching)
+## Phase 2: New JSON Schema for LLM Suggestions
 
-- [Occurrence disambiguation]
-  - What: Support `occurrenceIndex` (1-based) for repeated targets in the same context.
-  - Why: Deterministic targeting when substrings repeat.
-  - How: In `ExecuteSingleAction`, iterate `.Find.Execute` to the nth occurrence or count matches via loop and select nth.
-  - Acceptance: Tests for 1st/middle/last occurrences pass consistently.
+### 2.1 Simplified Action Schema
 
-- [Action order + context refresh]
-  - What: Apply sub-actions in stable order and refresh working context after each mutation.
-  - Why: After earlier changes, later target positions shift and may fail to match.
-  - How: Default order when not set: `replace` → `apply_heading_style`/format → `replace_with_table` → `comment`. After each sub-action, refresh a `currentContextRange` snapshot; after `replace_with_table`, set to `newTable.Range`.
-  - Acceptance: Compound actions apply reliably; follow-up actions still find targets.
-
-- [Per-suggestion `matchCase`]
-  - What: Allow `matchCase` at suggestion or action level.
-  - Why: Some corrections require case sensitivity.
-  - How: Read override and pass into `FindLongString`.
-  - Acceptance: Case-sensitive matches behave correctly in mixed-casing contexts.
-
----
-
-## Phase 3 — Preview UX
-
-- [Before/After snippet]
-  - What: Show short diff-like view for `replace` changes.
-  - Why: Quick, confident decision-making.
-  - How: Simulate replacement on a copy of text; render Before vs After in form (text-only; simple markers acceptable).
-  - Acceptance: Users see a clear “before vs after” snippet alongside context.
-
-- [Non-text suggestions clarity]
-  - What: Prominent banner for `comment`/`question` actions (no text change).
-  - Why: Set correct expectation; reduce cognitive load.
-  - How: Display type label (Formatting / Structure / Comment / Question) and a large “No text will change” notice.
-  - Acceptance: Comment-only items don’t appear like text edits; acceptance inserts a Word comment only.
-
-- [Modeless wait loop improvement]
-  - What: Avoid busy-wait spin.
-  - Why: Lower CPU use; improved responsiveness.
-  - How: Use modal dialog or a short-timer polling; always clear highlights on any exit path.
-  - Acceptance: CPU stays low while waiting; highlights are cleared reliably.
-
----
-
-## Phase 4 — Process Controls
-
-- [Preflight Analyzer]
-  - What: Categorize suggestions before review: Actionable, No-op, Ambiguous (repeated targets without `occurrenceIndex`), Not Found.
-  - Why: Focus effort; skip noise; prioritize ambiguous items.
-  - How: Pass over suggestions using matching logic without applying; present counts and filters.
-  - Acceptance: Users can filter to actionable-only or prioritize ambiguous.
-
-- [Interactive tracked-changes option]
-  - What: Optional “Apply as Tracked Changes” in interactive mode.
-  - Why: Retain post-pass review workflows.
-  - How: Temporarily set `ActiveDocument.TrackRevisions = True`; restore afterwards; maintain reviewer identity.
-  - Acceptance: Accepted changes appear as tracked when enabled; settings restored on exit.
-
-- [Single-step undo per suggestion]
-  - What: Group all edits from a single accepted suggestion into one undo record.
-  - Why: Improves trust and controllability.
-  - How: Wrap apply path with `Application.UndoRecord.StartCustomRecord`/`EndCustomRecord`.
-  - Acceptance: Ctrl+Z reverts the last accepted suggestion in one step.
-
----
-
-## Phase 5 — Schema & Prompt
-
-- [JSON schema v2]
-  - Fields:
-    - Required: `id`, `context`
-    - Optional (suggestion): `matchCase` (bool), `type` ("formatting" | "structure" | "comment" | "question")
-    - Single action: `{ action, target?, replace?, explanation?, occurrenceIndex?, matchCase? }`
-    - Multiple actions: `{ actions: [ same fields + optional order ] }`
-  - Backward compatible with v1; warn on ambiguity when fields missing.
-  - Acceptance: v1 payloads still work; v2 fields honored when present.
-
-- [LLM prompt alignment]
-  - Guidance:
-    - Keep `context` minimal and unique.
-    - Set `occurrenceIndex` when `target` repeats.
-    - Avoid no-ops when formatting already applied.
-    - Use only `<b>`, `<i>`, `<sub>`, `<sup>` inline tags.
-    - Avoid trailing commas and smart quotes.
-  - Acceptance: LLM outputs validate cleanly; fewer ambiguities in preflight.
-
-Example (v2):
 ```json
-[
-  {
-    "id": "H1-title-style",
-    "type": "formatting",
-    "context": "Project Overview",
-    "actions": [
-      { "action": "apply_heading_style", "replace": "Heading 1" },
-      { "action": "comment", "explanation": "Promote to H1 for consistency." }
-    ]
-  },
-  {
-    "id": "inline-emphasis",
-    "context": "Ensure the critical term is highlighted here.",
-    "actions": [
-      {
-        "action": "replace",
-        "target": "critical",
-        "occurrenceIndex": 1,
-        "replace": "<b>critical</b>"
-      }
-    ]
-  },
-  {
-    "id": "author-question",
-    "type": "question",
-    "context": "The experiment shows robust results.",
-    "action": "comment",
-    "explanation": "Do you have variance across cohorts?"
-  }
-]
+{
+  "suggestions": [
+    {
+      "target": "P5",
+      "action": "replace",
+      "find": "exisitng text",
+      "replace": "existing text",
+      "explanation": "Spelling correction"
+    },
+    {
+      "target": "P12",
+      "action": "apply_style",
+      "style": "heading_l2",
+      "explanation": "This should be a section heading"
+    },
+    {
+      "target": "T2.R3.C2",
+      "action": "replace",
+      "find": "52",
+      "replace": "53",
+      "explanation": "Corrected noise level"
+    },
+    {
+      "target": "T1",
+      "action": "replace_table",
+      "replace": "| Col1 | Col2 |\n|---|---|\n| A | B |",
+      "explanation": "Updated table data"
+    },
+    {
+      "target": "P8",
+      "action": "comment",
+      "explanation": "Consider expanding this section"
+    },
+    {
+      "target": "T3",
+      "action": "insert_row",
+      "after_row": 2,
+      "data": ["Location 4", "55", "47"],
+      "explanation": "Added missing measurement location"
+    }
+  ]
+}
+```
+
+### 2.2 Target Reference Types
+
+| Target Format | Description | Example |
+|---------------|-------------|---------|
+| `P{n}` | Paragraph by index | `P5` |
+| `T{n}` | Entire table | `T2` |
+| `T{n}.R{r}` | Table row | `T2.R3` |
+| `T{n}.R{r}.C{c}` | Table cell | `T2.R3.C2` |
+| `T{n}.H.C{c}` | Table header cell | `T2.H.C1` |
+
+### 2.3 Action Types
+
+| Action | Required Fields | Optional Fields |
+|--------|-----------------|-----------------|
+| `replace` | `find`, `replace` | `match_case` |
+| `apply_style` | `style` | - |
+| `comment` | `explanation` | - |
+| `delete` | - | - |
+| `replace_table` | `replace` (markdown) | - |
+| `insert_row` | `data` (array) | `after_row`, `before_row` |
+| `delete_row` | - | - |
+| `insert_paragraph` | `text`, `style` | `after` (target ref) |
+
+---
+
+## Phase 3: Core Processing Engine Rewrite
+
+### 3.1 Main Entry Point: `ApplyLlmReview_V4()`
+
+```
+1. Show input form (frmJsonInput)
+2. Parse JSON suggestions
+3. Load/refresh DocumentStructureMap
+4. For each suggestion:
+   a. Resolve target reference to Word Range
+   b. Validate action is applicable
+   c. Show preview (if interactive mode)
+   d. Execute action
+5. Report results
+```
+
+### 3.2 Target Resolution: `ResolveTargetToRange()`
+
+This is the **key function** that replaces all the fragile text searching:
+
+```vba
+Private Function ResolveTargetToRange(ByVal targetRef As String) As Range
+    ' Parse target reference format
+    ' P5 -> Get paragraph 5 from structure map -> Return its Range
+    ' T2 -> Get table 2 from structure map -> Return its Range
+    ' T2.R3.C2 -> Get table 2, row 3, col 2 -> Return cell Range
+    
+    ' Uses pre-built structure map - NO TEXT SEARCHING
+    ' Direct position-based Range creation
+End Function
+```
+
+### 3.3 Action Executors
+
+Create separate, focused functions for each action type:
+
+- `ExecuteReplaceAction()` - Find/replace within resolved range
+- `ExecuteApplyStyleAction()` - Apply VA Addin style function
+- `ExecuteCommentAction()` - Add comment to range
+- `ExecuteDeleteAction()` - Delete range content
+- `ExecuteReplaceTableAction()` - Replace entire table
+- `ExecuteInsertRowAction()` - Insert table row with data
+- `ExecuteDeleteRowAction()` - Delete table row
+- `ExecuteInsertParagraphAction()` - Insert new paragraph with style
+
+### 3.4 Style Application Integration
+
+```vba
+Private Sub ApplyVAStyle(ByVal rng As Range, ByVal styleKey As String)
+    rng.Select
+    Select Case LCase$(styleKey)
+        Case "heading_l1": Call RChapter
+        Case "heading_l2": Call RSectionheading
+        Case "body_text", "text": Call RSection
+        Case "heading_l3": Call RSubsection
+        Case "heading_l4": Call RHeadingL4
+        Case "bullet": Call RBullet
+        Case "table_heading": Call Tableheading
+        Case "table_text": Call Tabletext
+        Case "table_title": Call RTabletitle
+        Case "figure": Call Rfigure
+        Case Else
+            ' Fallback: try to apply as Word built-in style
+            On Error Resume Next
+            rng.Style = styleKey
+            On Error GoTo 0
+    End Select
+End Sub
 ```
 
 ---
 
-## Phase 6 — Matching & Scope Options
+## Phase 4: User Interface Updates
 
-- [Process selection only]
-  - What: Option to limit processing to `Selection.Range`.
-  - Why: Large docs; staged reviews.
-  - Acceptance: Only text within selection is matched and changed when enabled.
+### 4.1 Input Form Updates (frmJsonInput)
 
-- [Fuzzy matching anchors and guards]
-  - What: Optional `anchor` to accelerate long-context matching; maintain thresholds to avoid slow searches.
-  - Acceptance: Long contexts resolve faster and more accurately with anchors.
+Add new features:
+- **"Generate Structure Map"** button - Creates and displays the DSM
+- **"Copy to Clipboard"** button - Copies DSM for pasting to LLM
+- **Structure Map Preview** text box - Shows generated map
+- Keep existing JSON input area
 
----
+### 4.2 Preview Form Updates (frmSuggestionPreview)
 
-## QA & Verification
-- Fixtures: sample docs + JSON covering single, multiple, formatting-only, tables, comments, long contexts, repeated targets with/without `occurrenceIndex`.
-- Logging: include action type, decision (applied/skipped), and reason (no-op/not-found/ambiguous) in Immediate Window.
+Simplify since targeting is now deterministic:
+- Show target reference (P5, T2.R3.C2)
+- Show resolved location (highlight in document)
+- Show proposed change
+- Accept/Skip/Stop buttons
 
----
+### 4.3 New: Structure Map Viewer (Optional)
 
----
-
-## NEW: High-Impact/Low-Effort Additions (Based on User Feedback)
-
-### Matching Improvements (to reduce "not found" errors)
-
-✅ **[Progressive Fallback Strategy]** - DONE
-  - Multi-strategy matching dramatically reduces "not found" errors.
-  - See Phase 0 for details.
-
-⚠️ **[Better Debug Output for Not Found]** - RECOMMENDED
-  - What: When context not found, show first 100 chars of what was searched + suggestions.
-  - Why: Helps user/LLM understand why match failed.
-  - Impact: **HIGH** - Debugging/iteration speed.
-  - Effort: **LOW** - 15 minutes.
-  - How: In error path, log: "Searched for: '[text]...' | Try: shortening context, checking for typos, or using a distinctive phrase."
-
-🔄 **[Trim Excess Whitespace in LLM Prompts]** - RECOMMENDED
-  - What: Guide LLM to avoid leading/trailing spaces in context and target fields.
-  - Why: Prevents mismatches from invisible whitespace.
-  - Impact: **MEDIUM** - Preventative.
-  - Effort: **LOW** - Update prompt only.
-  - How: Add to LLM prompt: "Never include leading or trailing spaces in 'context' or 'target' fields. Use distinctive, concise phrases."
-
-⚠️ **[Context Length Warnings]** - RECOMMENDED
-  - What: Warn when context > 200 chars.
-  - Why: Long contexts are fragile and slow to match.
-  - Impact: **MEDIUM** - Encourages better LLM output.
-  - Effort: **LOW** - 10 minutes.
-  - How: In preflight or during processing, flag long contexts and suggest shorter alternatives in Debug.
-
-### User Experience
-
-✅ **[Keyboard Shortcuts Fixed]** - DONE
-  - Locked textboxes now delegate key events properly.
-  - A=Accept, R=Reject, S/N=Skip, ESC=Stop.
-
-⚠️ **[Before/After Text Preview]** - RECOMMENDED (HIGH IMPACT)
-  - What: For "replace" actions, show side-by-side or "before → after" in preview form.
-  - Why: Instant clarity on what will change.
-  - Impact: **HIGH** - Confidence, speed.
-  - Effort: **MEDIUM** - 1 hour (add label/textbox pair to form).
-  - How: Simulate the replacement on a text copy; display in form. Example: `"quick brown fox" → "slow red fox"`
-
-⚠️ **[Action Type Icons/Color]** - RECOMMENDED
-  - What: Color-code action types in preview form.
-  - Why: Visual differentiation (Replace=blue, Style=green, Comment=yellow, etc.).
-  - Impact: **MEDIUM** - Visual clarity.
-  - Effort: **LOW** - 20 minutes.
-  - How: Set `lblActionType.ForeColor` based on action type.
-
-⚠️ **[Show % Match Confidence]** - OPTIONAL
-  - What: Display match strategy used (e.g., "Found: 80% context, case-insensitive").
-  - Why: User knows when match is approximate vs exact.
-  - Impact: **LOW-MEDIUM** - Transparency.
-  - Effort: **MEDIUM** - 45 minutes.
-  - How: Return match metadata from `FindWithProgressiveFallback`; display in form.
+Simple form showing:
+- Tree view of document structure
+- Click to navigate to element
+- Shows element ID for reference
 
 ---
 
-## Timeline & Priorities (REVISED)
+## Phase 5: LLM Prompt Template
 
-### Immediate (All Completed! ✅)
-1. ✅ Progressive fallback matching (DONE)
-2. ✅ Keyboard shortcuts fix (DONE)
-3. ✅ Style no-op check (DONE)
-4. ✅ Normalized comparison in IsFormattingAlreadyApplied (DONE)
-5. ✅ Better debug output for "not found" (DONE)
-6. ✅ Context length warnings (DONE)
+### 5.1 System Prompt for Document Review
 
-### High Priority (Next Session - Total: ~2-3 hours)
-7. ⚠️ Before/after preview (1 hour)
-8. ⚠️ Target highlighting (30 min)
-9. ⚠️ Occurrence index support (1-2 hours)
-10. ⚠️ Context refresh for compound actions (1 hour)
-11. ⚠️ Action type color coding (20 min)
+```markdown
+You are a technical document reviewer. You will receive a Document Structure Map (DSM) 
+showing the structure of a Word document.
 
-### Medium Priority (When Time Permits - Total: ~3-4 hours)
-12. Preflight analyzer (2-3 hours) - categorize before review
-13. Undo grouping (30 min)
-14. Busy-wait fix (15 min)
-15. Protected range handling (1 hour)
-16. Show match confidence (45 min)
+## DSM Format:
+- P{n} = Paragraph number n
+- T{n} = Table number n  
+- [Style Name] = Current paragraph style
+- T{n}.R{r}.C{c} = Table n, Row r, Column c
 
-### Deferred (Low Priority or High Effort)
-- Schema v2 with full backward compatibility
-- Selection-only mode
-- Resume functionality
-- Batch operations
-- CSV export logging
-- Transaction/rollback for compound actions
+## Your Response Format:
+Return a JSON array of suggestions. Each suggestion must have:
+- "target": The element reference (P5, T2.R3.C2, etc.)
+- "action": One of: replace, apply_style, comment, delete, replace_table, insert_row, delete_row
+- "explanation": Why this change is needed
+
+For "replace" actions, include "find" and "replace" fields.
+For "apply_style" actions, include "style" field with one of:
+  heading_l1, heading_l2, heading_l3, heading_l4, body_text, bullet, 
+  table_heading, table_text, table_title, figure
+
+## Style Hierarchy (use for apply_style):
+1. heading_l1 - Chapter titles (e.g., "1. Introduction")
+2. heading_l2 - Section headings (e.g., "1.1 Site Description")  
+3. heading_l3 - Subsection headings (italic)
+4. heading_l4 - Sub-subsection headings
+5. body_text - Normal paragraph text
+6. bullet - Bullet points
+7. table_heading - Table header row cells
+8. table_text - Table body cells
+9. table_title - Table captions (e.g., "Table 7.1: Results")
+10. figure - Figure captions
+
+## Example Response:
+```json
+[
+  {"target": "P5", "action": "replace", "find": "recieved", "replace": "received", "explanation": "Spelling"},
+  {"target": "P12", "action": "apply_style", "style": "heading_l2", "explanation": "Should be section heading"},
+  {"target": "T2.R3.C2", "action": "replace", "find": "52", "replace": "53", "explanation": "Incorrect value"},
+  {"target": "P8", "action": "comment", "explanation": "Consider adding methodology details"}
+]
+```
+
+Now review the following document:
+```
 
 ---
 
-## Risks & Mitigations
-- Overlapping targets in compound actions → deterministic order + range refresh.
-- Performance on long contexts → anchors + matching thresholds.
-- Schema drift from LLM → strict template + validation with actionable messages.
+## Phase 6: Migration & Compatibility
+
+### 6.1 File Structure
+
+Create new module or significantly refactor existing:
+
+```
+wordAIreviewer_v4.bas (new main module)
+├── Document Structure Map functions
+├── Target resolution functions  
+├── Action executor functions
+├── Style integration functions
+├── JSON parsing (keep existing)
+├── UI form handlers
+
+frmJsonInput.frm (updated)
+├── Structure map generation UI
+├── JSON input area
+
+frmSuggestionPreview.frm (simplified)
+├── Target-based preview
+```
+
+### 6.2 Functions to Keep from Current Implementation
+
+- `LLM_ParseJson()` - JSON parser works well
+- `PreProcessJson()` - JSON cleanup
+- `NormalizeForDocument()` - Text normalization
+- `ParseFormattingTags()` - HTML tag parsing for `<b>`, `<i>`, etc.
+- `ApplyFormattedReplacement()` - But remove Font.Reset call
+- `ConvertMarkdownToTable()` - Table creation from markdown
+
+### 6.3 Functions to Remove/Replace
+
+- `FindWithProgressiveFallback()` - Replaced by `ResolveTargetToRange()`
+- `FindLongString()` - No longer needed
+- `FuzzyFindString()` - No longer needed
+- `FindTableCell()` - Replaced by coordinate-based lookup
+- `FindTableByTitle()` - Replaced by index-based lookup
+- All `TextMatchesHeuristic()` family - No longer needed
+- `BuildTableIndex()` - Replaced by DSM
 
 ---
 
-## Next Steps
-- Confirm priority and scope for Phases 1–3.
-- Implement Phase 1 and core of Phase 2; add a small preflight analyzer and target highlighting.
+## Phase 7: Implementation Order
+
+### Step 1: Core Infrastructure (Day 1)
+1. Create `DocumentElement` Type
+2. Create `g_DocumentMap()` global array
+3. Implement `BuildDocumentStructureMap()`
+4. Implement `ExportStructureMapAsMarkdown()`
+5. Test: Generate map for sample document
+
+### Step 2: Target Resolution (Day 1-2)
+1. Implement `ParseTargetReference()` - Parse "T2.R3.C2" format
+2. Implement `ResolveTargetToRange()` - Return Word Range
+3. Test: Verify correct range selection for various targets
+
+### Step 3: Style Integration (Day 2)
+1. Implement `ApplyVAStyle()` with all style mappings
+2. Test: Apply each style type correctly
+
+### Step 4: Action Executors (Day 2-3)
+1. Implement `ExecuteReplaceAction()`
+2. Implement `ExecuteApplyStyleAction()`
+3. Implement `ExecuteCommentAction()`
+4. Implement `ExecuteDeleteAction()`
+5. Implement table actions (replace, insert_row, delete_row)
+6. Test: Each action type individually
+
+### Step 5: Main Processing Loop (Day 3)
+1. Implement `ApplyLlmReview_V4()` main entry
+2. Implement `ProcessSuggestionV4()` 
+3. Implement preflight validation
+4. Test: End-to-end with sample JSON
+
+### Step 6: UI Updates (Day 4)
+1. Update frmJsonInput with DSM generation
+2. Simplify frmSuggestionPreview for target-based preview
+3. Test: Full workflow
+
+### Step 7: Testing & Polish (Day 4-5)
+1. Test with real documents containing:
+   - Auto-numbered headings
+   - Multiple similar tables
+   - Long paragraphs
+   - TOC
+2. Error handling refinement
+3. Debug logging improvements
+
+---
+
+## Phase 8: Testing Checklist
+
+### Unit Tests
+- [ ] DSM generates correct paragraph indices
+- [ ] DSM generates correct table indices  
+- [ ] DSM captures correct styles
+- [ ] Target "P5" resolves to correct paragraph
+- [ ] Target "T2.R3.C2" resolves to correct cell
+- [ ] Each action type executes correctly
+- [ ] VA Addin styles apply correctly
+
+### Integration Tests
+- [ ] Full workflow: Generate DSM → Get LLM response → Apply changes
+- [ ] Auto-numbered headings handled correctly
+- [ ] Multiple similar tables distinguished correctly
+- [ ] TOC not affected by changes
+- [ ] Track Changes works with new system
+- [ ] Undo works correctly
+
+### Edge Cases
+- [ ] Empty document
+- [ ] Document with only tables
+- [ ] Nested tables
+- [ ] Merged cells
+- [ ] Very long documents (100+ pages)
+- [ ] Documents with fields/bookmarks
+
+---
+
+## Appendix A: Sample Document Structure Map Output
+
+```markdown
+# DOCUMENT STRUCTURE MAP
+Generated: 2024-01-15 14:30:00
+
+## Paragraphs
+
+P1 [Report Level 1] "1. Introduction"
+P2 [Report Text] "This report presents the findings of the noise impact assessment for the proposed residential development at 123 Example Street, London."
+P3 [Report Level 2] "1.1 Site Description"
+P4 [Report Text] "The site is located in a predominantly residential area..."
+P5 [Report Text] "The surrounding area comprises..."
+P6 [Report Level 2] "1.2 Proposed Development"
+P7 [Report Text] "The proposed development consists of..."
+P8 [Report Level 1] "2. Assessment Criteria"
+P9 [Report Level 2] "2.1 National Planning Policy Framework"
+P10 [Report Text] "The NPPF states that..."
+P11 [Report Table Number] "Table 2.1: BS8233:2014 Internal Noise Criteria"
+
+## Tables
+
+T1 [after P11] "BS8233:2014 Internal Noise Criteria"
+| R | C1 | C2 | C3 |
+|---|----|----|-----|
+| 1 | Room Type | Day (07:00-23:00) | Night (23:00-07:00) |
+| 2 | Living Room | 35 dB LAeq,16hr | - |
+| 3 | Bedroom | 35 dB LAeq,16hr | 30 dB LAeq,8hr |
+
+P12 [Report Level 2] "2.2 Local Planning Policy"
+P13 [Report Text] "The local development plan requires..."
+...
+```
+
+---
+
+## Appendix B: Error Handling Strategy
+
+### Target Resolution Errors
+```vba
+' If target not found in structure map:
+' 1. Log warning with target reference
+' 2. Attempt to rebuild structure map (document may have changed)
+' 3. If still not found, skip suggestion with user notification
+' 4. Continue processing remaining suggestions
+```
+
+### Action Execution Errors
+```vba
+' If action fails:
+' 1. Log detailed error (target, action, error message)
+' 2. Wrap in UndoRecord so partial changes can be reverted
+' 3. Notify user of specific failure
+' 4. Continue with next suggestion
+```
+
+### Style Application Errors
+```vba
+' If VA Addin style function fails:
+' 1. Fall back to direct style assignment
+' 2. If that fails, log and skip
+' 3. Never leave document in inconsistent state
+```
+
+---
+
+## Appendix C: Why Not Markdown Anchoring?
+
+The user asked about generating markdown with anchoring tags. This approach was considered but rejected because:
+
+1. **Lossy conversion** - Converting Word to markdown loses formatting, styles, and structure
+2. **Round-trip problems** - Changes in markdown would need to be mapped back to Word positions
+3. **Table complexity** - Word tables with merged cells, formatting don't map cleanly to markdown
+4. **Style information lost** - Can't preserve VA Addin styles in markdown
+5. **Position drift** - If document is edited, anchors become invalid
+
+The DSM approach provides structural anchoring **within Word's native model**, avoiding these issues.
+
+---
+
+## Summary
+
+This refactor replaces fragile text-based searching with deterministic index-based targeting. The LLM receives a structured map of the document and returns changes using stable references (P5, T2.R3.C2) that map directly to Word Ranges. This eliminates the root cause of most failures: ambiguous text matching.
+
+**Estimated effort**: 4-5 days for a skilled VBA developer
+**Risk level**: Medium - significant architectural change but well-defined scope
+**Backward compatibility**: Not required per user specification

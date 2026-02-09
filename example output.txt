@@ -1,0 +1,1104 @@
+You are a technical document reviewer for acoustics and noise impact assessment reports. You will receive a Document Structure Map (DSM) showing the structure of a Word document with unique IDs for each element.
+
+## IMPORTANT: Response Format
+
+Return a JSON array of suggestions. Each suggestion MUST have:
+- "target": Element ID from the structure map (e.g., "P5", "T2.R3.C2")
+- "action": One of the action types listed below
+- "explanation": Brief reason for the change
+
+## Action Types
+
+### replace
+Find and replace text within the target element.
+Required: "find", "replace" | Optional: "match_case" (true/false)
+Example: {"target": "P5", "action": "replace", "find": "recieved", "replace": "received", "explanation": "Spelling"}
+
+### apply_style
+Apply a document style to the target element.
+Required: "style"
+Available styles: heading_l1, heading_l2, heading_l3, heading_l4, body_text, bullet, table_heading, table_text, table_title, figure
+Example: {"target": "P12", "action": "apply_style", "style": "heading_l2", "explanation": "Should be section heading"}
+
+### comment
+Add a comment to the target element.
+Required: "explanation" (becomes the comment text)
+Example: {"target": "P8", "action": "comment", "explanation": "Consider adding methodology details"}
+
+### replace_table
+Replace entire table with new markdown table.
+Required: "replace" (markdown table format)
+Example: {"target": "T1", "action": "replace_table", "replace": "| Col1 | Col2 |\n|---|---|\n| A | B |", "explanation": "Updated data"}
+
+### insert_row
+Insert a new row in a table.
+Required: "data" (array of cell values) | Optional: "after_row" (row number, default 0)
+Example: {"target": "T2", "action": "insert_row", "after_row": 3, "data": ["Location 4", "55", "47"], "explanation": "Added missing location"}
+
+### delete_row
+Delete a table row. Target must be a row reference (e.g., "T2.R5")
+Example: {"target": "T2.R5", "action": "delete_row", "explanation": "Duplicate entry"}
+
+## Target Reference Format
+
+- P{n} = Paragraph number (e.g., P5 = 5th paragraph)
+- T{n} = Table number (e.g., T2 = 2nd table)
+- T{n}.R{r} = Table row (e.g., T2.R3 = Table 2, Row 3)
+- T{n}.R{r}.C{c} = Table cell (e.g., T2.R3.C2 = Table 2, Row 3, Column 2)
+- T{n}.H.C{c} = Table header cell (e.g., T2.H.C1 = Table 2, Header, Column 1)
+
+## Review Guidelines
+
+Focus on:
+1. Technical accuracy (noise levels, standards, calculations)
+2. Consistency (terminology, units, formatting)
+3. Clarity (sentence structure, paragraph flow)
+4. Compliance (BS8233, WHO guidelines, planning policy)
+5. Completeness (missing sections, incomplete tables)
+
+## Formatting in Replacements
+
+You can use HTML-like tags in "replace" text:
+- <b>text</b> for bold
+- <i>text</i> for italic
+- <sub>text</sub> for subscript
+- <sup>text</sup> for superscript
+Example: "55 <b>dB</b> L<sub>Aeq</sub>"
+
+---
+
+# DOCUMENT STRUCTURE MAP
+Generated: 2026-02-03 14:26:52
+
+## Paragraphs and Tables
+
+## P1 [Normal] "
+"
+## P2 [Normal] "
+"
+## P3 [Normal] "
+"
+## P4 [Frontpage Ref] "Report VA6210.260127.NIA
+"
+## P5 [Normal] "
+"
+## P6 [Normal] "
+"
+## P7 [Normal] "
+"
+## P8 [Frontpage Title] "Lisieux Way, Taunton
+"
+## P9 [Normal] "
+"
+## P10 [Normal] "
+"
+## P11 [Normal] "
+"
+## P12 [Frontpage Report] "Noise Impact Assessment
+"
+## P13 [Normal] "
+"
+## P14 [Normal] "
+"
+## P15 [Normal] "
+"
+## P16 [Normal] "03 February 2026
+"
+## P17 [Normal] "
+"
+## P18 [Frontpage Address] "LNT Care Developments
+"
+## P19 [Frontpage Address] "Helios 47
+"
+## P20 [Frontpage Address] "Isabella Road
+"
+## P21 [Frontpage Address] "Garforth
+"
+## P22 [Frontpage Address] "LS25 2DY
+"
+## P23 [Frontpage Address] "
+"
+## P24 [Normal] "
+"
+## P25 [Normal] "
+"
+## P26 [level6] ""
+## P27 [Normal] "Contents
+"
+## P28 [Normal] "
+"
+## P29 [TOC 1] "1.	Introduction	1
+"
+## P30 [TOC 1] "2.	Guidance and Legislation	1
+"
+## P31 [TOC 2] "2.1	The National Planning Policy Framework (2024)	1
+"
+## P32 [TOC 2] "2.2	Noise Policy Statement for England (2010)	2
+"
+## P33 [TOC 2] "2.3	WHO Guidelines for Community Noise (1999)	2
+"
+## P34 [TOC 2] "2.4	BS8233:2014	3
+"
+## P35 [TOC 2] "2.5	BS4142:2014+A1:2019	4
+"
+## P36 [TOC 1] "3.	Site Description	4
+"
+## P37 [TOC 1] "4.	Environmental Noise Survey	5
+"
+## P38 [TOC 2] "4.1	Survey Procedure & Equipment	5
+"
+## P39 [TOC 2] "4.2	Results	6
+"
+## P40 [TOC 1] "5.	Traffic Noise	6
+"
+## P41 [TOC 1] "6.	YMCA Multi-Use Games Area (MUGA)	7
+"
+## P42 [TOC 1] "7.	Internal Noise Assessment	8
+"
+## P43 [TOC 2] "7.1	Sound Reduction Performances of Building Elements	8
+"
+## P44 [TOC 2] "7.2	Sound Reduction Performance of Windowsets and Vents	8
+"
+## P45 [TOC 2] "7.3	Ventilation	9
+"
+## P46 [TOC 1] "8.	Areas of External Amenity	9
+"
+## P47 [TOC 1] "9.	Plant Noise Assessment	9
+"
+## P48 [TOC 2] "9.1	Proposed plant	9
+"
+## P49 [TOC 2] "9.2	Predicted Noise Levels	10
+"
+## P50 [TOC 3] "9.2.1	Kitchen Extract Fan	10
+"
+## P51 [TOC 3] "9.2.2	PV Battery Storage	11
+"
+## P52 [TOC 2] "9.3	Uncertainty	11
+"
+## P53 [TOC 1] "10.	Conclusion	12
+"
+## P54 [Report Text] "
+"
+## P55 [Normal] "Attachments
+"
+## P56 [Table Text] "VA6210/SP1
+"
+## P57 [Table Text] "Indicative Site Plan
+"
+## P58 [Normal] "
+"
+## P59 [Table Text] "VA6210/TH1-TH7
+"
+## P60 [Table Text] "Environmental Noise Time Histories
+"
+## P61 [Normal] "
+"
+## P62 [Table Text] "
+"
+## P63 [Table Text] "
+"
+## P64 [Normal] "
+"
+## P65 [Table Text] "Appendix A
+"
+## P66 [Table Text] "Acoustic Terminology
+"
+## P67 [Normal] "
+"
+## P68 [Table Text] "
+"
+## P69 [Table Text] "
+"
+## P70 [Normal] "
+"
+## P71 [Normal] "
+"
+## P72 [Report Text] "
+"
+## P73 [Table Heading] "Report Version 
+"
+## P74 [Table Heading] "Author
+"
+## P75 [Table Heading] "Approved
+"
+## P76 [Table Heading] "Changes
+"
+## P77 [Table Heading] "Date
+"
+## P78 [Normal] "
+"
+## P79 [Table Text] "NIA
+"
+## P80 [Table Text] "Steven Liddell"
+## P81 [Table Text] "Ben Alexander"
+## P82 [Table Text] "
+"
+## P83 [Table Text] "02/02/2026
+"
+## P84 [Normal] "
+"
+## P85 [Report Table Number] "
+"
+## P86 [Normal] "
+"
+## P87 [Report Text] "
+"
+## P88 [Report Text] "The interpretations and conclusions summarised in this report represent Venta Acoustics’ best techni..."
+## P89 [level6] "
+"
+## P90 [level6] "
+"
+## P91 [Normal] ""
+## P92 [Report Level 1] "Introduction
+"
+## P93 [Report Text] "It is proposed to develop a new care home on land to the south-west of Lisieux Way, Taunton.
+"
+## P94 [Report Text] "LNT Care Developments has commissioned the assessment to review the existing noise climate at the si..."
+## P95 [Report Text] "The assessment has been undertaken with reference to the National Planning Policy Framework (NPPF), ..."
+## P96 [Report Text] "This report details the methodology and results of the assessment and provides recommendations for t..."
+## P97 [Report Level 1] "Guidance and Legislation 
+"
+## P98 [Report Level 2] "The National Planning Policy Framework (2024)
+"
+## P99 [Report Text] "The revised National Planning Policy Framework (NPPF), published in December 2024, sets out the Gove..."
+## P100 [Report Text] "In respect of noise, the NPPF states that the planning system should contribute to and enhance the n..."
+## P101 [Report Text] "Hence, Paragraph 198 states that planning policies and decisions should also ensure new development ..."
+## P102 [Report Bullets Italic] "mitigate and reduce to a minimum potential adverse impacts resulting from noise from new development..."
+## P103 [Report Bullets Italic] "identify and protect tranquil areas which have remained relatively undisturbed by noise and are priz..."
+## P104 [Report Text] "In regards to the term adverse impact, reference is made to the Noise Policy for England:
+"
+## P105 [Report Level 2] "Noise Policy Statement for England (2010)
+"
+## P106 [Report Text] "The Noise Policy Statement for England (NPSE) sets out the long term vision of Government noise poli..."
+## P107 [Report Text] "This vision is supported by the following aims:
+"
+## P108 [Report Bullets Italic] "avoid significant adverse impacts on health and quality of life;
+"
+## P109 [Report Bullets Italic] "mitigate and minimise adverse impacts on health and quality of life; and
+"
+## P110 [Report Bullets Italic] "where possible, contribute to the improvement of health and quality of life.
+"
+## P111 [Report Text] "The terms “significant adverse” and “adverse” are related to the following concepts:
+"
+## P112 [Report Text] "No Observed Effect Level (NOEL) - the level below which no effect on health and quality of life can ..."
+## P113 [Report Text] "Lowest Observed Adverse Effect Level (LOAEL) - the level above which adverse effects on health and q..."
+## P114 [Report Text] "Significant Observed Adverse Effect Level (SOAEL) - the level above which significant adverse effect..."
+## P115 [Report Text] "The guidance acknowledges that it is not possible to have a single objective noise-based measure tha..."
+## P116 [Report Text] "In order to enable assessment of impacts in line with these requirements, reference should be made t..."
+## P117 [Report Level 2] "WHO Guidelines for Community Noise (1999)
+"
+## P118 [Report Text] "The guidance in this document details suitable noise levels for various activities within residentia..."
+## P119 [Report Text] "The relevant sections of this document are shown in Table 2.1.
+"
+## P120 [Table Heading] "Criterion
+"
+## P121 [Table Heading] "Environment
+"
+## P122 [Table Heading] "Design range LAeq,T dB
+"
+## P123 [Normal] "
+"
+## P124 [Table Text] "Maintain speech intelligibility and avoid moderate annoyance, daytime and evening
+"
+## P125 [Table Text] "Living Room
+"
+## P126 [Table Text] "35 dB
+"
+## P127 [Normal] "
+"
+## P128 [Table Text] "Prevent sleep disturbance, night time
+"
+## P129 [Table Text] "Bedrooms
+"
+## P130 [Table Text] "30 dB
+"
+## P131 [Normal] "
+"
+## P132 [Report Table Number] "– Excerpt from WHO	[dB ref. 20µPa]
+"
+## P133 [Normal] "
+"
+## P134 [Report Text] "This guidance also states: 
+"
+## P135 [Report Text] "For a good sleep, it is believed that indoor sound pressure levels should not exceed approximately 4..."
+## P136 [Report Text] "For outdoor living areas, it is stated that:
+"
+## P137 [Report Text] "To protect the majority of people from being seriously annoyed during the daytime, the outdoor sound..."
+## P138 [Report Text] "For sleep disturbance, i.e. in bedrooms at night, the NOEL can, therefore, be taken as anything belo..."
+## P139 [Report Text] "During daytime periods, for avoidance of annoyance, the NOEL relates to anything up to 50dB(A) (typi..."
+## P140 [Report Level 2] "BS8233:2014 
+"
+## P141 [Report Text] "BS8233 Guidance on sound insulation and noise reduction for buildings provides guidance as to desira..."
+## P142 [Report Text] "The relevant section of the standard is shown below in Table 2.2.
+"
+## P143 [Table Heading] "Activity
+"
+## P144 [Table Heading] "Location
+"
+## P145 [Table Heading] "07:00 to 23:00
+"
+## P146 [Table Heading] "23:00 to 07:00
+"
+## P147 [Normal] "
+"
+## P148 [Table Text] "Resting
+"
+## P149 [Table Text] "Living Room
+"
+## P150 [Table Text] "35 dB LAeq, 16 hour
+"
+## P151 [Table Text] "-
+"
+## P152 [Normal] "
+"
+## P153 [Table Text] "Dining
+"
+## P154 [Table Text] "Dining Room
+"
+## P155 [Table Text] "40 dB LAeq, 16 hour
+"
+## P156 [Table Text] "-
+"
+## P157 [Normal] "
+"
+## P158 [Table Text] "Sleeping (daytime resting)
+"
+## P159 [Table Text] "Bedroom
+"
+## P160 [Table Text] "35 dB LAeq, 16 hour
+"
+## P161 [Table Text] "30 dB LAeq, 8 hour
+"
+## P162 [Normal] "
+"
+## P163 [Report Table Number] "– Excerpt from BS8233:2014 - Indoor ambient noise levels for dwellings                  	[dB ref. 20..."
+## P164 [Normal] "
+"
+## P165 [Report Text] "For external areas the standard states the following: 
+"
+## P166 [Report Text] "For traditional external areas that are used for amenity space, such as gardens and patios, it is de..."
+## P167 [Report Text] "However, it is also recognized that these guideline values are not achievable in all circumstances w..."
+## P168 [Report Level 2] "BS4142:2014+A1:2019  
+"
+## P169 [Report Text] "British Standard BS4142:2014+A1:2019 Methods for rating and assessing industrial and commercial soun..."
+## P170 [Report Text] "The assessment methodology considers the Specific Sound Level, as measured or calculated at a potent..."
+## P171 [Report Text] "Tonality – A correction of up to 6dB depending on the prominence of tones;
+"
+## P172 [Report Text] "Impulsivity - A correction of up to 9dB depending on the prominence of impulsivity;
+"
+## P173 [Report Text] "Other sound characteristics - A 3dB correction may be applied where a distinctive acoustic character..."
+## P174 [Report Text] "Intermittency - A 3dB correction may be applied where the specific sound has identifiable on/off con..."
+## P175 [Report Text] "An estimate of the impact of the source is obtained by subtracting the typical background noise leve..."
+## P176 [List Paragraph] "Typically, the greater this difference, the greater the magnitude of the impact.
+"
+## P177 [List Paragraph] "A difference of around +10 dB or more is likely to be an indication of a significant adverse impact,..."
+## P178 [List Paragraph] "A difference of around +5 dB could be an indication of an adverse impact, depending on the context. ..."
+## P179 [List Paragraph] "The lower the rating level is relative to the measured background sound level, the less likely it is..."
+## P180 [Report Level 1] "Site Description
+"
+## P181 [Report Text] "As illustrated on the attached site plan VA6210/SP1, the application site comprises an irregular par..."
+## P182 [Report Text] "The immediate acoustic environment is mixed, characterised by residential, commercial, and community..."
+## P183 [Report Text] "To the north, immediately adjacent to the site boundary, lies the YMCA Taunton facility. This site i..."
+## P184 [Report Text] "To the east, on the opposite side of Lisieux Way, is the Taunton Ambulance Station. While this is an..."
+## P185 [Report Text] "To the south lies the Taunton Technology Park. This commercial estate includes light industrial and ..."
+## P186 [Report Text] "The site is relatively flat, with no significant topographical features that would provide acoustic ..."
+## P187 [Report Level 1] "Environmental Noise Survey
+"
+## P188 [Report Level 2] "Survey Procedure & Equipment
+"
+## P189 [Report Text] "In order to establish the existing background and ambient noise levels at the site, a noise survey w..."
+## P190 [Report Text] "Continuous 5-minute samples of the LAeq, LAmax, LA10 and LA90 sound pressure levels were undertaken ..."
+## P191 [Report Text] "The weather during the survey period included periods of rain and high winds, which have been exclud..."
+## P192 [Report Text] "Measurements were made generally in accordance with ISO 1996 2:2017 Acoustics - Description, measure..."
+## P193 [Report Text] "The following equipment was used in the course of the survey:
+"
+## P194 [Table Heading] "Manufacturer
+"
+## P195 [Table Heading] "Model Type
+"
+## P196 [Table Heading] "Serial No
+"
+## P197 [Table Heading] "Calibration
+"
+## P198 [Normal] "
+"
+## P199 [Table Heading] "
+"
+## P200 [Table Heading] "
+"
+## P201 [Table Heading] "
+"
+## P202 [Table Heading] "Certificate No.
+"
+## P203 [Table Heading] "Date
+"
+## P204 [Normal] "
+"
+## P205 [Table Text] "Svantek Class 1 SLM
+"
+## P206 [Table Text] "971
+"
+## P207 [Table Text] "143568
+"
+## P208 [Table Text] "1508506-1
+"
+## P209 [Table Text] "22/4/24
+"
+## P210 [Normal] "
+"
+## P211 [Table Text] "Larson Davis calibrator
+"
+## P212 [Table Text] "CAL200
+"
+## P213 [Table Text] "13049
+"
+## P214 [Table Text] "1512828-2
+"
+## P215 [Table Text] "16/7/25
+"
+## P216 [Normal] "
+"
+## P217 [Report Table Number] "– Equipment used for the survey
+"
+## P218 [Normal] "
+"
+## P219 [Report Text] "The calibration of the sound level meter was verified before and after use with no significant calib..."
+## P220 [Report Level 2] "Results
+"
+## P221 [Report Text] "The measured sound levels are shown as a time-history plot on the attached chart VA6210/TH1-7.
+"
+## P222 [Report Text] "The site is primarily affected by traffic on Lisieux Way.  
+"
+## P223 [Report Text] "The average noise levels for the Daytime and Night-time periods, as measured at the automated monito..."
+## P224 [Table Heading] "Monitoring Period
+"
+## P225 [Table Heading] "LAeq, T
+"
+## P226 [Table Heading] "Typical1 LA90,5min
+"
+## P227 [Normal] "
+"
+## P228 [Table Text] "07:00 – 23:00
+"
+## P229 [Table Text] "61 dB
+"
+## P230 [Table Text] "46 dB
+"
+## P231 [Normal] "
+"
+## P232 [Table Text] "23:00 – 07:00
+"
+## P233 [Table Text] "52 dB
+"
+## P234 [Table Text] "36 dB
+"
+## P235 [Normal] "
+"
+## P236 [Table Text] "Kitchen Operational Hours
+"
+## P237 [Table Text] "08:30-17:30
+"
+## P238 [Table Text] "62 dB
+"
+## P239 [Table Text] "52 dB
+"
+## P240 [Normal] "
+"
+## P241 [Report Table Number] "– Average ambient and typical background noise levels
+"
+## P242 [Report Table Number] "1 The typical LA90 value is taken as the 10th percentile of all LA90 values measured during the rele..."
+## P243 [Report Table Number] "
+"
+## P244 [Normal] "
+"
+## P245 [Report Text] "The typical night time LAmax events, generated by vehicle passbys on Lisieux Way, were recorded to b..."
+## P246 [Report Level 1] "Traffic Noise
+"
+## P247 [Report Text] "The noise monitoring position was located 18m from the nearside carriageway edge of Lisieux Way. The..."
+## P248 [Report Text] "The North-West wing and Southern wings benefit from significantly greater distance and screening fro..."
+## P249 [Report Text] "The predicted maximum façade noise levels at the most exposed habitable rooms of each façade are sum..."
+## P250 [Table Heading] "Building Facade
+"
+## P251 [Table Heading] "Daytime LAeq,16hr​
+"
+## P252 [Table Heading] "Night-Time LAeq,8hr​
+"
+## P253 [Table Heading] "Typical Night LAmax,fast​
+"
+## P254 [Normal] "
+"
+## P255 [Table Text] "North East Facade
+"
+## P256 [Table Text] "59 dB
+"
+## P257 [Table Text] "50 dB
+"
+## P258 [Table Text] "68 dB
+"
+## P259 [Normal] "
+"
+## P260 [Table Text] "North West Facade
+"
+## P261 [Table Text] "51 dB
+"
+## P262 [Table Text] "42 dB
+"
+## P263 [Table Text] "60 dB
+"
+## P264 [Normal] "
+"
+## P265 [Table Text] "SE and SW Facade
+"
+## P266 [Table Text] "51 dB
+"
+## P267 [Table Text] "42 dB
+"
+## P268 [Table Text] "60 dB
+"
+## P269 [Normal] "
+"
+## P270 [Report Table Number] "Predicted sound levels on the building façades 
+"
+## P271 [Report Text] "
+"
+## P272 [Report Level 1] "YMCA Multi-Use Games Area (MUGA)
+"
+## P273 [Report Text] "The environmental noise survey identified distinct periods of elevated noise levels during the early..."
+## P274 [Report Text] "As the proposed development introduces a new noise-sensitive use to the area, the assessment follows..."
+## P275 [Report Text] "However, the noise source is intermittent and limited in nature, only occurring during specific dayt..."
+## P276 [Report Text] "To address internal amenity, habitable rooms on the North-West façade will be provided with a standa..."
+## P277 [Report Level 1] "Internal Noise Assessment
+"
+## P278 [Report Text] "A review of the proposed scheme has been undertaken with the intent of achieving the internal noise ..."
+## P279 [Report Level 2] "Sound Reduction Performances of Building Elements
+"
+## P280 [Report Text] "It has been assumed that all the non-glazed elements, i.e. walls and roof systems, will be capable o..."
+## P281 [Table Heading] "Building Element
+"
+## P282 [Table Heading] "Single figure weighted sound reduction index, dB
+"
+## P283 [Normal] "
+"
+## P284 [Table Text] "Roof
+"
+## P285 [Table Text] "Rw 45
+"
+## P286 [Normal] "
+"
+## P287 [Table Text] "Masonry
+"
+## P288 [Table Text] "Rw 51
+"
+## P289 [Normal] "
+"
+## P290 [Report Table Number] "– Assumed sound reductions performances of non-glazed elements
+"
+## P291 [Normal] "
+"
+## P292 [Report Level 2] "Sound Reduction Performance of Windowsets and Vents
+"
+## P293 [Report Text] "The monitoring data along with the architectural drawings have been used to calculate the required s..."
+## P294 [Table Heading] "Glazing Reference
+"
+## P295 [Table Heading] "Required Glazing SRI, Rw (+Ctr) 
+"
+## P296 [Table Heading] "Ventilator Performance, Dn,e,w (+Ctr)
+"
+## P297 [Normal] "
+"
+## P298 [Table Text] "All Façades
+"
+## P299 [Table Text] "27(0)dB
+"
+## P300 [Table Text] "31(-2)dB
+"
+## P301 [Normal] "
+"
+## P302 [Report Table Number] "– Required minimum sound reduction indices for glazing and ventilators
+"
+## P303 [Normal] "
+"
+## P304 [Report Text] "It is important that the performance shown in Table 7.2 are achieved by the entire windowset includi..."
+## P305 [Report Text] "The ventilator performances provided would need to be achieved with the vents open. Should this perf..."
+## P306 [Report Level 2] "Ventilation
+"
+## P307 [Report Text] "Draft guidance on meeting the requirements of Approved Document O is provided in the Approved Docume..."
+## P308 [Report Text] "For moderate risk locations, the simplified method can be considered to be met when external noise l..."
+## P309 [Report Text] "The requirements are deemed to be met with openable windows on all the south facing and the north we..."
+## P310 [Report Text] "On the north east façade, an equivalent area of up to 0.0002m2 would be permissible. Where this is n..."
+## P311 [Report Text] "In order that windows may remain closed, it is expected that attenuated means of background ventilat..."
+## P312 [Report Level 1] "Areas of External Amenity
+"
+## P313 [Report Text] "The primary external amenity areas are located to the south and west of the care home, providing inh..."
+## P314 [Report Level 1] "Plant Noise Assessment
+"
+## P315 [Report Text] "The potential noise impact from the proposed equipment associated with the care home on the nearest ..."
+## P316 [Report Text] "The nearest residential receptors are the dwellings on Ruskin close, located approximately 13m to th..."
+## P317 [Report Text] "The kitchen extract fan discharges onto the carpark to the south and is approximately 93m from the a..."
+## P318 [Report Level 2] "Proposed plant
+"
+## P319 [Report Text] "The following plant is proposed for installation at the locations indicated on site plan VA6171/SP1...."
+## P320 [Table Heading] "Plant Item
+"
+## P321 [Table Heading] "Quantity
+"
+## P322 [Table Heading] "Proposed Model
+"
+## P323 [Table Heading] "Notes
+"
+## P324 [Normal] "
+"
+## P325 [Table Text] "Kitchen Extract Fan
+"
+## P326 [Table Text] "1
+"
+## P327 [Table Text] "Systemair K450
+"
+## P328 [Table Text] "(CA1-450S4-1A)
+"
+## P329 [Table Text] "Fan and motor located within the kitchen, with the discharge ducted via a ground floor louvre on the..."
+## P330 [Normal] "
+"
+## P331 [Table Text] "Battery Storage Container – Extract Fan
+"
+## P332 [Table Text] "1
+"
+## P333 [Table Text] "Xpelair GX12
+"
+## P334 [Table Text] "Sound pressure level of up to 60dB @ 1m
+"
+## P335 [Normal] "
+"
+## P336 [Report Table Number] "– Advised plant selections used for this assessment.
+"
+## P337 [Normal] "
+"
+## P338 [Report Level 2] "Predicted Noise Levels
+"
+## P339 [Report Level 3] "Kitchen Extract Fan
+"
+## P340 [Report Text] "The proposed plant for this scheme is limited to a single extract fan servicing the kitchen. Discuss..."
+## P341 [Report Text] "Measurements of the noise emissions from this system specification have been undertaken outside the ..."
+## P342 [Table Heading] "Measurement
+"
+## P343 [Table Heading] "Result
+"
+## P344 [Normal] "
+"
+## P345 [Table Text] "Full Speed @ 3m 
+"
+## P346 [Table Text] "63 dB
+"
+## P347 [Normal] "
+"
+## P348 [Table Text] "Normal operating Speed @ 3m
+"
+## P349 [Table Text] "55 dB
+"
+## P350 [Normal] "
+"
+## P351 [Report Table Number] "– Measured specific sound Levels due to extract
+"
+## P352 [Normal] "
+"
+## P353 [Report Text] "It is understood that the fan would typically operate at between 50% and 75% speeds for most periods..."
+## P354 [Report Text] "The most affected receivers are expected to be the apartments at Tennyson Court, Parmin Way to the s..."
+## P355 [Report Text] "The frequency spectrum and subjective observations of sound from the fan during previous measurement..."
+## P356 [Table Heading] "Results
+"
+## P357 [Table Heading] "Dwellings to Southwest
+"
+## P358 [Table Heading] "Relevant Clause
+"
+## P359 [Table Heading] "Commentary
+"
+## P360 [Normal] "
+"
+## P361 [Table Text] "Extract Fan
+"
+## P362 [Table Text] "LAeq 55 dB @ 3m
+"
+## P363 [Table Text] "
+"
+## P364 [Table Text] "Normal operating speed
+"
+## P365 [Normal] "
+"
+## P366 [Table Text] "Assume 60 minutes / hour
+"
+## P367 [Table Text] "0 dB
+"
+## P368 [Table Text] "7.2
+"
+## P369 [Table Text] "Continuous operation during kitchen hours
+"
+## P370 [Normal] "
+"
+## P371 [Table Text] "Distance loss 
+"
+## P372 [Table Text] "-30 dB (93m)
+"
+## P373 [Table Text] "
+"
+## P374 [Table Text] "
+"
+## P375 [Normal] "
+"
+## P376 [Table Text] "Specific Sound Level
+"
+## P377 [Table Text] "25 dB
+"
+## P378 [Table Text] "
+"
+## P379 [Table Text] "
+"
+## P380 [Normal] "
+"
+## P381 [Table Text] "Acoustic feature
+"
+## P382 [Table Text] "correction
+"
+## P383 [Table Text] "+3 dB
+"
+## P384 [Table Text] "9.2
+"
+## P385 [Table Text] "+3dB for other sound characteristics
+"
+## P386 [Normal] "
+"
+## P387 [Table Text] "Rating level
+"
+## P388 [Table Text] "LAr 28 dB
+"
+## P389 [Table Text] "9.2
+"
+## P390 [Table Text] "
+"
+## P391 [Normal] "
+"
+## P392 [Table Text] "Background sound level
+"
+## P393 [Table Text] "LA90 52 dB
+"
+## P394 [Table Text] "8
+"
+## P395 [Table Text] "During the operational periods
+"
+## P396 [Normal] "
+"
+## P397 [Table Text] "Excess of rating over
+"
+## P398 [Table Text] "background sound level
+"
+## P399 [Table Text] "-24 dB
+"
+## P400 [Table Text] "11
+"
+## P401 [Table Text] "
+"
+## P402 [Normal] "
+"
+## P403 [Table Text] "Assessment indicates a low impact
+"
+## P404 [Table Text] "11
+"
+## P405 [Table Text] "Depending on context
+"
+## P406 [Normal] "
+"
+## P407 [Table Text] "Context
+"
+## P408 [Table Text] "The sound level is predicted to be well below the existing background sound level. 
+"
+## P409 [Normal] "
+"
+## P410 [Report Table Number] "- BS4142 Assessment – Kitchen Extract Fan 
+"
+## P411 [Normal] "
+"
+## P412 [Report Level 3] "PV Battery Storage
+"
+## P413 [Report Text] "It is understood that the fans on the PV battery storage unit only operates during the daytime. The ..."
+## P414 [Table Heading] "Results
+"
+## P415 [Table Heading] "Dwellings to West 
+"
+## P416 [Table Heading] "Relevant Clause
+"
+## P417 [Table Heading] "Commentary
+"
+## P418 [Normal] "
+"
+## P419 [Table Text] "Extract Fan
+"
+## P420 [Table Text] "LAeq 60dB @ 1m
+"
+## P421 [Table Text] "
+"
+## P422 [Table Text] "Measured at a similar site
+"
+## P423 [Normal] "
+"
+## P424 [Table Text] "Assume constant operation
+"
+## P425 [Table Text] "0dB
+"
+## P426 [Table Text] "7.2
+"
+## P427 [Table Text] "Continuous operation during the day
+"
+## P428 [Normal] "
+"
+## P429 [Table Text] "Distance loss 
+"
+## P430 [Table Text] "-22 dB (13m)
+"
+## P431 [Table Text] "
+"
+## P432 [Table Text] "
+"
+## P433 [Normal] "
+"
+## P434 [Table Text] "Specific Sound Level
+"
+## P435 [Table Text] "38 dB
+"
+## P436 [Table Text] "
+"
+## P437 [Table Text] "
+"
+## P438 [Normal] "
+"
+## P439 [Table Text] "Acoustic feature
+"
+## P440 [Table Text] "correction
+"
+## P441 [Table Text] "+0 dB
+"
+## P442 [Table Text] "9.2
+"
+## P443 [Table Text] "Not characterful
+"
+## P444 [Normal] "
+"
+## P445 [Table Text] "Rating level
+"
+## P446 [Table Text] "LAr 38 dB
+"
+## P447 [Table Text] "9.2
+"
+## P448 [Table Text] "
+"
+## P449 [Normal] "
+"
+## P450 [Table Text] "Background sound level
+"
+## P451 [Table Text] "LA90 46 dB
+"
+## P452 [Table Text] "8
+"
+## P453 [Table Text] "Day time background
+"
+## P454 [Normal] "
+"
+## P455 [Table Text] "Excess of rating over
+"
+## P456 [Table Text] "background sound level
+"
+## P457 [Table Text] "-8 dB
+"
+## P458 [Table Text] "11
+"
+## P459 [Table Text] "
+"
+## P460 [Normal] "
+"
+## P461 [Table Text] "Assessment indicates a low impact
+"
+## P462 [Table Text] "11
+"
+## P463 [Table Text] "Depending on context
+"
+## P464 [Normal] "
+"
+## P465 [Table Text] "Context
+"
+## P466 [Table Text] "The predicted rating level is below the existing background sound level. The area has a history of m..."
+## P467 [Normal] "
+"
+## P468 [Report Table Number] "- BS4142 Assessment – PV Battery Extract Fan 
+"
+## P469 [Normal] "
+"
+## P470 [Report Level 2] "Uncertainty
+"
+## P471 [Report Text] "This section acknowledges that uncertainty is inherent in all noise predictions and assessments and ..."
+## P472 [Report Text] "All survey instrumentation comprised Type 1 sound level meters, with field calibration checks carrie..."
+## P473 [Report Text] "The assessment methodologies were undertaken in general accordance with recognised British Standards..."
+## P474 [Report Text] "The environmental noise survey was conducted over a period of several days, providing a robust datas..."
+## P475 [Report Text] "Source noise data was obtained from measurements at several other instances of the same care home de..."
+## P476 [Report Text] "The predicted noise impact from the proposed care home's own plant on surrounding receptors was calc..."
+## P477 [Report Text] "It is acknowledged that there would be day-to-day variations in the background noise level and sourc..."
+## P478 [Report Text] "Considering the measures taken, the level of uncertainty in this report's conclusions is considered ..."
+## P479 [Report Level 1] "Conclusion
+"
+## P480 [Report Text] "A baseline noise survey has been undertaken by Venta Acoustics to establish the prevailing noise cli..."
+## P481 [Report Text] "Appropriate external and internal noise criteria have been considered to minimise adverse impacts on..."
+## P482 [Report Text] "Noise emissions from the proposed building services plant have been assessed and are predicted to re..."
+## P483 [Report Text] "
+"
+## P484 [Report Text] "
+"
+## P485 [Report Text] "Steven Liddell  MIOA
+"
+
+## T1 (6 rows x 1 cols) "
+
+
+Report VA6210.260127.NIA
+"
+| R | C1 | 
+|---|---|
+| 1 |    Report VA6210.260127.NIA  | 
+| 2 |   | 
+| 3 | Lisieux Way, Taunton  | 
+| 4 |   Noise Impact Assessment    | 
+| 5 | 03 February 2026  | 
+| ... | (showing first 5 of 6 rows) |
+
+
+## T2 (5 rows x 2 cols) "Attachments
+"
+| R | C1 | C2 | 
+|---|---|---|
+| 1 | VA6210/SP1  | Indicative Site Plan  | 
+| 2 | VA6210/TH1-TH7  | Environmental Noise Time Histo... | 
+| 3 |   |   | 
+| 4 | Appendix A  | Acoustic Terminology  | 
+| 5 |   |   | 
+
+
+## T3 (3 rows x 5 cols) "Report Version 
+"
+| R | C1 | C2 | C3 | C4 | C5 | 
+|---|---|---|---|---|---|
+| 1 | Report Version   | Author  | Approved  | Changes  | Date  | 
+| 2 | NIA  | Steven Liddell | Ben Alexander |   | 02/02/2026  | 
+| 3 |   |   |   |   |   | 
+
+
+## T4 (4 rows x 3 cols) "This guidance also states: 
+"
+| R | C1 | C2 | C3 | 
+|---|---|---|---|
+| 1 | Criterion  | Environment  | Design range LAeq,T dB  | 
+| 2 | Maintain speech intelligibilit... | Living Room  | 35 dB  | 
+| 3 | Prevent sleep disturbance, nig... | Bedrooms  | 30 dB  | 
+| 4 | – Excerpt from WHO	[dB ref. 20... | – Excerpt from WHO	[dB ref. 20... | – Excerpt from WHO	[dB ref. 20... | 
+
+
+## T5 (5 rows x 4 cols) "For external areas the standard states the following: 
+"
+| R | C1 | C2 | C3 | C4 | 
+|---|---|---|---|---|
+| 1 | Activity  | Location  | 07:00 to 23:00  | 23:00 to 07:00  | 
+| 2 | Resting  | Living Room  | 35 dB LAeq, 16 hour  | -  | 
+| 3 | Dining  | Dining Room  | 40 dB LAeq, 16 hour  | -  | 
+| 4 | Sleeping (daytime resting)  | Bedroom  | 35 dB LAeq, 16 hour  | 30 dB LAeq, 8 hour  | 
+| 5 | – Excerpt from BS8233:2014 - I... | – Excerpt from BS8233:2014 - I... | – Excerpt from BS8233:2014 - I... | – Excerpt from BS8233:2014 - I... | 
+
+
+## T6 (5 rows x 5 cols) "The calibration of the sound level meter was verified before and after use with no significant calibration drift observed.
+"
+| R | C1 | C2 | C3 | C4 | C5 | 
+|---|---|---|---|---|---|
+| 1 | Manufacturer  | Model Type  | Serial No  | Calibration  | Calibration  | 
+| 2 | Calibration  | Calibration  | Calibration  | Certificate No.  | Date  | 
+| 3 | Svantek Class 1 SLM  | 971  | 143568  | 1508506-1  | 22/4/24  | 
+| 4 | Larson Davis calibrator  | CAL200  | 13049  | 1512828-2  | 16/7/25  | 
+| 5 | – Equipment used for the surve... | – Equipment used for the surve... | – Equipment used for the surve... | – Equipment used for the surve... | – Equipment used for the surve... | 
+
+
+## T7 (5 rows x 3 cols) "The typical night time LAmax events, generated by vehicle passbys on Lisieux Way, were recorded to be in the order of 70dB LAmax,fast.
+"
+| R | C1 | C2 | C3 | 
+|---|---|---|---|
+| 1 | Monitoring Period  | LAeq, T  | Typical1 LA90,5min  | 
+| 2 | 07:00 – 23:00  | 61 dB  | 46 dB  | 
+| 3 | 23:00 – 07:00  | 52 dB  | 36 dB  | 
+| 4 | Kitchen Operational Hours 08:3... | 62 dB  | 52 dB  | 
+| 5 | – Average ambient and typical ... | – Average ambient and typical ... | – Average ambient and typical ... | 
+
+
+## T8 (4 rows x 4 cols) "Predicted sound levels on the building façades 
+"
+| R | C1 | C2 | C3 | C4 | 
+|---|---|---|---|---|
+| 1 | Building Facade  | Daytime LAeq,16hr​  | Night-Time LAeq,8hr​  | Typical Night LAmax,fast​  | 
+| 2 | North East Facade  | 59 dB  | 50 dB  | 68 dB  | 
+| 3 | North West Facade  | 51 dB  | 42 dB  | 60 dB  | 
+| 4 | SE and SW Facade  | 51 dB  | 42 dB  | 60 dB  | 
+
+
+## T9 (4 rows x 2 cols) "Sound Reduction Performance of Windowsets and Vents
+"
+| R | C1 | C2 | 
+|---|---|---|
+| 1 | Building Element  | Single figure weighted sound r... | 
+| 2 | Roof  | Rw 45  | 
+| 3 | Masonry  | Rw 51  | 
+| 4 | – Assumed sound reductions per... | – Assumed sound reductions per... | 
+
+
+## T10 (3 rows x 3 cols) "Glazing Reference
+"
+| R | C1 | C2 | C3 | 
+|---|---|---|---|
+| 1 | Glazing Reference  | Required Glazing SRI, Rw (+Ctr... | Ventilator Performance, Dn,e,w... | 
+| 2 | All Façades  | 27(0)dB  | 31(-2)dB  | 
+| 3 | – Required minimum sound reduc... | – Required minimum sound reduc... | – Required minimum sound reduc... | 
+
+
+## T11 (4 rows x 4 cols) "Predicted Noise Levels
+"
+| R | C1 | C2 | C3 | C4 | 
+|---|---|---|---|---|
+| 1 | Plant Item  | Quantity  | Proposed Model  | Notes  | 
+| 2 | Kitchen Extract Fan  | 1  | Systemair K450 (CA1-450S4-1A)  | Fan and motor located within t... | 
+| 3 | Battery Storage Container – Ex... | 1  | Xpelair GX12  | Sound pressure level of up to ... | 
+| 4 | – Advised plant selections use... | – Advised plant selections use... | – Advised plant selections use... | – Advised plant selections use... | 
+
+
+## T12 (4 rows x 2 cols) "Measurements of the noise emissions from this system specification have been undertaken outside the discharge louvre at other sites by the same developer:
+"
+| R | C1 | C2 | 
+|---|---|---|
+| 1 | Measurement  | Result  | 
+| 2 | Full Speed @ 3m   | 63 dB  | 
+| 3 | Normal operating Speed @ 3m  | 55 dB  | 
+| 4 | – Measured specific sound Leve... | – Measured specific sound Leve... | 
+
+
+## T13 (12 rows x 4 cols) "PV Battery Storage
+"
+| R | C1 | C2 | C3 | C4 | 
+|---|---|---|---|---|
+| 1 | Results  | Dwellings to Southwest  | Relevant Clause  | Commentary  | 
+| 2 | Extract Fan  | LAeq 55 dB @ 3m  |   | Normal operating speed  | 
+| 3 | Assume 60 minutes / hour  | 0 dB  | 7.2  | Continuous operation during ki... | 
+| 4 | Distance loss   | -30 dB (93m)  |   |   | 
+| 5 | Specific Sound Level  | 25 dB  |   |   | 
+| ... | (showing first 5 of 12 rows) |
+
+
+## T14 (12 rows x 4 cols) "Uncertainty
+"
+| R | C1 | C2 | C3 | C4 | 
+|---|---|---|---|---|
+| 1 | Results  | Dwellings to West   | Relevant Clause  | Commentary  | 
+| 2 | Extract Fan  | LAeq 60dB @ 1m  |   | Measured at a similar site  | 
+| 3 | Assume constant operation  | 0dB  | 7.2  | Continuous operation during th... | 
+| 4 | Distance loss   | -22 dB (13m)  |   |   | 
+| 5 | Specific Sound Level  | 38 dB  |   |   | 
+| ... | (showing first 5 of 12 rows) |
+

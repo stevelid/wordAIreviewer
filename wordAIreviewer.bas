@@ -45,6 +45,39 @@ Private g_TableIndex() As TableIndexEntry
 Private g_TableIndexCount As Long
 Private g_TableIndexBuilt As Boolean
 
+' =========================================================================================
+' === DOCUMENT STRUCTURE MAP (DSM) - V4 Architecture =====================================
+' =========================================================================================
+
+' Document element type for structure map
+Private Type DocumentElement
+    ElementID As String             ' P1, P2, T1, T2, etc.
+    ElementType As String           ' "paragraph", "table"
+    StyleName As String             ' Word style name
+    TextPreview As String           ' First 100 chars of content
+    StartPos As Long                ' Character position start
+    EndPos As Long                  ' Character position end
+    TableRowCount As Long           ' For tables: number of rows
+    TableColCount As Long           ' For tables: number of columns
+    AssociatedTitleID As String     ' For tables: ID of title paragraph (if any)
+End Type
+
+' Global structure map
+Private g_DocumentMap() As DocumentElement
+Private g_DocumentMapCount As Long
+Private g_DocumentMapBuilt As Boolean
+
+' Target reference type for V4 architecture
+Private Type TargetReference
+    IsValid As Boolean
+    TargetType As String        ' "paragraph", "table", "table_row", "table_cell"
+    ParagraphNum As Long        ' For P5
+    TableNum As Long            ' For T2, T2.R3, T2.R3.C2
+    RowNum As Long              ' For T2.R3, T2.R3.C2
+    ColNum As Long              ' For T2.R3.C2
+    IsHeaderRow As Boolean      ' For T2.H.C2
+End Type
+
 Option Explicit
 
 ' VBA Module to Apply LLM Review Suggestions (Version 3 - Production)
@@ -361,80 +394,668 @@ Private Sub ClearTableIndex()
 End Sub
 
 ' =========================================================================================
+' === DOCUMENT STRUCTURE MAP (DSM) FUNCTIONS =============================================
+' =========================================================================================
+
+Private Sub BuildDocumentStructureMap(ByVal doc As Document)
+    ' Builds a comprehensive structure map of the document
+    ' Maps every paragraph and table to a unique ID (P1, P2, T1, T2, etc.)
+    
+    On Error GoTo ErrorHandler
+    
+    Dim paraCount As Long
+    Dim tableCount As Long
+    Dim totalElements As Long
+    Dim idx As Long
+    Dim para As Paragraph
+    Dim tbl As Table
+    Dim styleStr As String
+    Dim textPrev As String
+    
+    Debug.Print "Building Document Structure Map..."
+    
+    ' Count elements
+    paraCount = doc.Paragraphs.Count
+    tableCount = doc.Tables.Count
+    totalElements = paraCount + tableCount
+    
+    If totalElements = 0 Then
+        g_DocumentMapCount = 0
+        g_DocumentMapBuilt = True
+        Debug.Print "  -> Empty document, no elements to map"
+        Exit Sub
+    End If
+    
+    ' Allocate array
+    ReDim g_DocumentMap(1 To totalElements)
+    idx = 0
+    
+    ' Map all paragraphs first
+    Dim paraIdx As Long
+    paraIdx = 0
+    For Each para In doc.Paragraphs
+        paraIdx = paraIdx + 1
+        idx = idx + 1
+        
+        With g_DocumentMap(idx)
+            .ElementID = "P" & paraIdx
+            .ElementType = "paragraph"
+            
+            ' Get style name
+            On Error Resume Next
+            styleStr = para.Style.NameLocal
+            If Err.Number <> 0 Then styleStr = "Normal"
+            Err.Clear
+            On Error GoTo ErrorHandler
+            .StyleName = styleStr
+            
+            ' Get full text content (no truncation for LLM review)
+            textPrev = Trim$(para.Range.Text)
+            .TextPreview = textPrev
+            
+            ' Store position
+            .StartPos = para.Range.Start
+            .EndPos = para.Range.End
+            
+            .TableRowCount = 0
+            .TableColCount = 0
+            .AssociatedTitleID = ""
+        End With
+        
+        If paraIdx Mod 100 = 0 Then
+            Debug.Print "  -> Mapped " & paraIdx & " paragraphs..."
+        End If
+    Next para
+    
+    ' Map all tables
+    Dim tblIdx As Long
+    tblIdx = 0
+    For Each tbl In doc.Tables
+        tblIdx = tblIdx + 1
+        idx = idx + 1
+        
+        With g_DocumentMap(idx)
+            .ElementID = "T" & tblIdx
+            .ElementType = "table"
+            .StyleName = ""
+            
+            ' Get table title (look for paragraph before/after table)
+            textPrev = GetTableTitleForDSM(tbl, doc)
+            .TextPreview = textPrev
+            
+            ' Store position
+            .StartPos = tbl.Range.Start
+            .EndPos = tbl.Range.End
+            
+            ' Store dimensions
+            On Error Resume Next
+            .TableRowCount = tbl.Rows.Count
+            .TableColCount = tbl.Columns.Count
+            If Err.Number <> 0 Then
+                .TableRowCount = 0
+                .TableColCount = 0
+            End If
+            Err.Clear
+            On Error GoTo ErrorHandler
+            
+            .AssociatedTitleID = ""
+        End With
+    Next tbl
+    
+    g_DocumentMapCount = idx
+    g_DocumentMapBuilt = True
+    
+    Debug.Print "  -> Structure map built: " & paraIdx & " paragraphs, " & tblIdx & " tables"
+    Exit Sub
+    
+ErrorHandler:
+    Debug.Print "Error building structure map: " & Err.Description
+    g_DocumentMapCount = 0
+    g_DocumentMapBuilt = False
+End Sub
+
+Private Function GetTableTitleForDSM(ByVal tbl As Table, ByVal doc As Document) As String
+    ' Gets a descriptive title for the table (paragraph before or after)
+    On Error Resume Next
+    
+    Dim p As Paragraph
+    Dim txt As String
+    
+    ' Try paragraph after table first
+    Set p = tbl.Range.Paragraphs(tbl.Range.Paragraphs.Count).Next
+    If Not p Is Nothing Then
+        txt = Trim$(p.Range.Text)
+        If Len(txt) > 3 And Len(txt) < 200 Then
+            GetTableTitleForDSM = txt
+            Exit Function
+        End If
+    End If
+    
+    ' Try paragraph before table
+    Set p = tbl.Range.Paragraphs(1).Previous
+    If Not p Is Nothing Then
+        txt = Trim$(p.Range.Text)
+        If Len(txt) > 3 And Len(txt) < 200 Then
+            GetTableTitleForDSM = txt
+            Exit Function
+        End If
+    End If
+    
+    ' Fallback: use first cell content
+    If tbl.Rows.Count > 0 And tbl.Columns.Count > 0 Then
+        txt = Trim$(tbl.Cell(1, 1).Range.Text)
+        If Len(txt) > 100 Then txt = Left$(txt, 100) & "..."
+        GetTableTitleForDSM = txt
+    Else
+        GetTableTitleForDSM = "(Table)"
+    End If
+End Function
+
+Private Sub ClearDocumentStructureMap()
+    ' Clears the structure map - call when document changes
+    g_DocumentMapCount = 0
+    g_DocumentMapBuilt = False
+    Erase g_DocumentMap
+End Sub
+
+Public Function ExportStructureMapAsMarkdown() As String
+    ' Exports the structure map as markdown for LLM consumption
+    ' Includes complete prompt instructions for the LLM
+    
+    On Error GoTo ErrorHandler
+    
+    If Not g_DocumentMapBuilt Then
+        BuildDocumentStructureMap ActiveDocument
+    End If
+    
+    If g_DocumentMapCount = 0 Then
+        ExportStructureMapAsMarkdown = "# DOCUMENT STRUCTURE MAP" & vbCrLf & vbCrLf & "(Empty document)"
+        Exit Function
+    End If
+    
+    Dim output As String
+    Dim i As Long
+    Dim elem As DocumentElement
+    
+    ' Add LLM prompt instructions at the beginning
+    output = "You are a technical document reviewer for acoustics and noise impact assessment reports. You will receive a Document Structure Map (DSM) showing the structure of a Word document with unique IDs for each element." & vbCrLf & vbCrLf
+    
+    output = output & "## IMPORTANT: Response Format" & vbCrLf & vbCrLf
+    output = output & "Return a JSON array of suggestions. Each suggestion MUST have:" & vbCrLf
+    output = output & "- ""target"": Element ID from the structure map (e.g., ""P5"", ""T2.R3.C2"")" & vbCrLf
+    output = output & "- ""action"": One of the action types listed below" & vbCrLf
+    output = output & "- ""explanation"": Brief reason for the change" & vbCrLf & vbCrLf
+    
+    output = output & "## Action Types" & vbCrLf & vbCrLf
+    output = output & "### replace" & vbCrLf
+    output = output & "Find and replace text within the target element." & vbCrLf
+    output = output & "Required: ""find"", ""replace"" | Optional: ""match_case"" (true/false)" & vbCrLf
+    output = output & "Example: {""target"": ""P5"", ""action"": ""replace"", ""find"": ""recieved"", ""replace"": ""received"", ""explanation"": ""Spelling""}" & vbCrLf & vbCrLf
+    
+    output = output & "### apply_style" & vbCrLf
+    output = output & "Apply a document style to the target element." & vbCrLf
+    output = output & "Required: ""style""" & vbCrLf
+    output = output & "Available styles: heading_l1, heading_l2, heading_l3, heading_l4, body_text, bullet, table_heading, table_text, table_title, figure" & vbCrLf
+    output = output & "Example: {""target"": ""P12"", ""action"": ""apply_style"", ""style"": ""heading_l2"", ""explanation"": ""Should be section heading""}" & vbCrLf & vbCrLf
+    
+    output = output & "### comment" & vbCrLf
+    output = output & "Add a comment to the target element." & vbCrLf
+    output = output & "Required: ""explanation"" (becomes the comment text)" & vbCrLf
+    output = output & "Example: {""target"": ""P8"", ""action"": ""comment"", ""explanation"": ""Consider adding methodology details""}" & vbCrLf & vbCrLf
+    
+    output = output & "### replace_table" & vbCrLf
+    output = output & "Replace entire table with new markdown table." & vbCrLf
+    output = output & "Required: ""replace"" (markdown table format)" & vbCrLf
+    output = output & "Example: {""target"": ""T1"", ""action"": ""replace_table"", ""replace"": ""| Col1 | Col2 |\n|---|---|\n| A | B |"", ""explanation"": ""Updated data""}" & vbCrLf & vbCrLf
+    
+    output = output & "### insert_row" & vbCrLf
+    output = output & "Insert a new row in a table." & vbCrLf
+    output = output & "Required: ""data"" (array of cell values) | Optional: ""after_row"" (row number, default 0)" & vbCrLf
+    output = output & "Example: {""target"": ""T2"", ""action"": ""insert_row"", ""after_row"": 3, ""data"": [""Location 4"", ""55"", ""47""], ""explanation"": ""Added missing location""}" & vbCrLf & vbCrLf
+    
+    output = output & "### delete_row" & vbCrLf
+    output = output & "Delete a table row. Target must be a row reference (e.g., ""T2.R5"")" & vbCrLf
+    output = output & "Example: {""target"": ""T2.R5"", ""action"": ""delete_row"", ""explanation"": ""Duplicate entry""}" & vbCrLf & vbCrLf
+    
+    output = output & "## Target Reference Format" & vbCrLf & vbCrLf
+    output = output & "- P{n} = Paragraph number (e.g., P5 = 5th paragraph)" & vbCrLf
+    output = output & "- T{n} = Table number (e.g., T2 = 2nd table)" & vbCrLf
+    output = output & "- T{n}.R{r} = Table row (e.g., T2.R3 = Table 2, Row 3)" & vbCrLf
+    output = output & "- T{n}.R{r}.C{c} = Table cell (e.g., T2.R3.C2 = Table 2, Row 3, Column 2)" & vbCrLf
+    output = output & "- T{n}.H.C{c} = Table header cell (e.g., T2.H.C1 = Table 2, Header, Column 1)" & vbCrLf & vbCrLf
+    
+    output = output & "## Review Guidelines" & vbCrLf & vbCrLf
+    output = output & "Focus on:" & vbCrLf
+    output = output & "1. Technical accuracy (noise levels, standards, calculations)" & vbCrLf
+    output = output & "2. Consistency (terminology, units, formatting)" & vbCrLf
+    output = output & "3. Clarity (sentence structure, paragraph flow)" & vbCrLf
+    output = output & "4. Compliance (BS8233, WHO guidelines, planning policy)" & vbCrLf
+    output = output & "5. Completeness (missing sections, incomplete tables)" & vbCrLf & vbCrLf
+    
+    output = output & "## Formatting in Replacements" & vbCrLf & vbCrLf
+    output = output & "You can use HTML-like tags in ""replace"" text:" & vbCrLf
+    output = output & "- <b>text</b> for bold" & vbCrLf
+    output = output & "- <i>text</i> for italic" & vbCrLf
+    output = output & "- <sub>text</sub> for subscript" & vbCrLf
+    output = output & "- <sup>text</sup> for superscript" & vbCrLf
+    output = output & "Example: ""55 <b>dB</b> L<sub>Aeq</sub>""" & vbCrLf & vbCrLf
+    
+    output = output & "---" & vbCrLf & vbCrLf
+    output = output & "# DOCUMENT STRUCTURE MAP" & vbCrLf
+    output = output & "Generated: " & Format(Now, "yyyy-mm-dd hh:nn:ss") & vbCrLf & vbCrLf
+    output = output & "## Paragraphs and Tables" & vbCrLf & vbCrLf
+    
+    For i = 1 To g_DocumentMapCount
+        elem = g_DocumentMap(i)
+        
+        If elem.ElementType = "paragraph" Then
+            ' Format: ## P5 [Style Name] "Text preview..."
+            output = output & "## " & elem.ElementID
+            If Len(elem.StyleName) > 0 Then
+                output = output & " [" & elem.StyleName & "]"
+            End If
+            output = output & " """ & elem.TextPreview & """" & vbCrLf
+            
+        ElseIf elem.ElementType = "table" Then
+            ' Format: ## T2 (5 rows x 3 cols) "Title..."
+            output = output & vbCrLf & "## " & elem.ElementID
+            If elem.TableRowCount > 0 And elem.TableColCount > 0 Then
+                output = output & " (" & elem.TableRowCount & " rows x " & elem.TableColCount & " cols)"
+            End If
+            output = output & " """ & elem.TextPreview & """" & vbCrLf
+            
+            ' Add table content preview
+            output = output & ExportTableContentPreview(elem.ElementID) & vbCrLf
+        End If
+    Next i
+    
+    ExportStructureMapAsMarkdown = output
+    Exit Function
+    
+ErrorHandler:
+    ExportStructureMapAsMarkdown = "# ERROR" & vbCrLf & "Failed to export structure map: " & Err.Description
+End Function
+
+Public Sub ExportStructureMapToFile()
+    ' Exports the structure map to a text file in the document's parent folder
+    ' File is named: [DocumentName]_StructureMap.txt
+    
+    On Error GoTo ErrorHandler
+    
+    Dim markdown As String
+    Dim filePath As String
+    Dim docPath As String
+    Dim docName As String
+    Dim parentFolder As String
+    Dim fso As Object
+    Dim fileNum As Integer
+    
+    ' Check if document is saved
+    If ActiveDocument.Path = "" Then
+        MsgBox "Please save the document first before exporting the structure map.", vbExclamation, "Document Not Saved"
+        Exit Sub
+    End If
+    
+    ' Get document path and name
+    docPath = ActiveDocument.FullName
+    docName = ActiveDocument.Name
+    
+    ' Remove extension from document name
+    If InStrRev(docName, ".") > 0 Then
+        docName = Left$(docName, InStrRev(docName, ".") - 1)
+    End If
+    
+    ' Build file path in parent folder
+    parentFolder = ActiveDocument.Path
+    filePath = parentFolder & "\" & docName & "_StructureMap.txt"
+    
+    ' Generate the markdown content
+    markdown = ExportStructureMapAsMarkdown()
+    
+    ' Write to file
+    fileNum = FreeFile
+    Open filePath For Output As #fileNum
+    Print #fileNum, markdown
+    Close #fileNum
+    
+    MsgBox "Structure map exported to:" & vbCrLf & filePath, vbInformation, "Export Complete"
+    Exit Sub
+    
+ErrorHandler:
+    MsgBox "Error exporting structure map: " & Err.Description, vbCritical, "Export Error"
+End Sub
+
+Private Function ExportTableContentPreview(ByVal tableID As String) As String
+    ' Exports table content in markdown format for preview
+    ' Shows first 5 rows maximum
+    
+    On Error Resume Next
+    
+    Dim tbl As Table
+    Dim r As Long
+    Dim c As Long
+    Dim cellText As String
+    Dim output As String
+    Dim maxRows As Long
+    Dim maxCols As Long
+    
+    ' Find the table
+    Set tbl = ResolveTableByID(tableID)
+    If tbl Is Nothing Then
+        ExportTableContentPreview = "(Table not found)"
+        Exit Function
+    End If
+    
+    maxRows = tbl.Rows.Count
+    ' Show all rows for LLM review
+    
+    maxCols = tbl.Columns.Count
+    ' Show all columns for LLM review
+    
+    output = "| R | "
+    For c = 1 To maxCols
+        output = output & "C" & c & " | "
+    Next c
+    output = output & vbCrLf & "|---|"
+    For c = 1 To maxCols
+        output = output & "---|"
+    Next c
+    output = output & vbCrLf
+    
+    For r = 1 To maxRows
+        output = output & "| " & r & " | "
+        For c = 1 To maxCols
+            cellText = Trim$(tbl.Cell(r, c).Range.Text)
+            ' Remove cell markers
+            cellText = Replace(cellText, Chr(13), " ")
+            cellText = Replace(cellText, Chr(7), "")
+            ' No truncation - show full cell content
+            output = output & cellText & " | "
+        Next c
+        output = output & vbCrLf
+    Next r
+    
+    ' All rows shown - no truncation message needed
+    
+    ExportTableContentPreview = output
+End Function
+
+Private Function ResolveTableByID(ByVal tableID As String) As Table
+    ' Helper to find table by ID (e.g., "T2")
+    On Error Resume Next
+    
+    Dim tblNum As Long
+    tblNum = CLng(Mid$(tableID, 2))  ' Extract number from "T2"
+    
+    If tblNum > 0 And tblNum <= ActiveDocument.Tables.Count Then
+        Set ResolveTableByID = ActiveDocument.Tables(tblNum)
+    Else
+        Set ResolveTableByID = Nothing
+    End If
+End Function
+
+' =========================================================================================
+' === TARGET RESOLUTION FUNCTIONS (V4 Architecture) ======================================
+' =========================================================================================
+
+Private Function ParseTargetReference(ByVal targetRef As String) As TargetReference
+    ' Parses target reference string into structured format
+    ' Formats: P5, T2, T2.R3, T2.R3.C2, T2.H.C2
+    
+    On Error GoTo ParseError
+    
+    Dim result As TargetReference
+    Dim parts() As String
+    Dim firstChar As String
+    
+    targetRef = Trim$(UCase$(targetRef))
+    
+    If Len(targetRef) = 0 Then GoTo ParseError
+    
+    firstChar = Left$(targetRef, 1)
+    
+    If firstChar = "P" Then
+        ' Paragraph reference: P5
+        result.TargetType = "paragraph"
+        result.ParagraphNum = CLng(Mid$(targetRef, 2))
+        result.IsValid = True
+        
+    ElseIf firstChar = "T" Then
+        ' Table reference: T2, T2.R3, T2.R3.C2, T2.H.C2
+        parts = Split(targetRef, ".")
+        
+        ' Extract table number
+        result.TableNum = CLng(Mid$(parts(0), 2))
+        
+        If UBound(parts) = 0 Then
+            ' Just T2 - entire table
+            result.TargetType = "table"
+            result.IsValid = True
+            
+        ElseIf UBound(parts) = 1 Then
+            ' T2.R3 - table row
+            If Left$(parts(1), 1) = "R" Then
+                result.TargetType = "table_row"
+                result.RowNum = CLng(Mid$(parts(1), 2))
+                result.IsValid = True
+            Else
+                GoTo ParseError
+            End If
+            
+        ElseIf UBound(parts) = 2 Then
+            ' T2.R3.C2 or T2.H.C2 - table cell
+            result.TargetType = "table_cell"
+            
+            If Left$(parts(1), 1) = "H" Then
+                ' Header row
+                result.IsHeaderRow = True
+                result.RowNum = 1
+            ElseIf Left$(parts(1), 1) = "R" Then
+                result.IsHeaderRow = False
+                result.RowNum = CLng(Mid$(parts(1), 2))
+            Else
+                GoTo ParseError
+            End If
+            
+            If Left$(parts(2), 1) = "C" Then
+                result.ColNum = CLng(Mid$(parts(2), 2))
+                result.IsValid = True
+            Else
+                GoTo ParseError
+            End If
+        Else
+            GoTo ParseError
+        End If
+    Else
+        GoTo ParseError
+    End If
+    
+    With ParseTargetReference
+        .IsValid = result.IsValid
+        .TargetType = result.TargetType
+        .ParagraphNum = result.ParagraphNum
+        .TableNum = result.TableNum
+        .RowNum = result.RowNum
+        .ColNum = result.ColNum
+        .IsHeaderRow = result.IsHeaderRow
+    End With
+    Exit Function
+    
+ParseError:
+    With ParseTargetReference
+        .IsValid = False
+        .TargetType = ""
+        .ParagraphNum = 0
+        .TableNum = 0
+        .RowNum = 0
+        .ColNum = 0
+        .IsHeaderRow = False
+    End With
+    Debug.Print "Failed to parse target reference: " & targetRef
+End Function
+
+Private Function ResolveTargetToRange(ByVal targetRef As String) As Range
+    ' Resolves a target reference to a Word Range
+    ' This is the KEY function that replaces all text-based searching
+    
+    On Error GoTo ErrorHandler
+    
+    Dim ref As TargetReference
+    Dim elem As DocumentElement
+    Dim i As Long
+    Dim tbl As Table
+    Dim foundElem As Boolean
+    
+    ' Ensure structure map is built
+    If Not g_DocumentMapBuilt Then
+        BuildDocumentStructureMap ActiveDocument
+    End If
+    
+    ' Parse the reference
+    ref = ParseTargetReference(targetRef)
+    
+    If Not ref.IsValid Then
+        Debug.Print "Invalid target reference: " & targetRef
+        Set ResolveTargetToRange = Nothing
+        Exit Function
+    End If
+    
+    ' Resolve based on type
+    Select Case ref.TargetType
+        Case "paragraph"
+            ' Find paragraph in structure map
+            For i = 1 To g_DocumentMapCount
+                elem = g_DocumentMap(i)
+                If elem.ElementType = "paragraph" And elem.ElementID = "P" & ref.ParagraphNum Then
+                    ' Return range for this paragraph
+                    Set ResolveTargetToRange = ActiveDocument.Range(elem.StartPos, elem.EndPos)
+                    Debug.Print "Resolved " & targetRef & " to paragraph at position " & elem.StartPos
+                    Exit Function
+                End If
+            Next i
+            
+        Case "table"
+            ' Return entire table range
+            Set tbl = ResolveTableByID("T" & ref.TableNum)
+            If Not tbl Is Nothing Then
+                Set ResolveTargetToRange = tbl.Range
+                Debug.Print "Resolved " & targetRef & " to table"
+                Exit Function
+            End If
+            
+        Case "table_row"
+            ' Return row range
+            Set tbl = ResolveTableByID("T" & ref.TableNum)
+            If Not tbl Is Nothing Then
+                If ref.RowNum > 0 And ref.RowNum <= tbl.Rows.Count Then
+                    Set ResolveTargetToRange = tbl.Rows(ref.RowNum).Range
+                    Debug.Print "Resolved " & targetRef & " to table row"
+                    Exit Function
+                End If
+            End If
+            
+        Case "table_cell"
+            ' Return cell range
+            Set tbl = ResolveTableByID("T" & ref.TableNum)
+            If Not tbl Is Nothing Then
+                If ref.RowNum > 0 And ref.RowNum <= tbl.Rows.Count Then
+                    If ref.ColNum > 0 And ref.ColNum <= tbl.Columns.Count Then
+                        Dim cellRange As Range
+                        Set cellRange = tbl.Cell(ref.RowNum, ref.ColNum).Range
+                        ' Remove cell end marker
+                        If cellRange.End > cellRange.Start Then
+                            cellRange.End = cellRange.End - 1
+                        End If
+                        Set ResolveTargetToRange = cellRange
+                        Debug.Print "Resolved " & targetRef & " to table cell"
+                        Exit Function
+                    End If
+                End If
+            End If
+    End Select
+    
+    ' If we get here, resolution failed
+    Debug.Print "Failed to resolve target: " & targetRef
+    Set ResolveTargetToRange = Nothing
+    Exit Function
+    
+ErrorHandler:
+    Debug.Print "Error resolving target " & targetRef & ": " & Err.Description
+    Set ResolveTargetToRange = Nothing
+End Function
+
+' =========================================================================================
 ' === HOUSE STYLE INTEGRATION =============================================================
 ' =========================================================================================
 ' Customize this function to call your organization's style functions.
 ' Return True if the style was applied successfully, False to use fallback.
 
 Private Function ApplyHouseStyle(ByVal rng As Range, ByVal styleName As String) As Boolean
-    ' This function provides an extension point for your house style functions.
-    ' Customize the Select Case below to call your actual style functions.
-    '
-    ' Example: If you have functions like ApplyH1(), ApplyH2(), etc., add them here.
-    '
-    ' To use:
-    ' 1. Uncomment the relevant Case statements below
-    ' 2. Replace the placeholder function calls with your actual function names
-    ' 3. Ensure your style functions select the range before applying styles
-    '
-    ' Return True if the style was applied, False to fall back to default behavior.
+    ' Applies VA Addin styles by calling the appropriate style function
+    ' Returns True if style was applied successfully, False to use fallback
 
     On Error GoTo Fail
 
     Dim normalizedStyle As String
     normalizedStyle = LCase$(Trim$(styleName))
 
+    ' Select the range (required by VA Addin style functions)
+    rng.Select
+
     Select Case normalizedStyle
-        ' ==========================================
-        ' HEADING STYLES - Uncomment and customize:
-        ' ==========================================
+        ' VA Addin Report Styles
+        Case "heading_l1", "report level 1"
+            Call RChapter
+            ApplyHouseStyle = True
+            Exit Function
 
-        'Case "heading 1", "h1"
-        '    rng.Select
-        '    Call ApplyH1  ' Replace with your actual function name
-        '    ApplyHouseStyle = True
-        '    Exit Function
+        Case "heading_l2", "report level 2"
+            Call RSectionheading
+            ApplyHouseStyle = True
+            Exit Function
 
-        'Case "heading 2", "h2"
-        '    rng.Select
-        '    Call ApplyH2  ' Replace with your actual function name
-        '    ApplyHouseStyle = True
-        '    Exit Function
+        Case "heading_l3", "report level 3"
+            Call RSubsection
+            ApplyHouseStyle = True
+            Exit Function
 
-        'Case "heading 3", "h3"
-        '    rng.Select
-        '    Call ApplyH3  ' Replace with your actual function name
-        '    ApplyHouseStyle = True
-        '    Exit Function
+        Case "heading_l4", "report level 4"
+            Call RHeadingL4
+            ApplyHouseStyle = True
+            Exit Function
 
-        'Case "heading 4", "h4"
-        '    rng.Select
-        '    Call ApplyH4  ' Replace with your actual function name
-        '    ApplyHouseStyle = True
-        '    Exit Function
+        Case "body_text", "text", "report text"
+            Call RSection
+            ApplyHouseStyle = True
+            Exit Function
 
-        ' ==========================================
-        ' TABLE STYLES - Uncomment and customize:
-        ' ==========================================
+        Case "bullet", "report bullet"
+            Call RBullet
+            ApplyHouseStyle = True
+            Exit Function
 
-        'Case "table normal", "table"
-        '    rng.Select
-        '    Call ApplyTableStyle  ' Replace with your actual function name
-        '    ApplyHouseStyle = True
-        '    Exit Function
+        Case "table_heading", "table heading"
+            Call Tableheading
+            ApplyHouseStyle = True
+            Exit Function
 
-        ' ==========================================
-        ' OTHER STYLES - Add more as needed:
-        ' ==========================================
+        Case "table_text", "table text"
+            Call Tabletext
+            ApplyHouseStyle = True
+            Exit Function
 
-        'Case "body text", "normal"
-        '    rng.Select
-        '    Call ApplyBodyText  ' Replace with your actual function name
-        '    ApplyHouseStyle = True
-        '    Exit Function
+        Case "table_title", "report table number"
+            Call RTabletitle
+            ApplyHouseStyle = True
+            Exit Function
+
+        Case "figure", "report figure"
+            Call Rfigure
+            ApplyHouseStyle = True
+            Exit Function
 
         Case Else
-            ' No matching house style function - use fallback
+            ' No matching VA Addin style - use fallback
             ApplyHouseStyle = False
             Exit Function
     End Select
@@ -442,6 +1063,603 @@ Private Function ApplyHouseStyle(ByVal rng As Range, ByVal styleName As String) 
 Fail:
     ' Error occurred - use fallback
     ApplyHouseStyle = False
+End Function
+
+' =========================================================================================
+' === V4 ACTION EXECUTORS (DSM-Based) ====================================================
+' =========================================================================================
+
+Private Function ExecuteReplaceActionV4(ByVal targetRange As Range, ByVal findText As String, ByVal replaceText As String, Optional ByVal matchCase As Boolean = False) As Boolean
+    ' V4 Replace action - find and replace within the resolved target range
+    
+    On Error GoTo ErrorHandler
+    
+    Dim normalizedFind As String
+    Dim normalizedReplace As String
+    
+    normalizedFind = NormalizeForDocument(findText)
+    normalizedReplace = replaceText  ' Don't normalize replacement - preserve formatting tags
+    
+    ' Use existing ApplyFormattedReplacement if we have formatting tags
+    If InStr(1, replaceText, "<") > 0 Then
+        ' Check if text matches first
+        If InStr(1, NormalizeForDocument(targetRange.Text), normalizedFind) > 0 Then
+            ApplyFormattedReplacement targetRange, normalizedReplace
+            Debug.Print "  -> Replace action executed with formatting"
+            ExecuteReplaceActionV4 = True
+            Exit Function
+        End If
+    Else
+        ' Simple text replacement
+        With targetRange.Find
+            .ClearFormatting
+            .Text = normalizedFind
+            .Replacement.Text = normalizedReplace
+            .matchCase = matchCase
+            .Wrap = wdFindStop
+            .Forward = True
+            
+            If .Execute(Replace:=wdReplaceAll) Then
+                Debug.Print "  -> Replace action executed: '" & findText & "' -> '" & replaceText & "'"
+                ExecuteReplaceActionV4 = True
+                Exit Function
+            End If
+        End With
+    End If
+    
+    Debug.Print "  -> Replace action: text not found in target range"
+    ExecuteReplaceActionV4 = False
+    Exit Function
+    
+ErrorHandler:
+    Debug.Print "  -> Error in ExecuteReplaceActionV4: " & Err.Description
+    ExecuteReplaceActionV4 = False
+End Function
+
+Private Function ExecuteApplyStyleActionV4(ByVal targetRange As Range, ByVal styleKey As String) As Boolean
+    ' V4 Apply Style action - applies VA Addin style or Word style
+    
+    On Error GoTo ErrorHandler
+    
+    ' Try VA Addin style first
+    If ApplyHouseStyle(targetRange, styleKey) Then
+        Debug.Print "  -> Style applied via VA Addin: " & styleKey
+        ExecuteApplyStyleActionV4 = True
+        Exit Function
+    End If
+    
+    ' Fallback to direct Word style application
+    On Error Resume Next
+    targetRange.Style = styleKey
+    If Err.Number = 0 Then
+        Debug.Print "  -> Style applied directly: " & styleKey
+        ExecuteApplyStyleActionV4 = True
+    Else
+        Debug.Print "  -> Style not found: " & styleKey
+        ExecuteApplyStyleActionV4 = False
+    End If
+    On Error GoTo ErrorHandler
+    
+    Exit Function
+    
+ErrorHandler:
+    Debug.Print "  -> Error in ExecuteApplyStyleActionV4: " & Err.Description
+    ExecuteApplyStyleActionV4 = False
+End Function
+
+Private Function ExecuteCommentActionV4(ByVal targetRange As Range, ByVal commentText As String) As Boolean
+    ' V4 Comment action - adds a comment to the target range
+    
+    On Error GoTo ErrorHandler
+    
+    ActiveDocument.Comments.Add Range:=targetRange, Text:=commentText
+    Debug.Print "  -> Comment added: " & Left$(commentText, 50)
+    ExecuteCommentActionV4 = True
+    Exit Function
+    
+ErrorHandler:
+    Debug.Print "  -> Error in ExecuteCommentActionV4: " & Err.Description
+    ExecuteCommentActionV4 = False
+End Function
+
+Private Function ExecuteDeleteActionV4(ByVal targetRange As Range) As Boolean
+    ' V4 Delete action - deletes the target range content
+    
+    On Error GoTo ErrorHandler
+    
+    targetRange.Delete
+    Debug.Print "  -> Content deleted"
+    ExecuteDeleteActionV4 = True
+    Exit Function
+    
+ErrorHandler:
+    Debug.Print "  -> Error in ExecuteDeleteActionV4: " & Err.Description
+    ExecuteDeleteActionV4 = False
+End Function
+
+Private Function ExecuteReplaceTableActionV4(ByVal targetRange As Range, ByVal markdownTable As String) As Boolean
+    ' V4 Replace Table action - replaces entire table with new markdown table
+    
+    On Error GoTo ErrorHandler
+    
+    Dim newTable As Table
+    Set newTable = ConvertMarkdownToTable(targetRange, markdownTable)
+    
+    If Not newTable Is Nothing Then
+        Debug.Print "  -> Table replaced successfully"
+        ExecuteReplaceTableActionV4 = True
+    Else
+        Debug.Print "  -> Table replacement failed"
+        ExecuteReplaceTableActionV4 = False
+    End If
+    
+    Exit Function
+    
+ErrorHandler:
+    Debug.Print "  -> Error in ExecuteReplaceTableActionV4: " & Err.Description
+    ExecuteReplaceTableActionV4 = False
+End Function
+
+Private Function ExecuteInsertRowActionV4(ByVal tableRef As String, ByVal afterRow As Long, ByVal rowData As Variant) As Boolean
+    ' V4 Insert Row action - inserts a new row in a table
+    
+    On Error GoTo ErrorHandler
+    
+    Dim tbl As Table
+    Dim ref As TargetReference
+    Dim newRow As Row
+    Dim colIndex As Long
+    Dim cellRange As Range
+    
+    ' Parse table reference
+    ref = ParseTargetReference(tableRef)
+    If Not ref.IsValid Or ref.TargetType <> "table" Then
+        Debug.Print "  -> Invalid table reference: " & tableRef
+        ExecuteInsertRowActionV4 = False
+        Exit Function
+    End If
+    
+    ' Get table
+    Set tbl = ResolveTableByID("T" & ref.TableNum)
+    If tbl Is Nothing Then
+        Debug.Print "  -> Table not found: " & tableRef
+        ExecuteInsertRowActionV4 = False
+        Exit Function
+    End If
+    
+    ' Insert row
+    If afterRow >= tbl.Rows.Count Then
+        Set newRow = tbl.Rows.Add  ' Add at end
+    Else
+        Set newRow = tbl.Rows.Add(tbl.Rows(afterRow + 1))  ' Add after specified row
+    End If
+    
+    ' Populate cells if data provided
+    If IsArray(rowData) Then
+        For colIndex = LBound(rowData) To UBound(rowData)
+            If colIndex + 1 <= newRow.Cells.Count Then
+                Set cellRange = newRow.Cells(colIndex + 1).Range
+                If cellRange.End > cellRange.Start Then cellRange.End = cellRange.End - 1
+                cellRange.Text = CStr(rowData(colIndex))
+            End If
+        Next colIndex
+    End If
+    
+    Debug.Print "  -> Row inserted after row " & afterRow
+    ExecuteInsertRowActionV4 = True
+    Exit Function
+    
+ErrorHandler:
+    Debug.Print "  -> Error in ExecuteInsertRowActionV4: " & Err.Description
+    ExecuteInsertRowActionV4 = False
+End Function
+
+Private Function ExecuteDeleteRowActionV4(ByVal targetRange As Range) As Boolean
+    ' V4 Delete Row action - deletes a table row
+    
+    On Error GoTo ErrorHandler
+    
+    If Not targetRange.Information(wdWithinTable) Then
+        Debug.Print "  -> Target is not within a table"
+        ExecuteDeleteRowActionV4 = False
+        Exit Function
+    End If
+    
+    Dim tbl As Table
+    Dim rowNum As Long
+    
+    Set tbl = targetRange.Tables(1)
+    rowNum = targetRange.Cells(1).RowIndex
+    
+    tbl.Rows(rowNum).Delete
+    Debug.Print "  -> Row " & rowNum & " deleted"
+    ExecuteDeleteRowActionV4 = True
+    Exit Function
+    
+ErrorHandler:
+    Debug.Print "  -> Error in ExecuteDeleteRowActionV4: " & Err.Description
+    ExecuteDeleteRowActionV4 = False
+End Function
+
+' =========================================================================================
+' === V4 MAIN PROCESSING FUNCTIONS =======================================================
+' =========================================================================================
+
+Private Function ProcessSuggestionV4(ByVal suggestion As Object) As Boolean
+    ' V4 suggestion processor - uses target references instead of text searching
+    
+    On Error GoTo ErrorHandler
+    
+    Dim targetRef As String
+    Dim action As String
+    Dim targetRange As Range
+    Dim findText As String
+    Dim replaceText As String
+    Dim styleKey As String
+    Dim explanation As String
+    Dim matchCase As Boolean
+    Dim success As Boolean
+    
+    ' Extract required fields
+    If Not HasDictionaryKey(suggestion, "target") Then
+        Debug.Print "  -> Missing 'target' field"
+        ProcessSuggestionV4 = False
+        Exit Function
+    End If
+    
+    If Not HasDictionaryKey(suggestion, "action") Then
+        Debug.Print "  -> Missing 'action' field"
+        ProcessSuggestionV4 = False
+        Exit Function
+    End If
+    
+    targetRef = GetSuggestionText(suggestion, "target", "")
+    action = LCase$(Trim$(GetSuggestionText(suggestion, "action", "")))
+    explanation = GetSuggestionText(suggestion, "explanation", "")
+    
+    Debug.Print "  Processing: " & targetRef & " | Action: " & action
+    
+    ' Resolve target to range
+    Set targetRange = ResolveTargetToRange(targetRef)
+    If targetRange Is Nothing Then
+        Debug.Print "  -> Failed to resolve target: " & targetRef
+        ProcessSuggestionV4 = False
+        Exit Function
+    End If
+    
+    ' Execute action based on type
+    Select Case action
+        Case "replace"
+            findText = GetSuggestionText(suggestion, "find", "")
+            replaceText = GetSuggestionText(suggestion, "replace", "")
+            matchCase = False
+            If HasDictionaryKey(suggestion, "match_case") Then
+                On Error Resume Next
+                matchCase = CBool(suggestion("match_case"))
+                On Error GoTo ErrorHandler
+            End If
+            success = ExecuteReplaceActionV4(targetRange, findText, replaceText, matchCase)
+            
+        Case "apply_style"
+            styleKey = GetSuggestionText(suggestion, "style", "")
+            success = ExecuteApplyStyleActionV4(targetRange, styleKey)
+            
+        Case "comment"
+            success = ExecuteCommentActionV4(targetRange, explanation)
+            
+        Case "delete"
+            success = ExecuteDeleteActionV4(targetRange)
+            
+        Case "replace_table"
+            replaceText = GetSuggestionText(suggestion, "replace", "")
+            success = ExecuteReplaceTableActionV4(targetRange, replaceText)
+            
+        Case "insert_row"
+            Dim afterRow As Long
+            Dim rowData As Variant
+            afterRow = 0
+            If HasDictionaryKey(suggestion, "after_row") Then
+                afterRow = CLng(Val(CStr(suggestion("after_row"))))
+            End If
+            If HasDictionaryKey(suggestion, "data") Then
+                rowData = suggestion("data")
+            End If
+            success = ExecuteInsertRowActionV4(targetRef, afterRow, rowData)
+            
+        Case "delete_row"
+            success = ExecuteDeleteRowActionV4(targetRange)
+            
+        Case Else
+            Debug.Print "  -> Unknown action type: " & action
+            success = False
+    End Select
+    
+    ProcessSuggestionV4 = success
+    Exit Function
+    
+ErrorHandler:
+    Debug.Print "  -> Error in ProcessSuggestionV4: " & Err.Description
+    ProcessSuggestionV4 = False
+End Function
+
+Public Sub ApplyLlmReview_V4()
+    ' V4 Main entry point - uses Document Structure Map for deterministic targeting
+    
+    On Error GoTo ErrorHandler
+    
+    Dim inputForm As New frmJsonInput
+    Dim jsonString As String
+    Dim suggestions As Object
+    Dim suggestion As Object
+    Dim successCount As Long
+    Dim failCount As Long
+    Dim totalCount As Long
+    Dim startTime As Single
+    
+    Debug.Print vbCrLf & "================ APPLY LLM REVIEW V4 (DSM) ================"
+    startTime = Timer
+    
+    ' Show input form
+    inputForm.Show vbModal
+    
+    ' Get JSON from form
+    jsonString = PreProcessJson(inputForm.txtJson.value)
+    
+    ' Parse JSON
+    Set suggestions = LLM_ParseJson(jsonString)
+    If suggestions Is Nothing Or TypeName(suggestions) <> "Collection" Then
+        MsgBox "Failed to parse JSON. Please check the format.", vbCritical, "JSON Error"
+        Exit Sub
+    End If
+    
+    totalCount = suggestions.Count
+    Debug.Print "Found " & totalCount & " suggestions"
+    
+    ' Build/refresh structure map
+    ClearDocumentStructureMap
+    BuildDocumentStructureMap ActiveDocument
+    
+    If g_DocumentMapCount = 0 Then
+        MsgBox "Document structure map could not be built.", vbExclamation, "Error"
+        Exit Sub
+    End If
+    
+    Debug.Print "Structure map ready: " & g_DocumentMapCount & " elements"
+    
+    ' Process each suggestion
+    successCount = 0
+    failCount = 0
+    
+    For Each suggestion In suggestions
+        If ProcessSuggestionV4(suggestion) Then
+            successCount = successCount + 1
+        Else
+            failCount = failCount + 1
+        End If
+    Next suggestion
+    
+    ' Report results
+    Dim duration As Single
+    duration = Timer - startTime
+    
+    Dim report As String
+    report = "LLM Review V4 Complete!" & vbCrLf & vbCrLf
+    report = report & "Total Suggestions: " & totalCount & vbCrLf
+    report = report & "Successfully Applied: " & successCount & vbCrLf
+    report = report & "Failed: " & failCount & vbCrLf
+    report = report & "Duration: " & Format(duration, "0.0") & " seconds"
+    
+    Debug.Print report
+    MsgBox report, vbInformation, "Review Complete"
+    
+    Exit Sub
+    
+ErrorHandler:
+    MsgBox "Error in ApplyLlmReview_V4: " & Err.Description, vbCritical, "Error"
+End Sub
+
+Public Sub RunInteractiveReview_V4()
+    ' V4 Interactive review - shows preview for each suggestion with accept/reject
+    
+    On Error GoTo ErrorHandler
+    
+    Dim inputForm As New frmJsonInput
+    Dim jsonString As String
+    Dim suggestions As Object
+    Dim suggestion As Object
+    Dim index As Long
+    Dim totalCount As Long
+    Dim acceptedCount As Long
+    Dim rejectedCount As Long
+    Dim skippedCount As Long
+    Dim userAction As String
+    Dim startTime As Single
+    
+    Debug.Print vbCrLf & "================ INTERACTIVE REVIEW V4 (DSM) ================"
+    startTime = Timer
+    
+    ' Show input form
+    inputForm.Show vbModal
+    
+    ' Get JSON from form
+    jsonString = PreProcessJson(inputForm.txtJson.value)
+    
+    ' Parse JSON
+    Set suggestions = LLM_ParseJson(jsonString)
+    If suggestions Is Nothing Or TypeName(suggestions) <> "Collection" Then
+        MsgBox "Failed to parse JSON. Please check the format.", vbCritical, "JSON Error"
+        Exit Sub
+    End If
+    
+    totalCount = suggestions.Count
+    Debug.Print "Found " & totalCount & " suggestions for interactive review"
+    
+    ' Build/refresh structure map
+    ClearDocumentStructureMap
+    BuildDocumentStructureMap ActiveDocument
+    
+    If g_DocumentMapCount = 0 Then
+        MsgBox "Document structure map could not be built.", vbExclamation, "Error"
+        Exit Sub
+    End If
+    
+    Debug.Print "Structure map ready: " & g_DocumentMapCount & " elements"
+    
+    ' Process each suggestion interactively
+    acceptedCount = 0
+    rejectedCount = 0
+    skippedCount = 0
+    index = 0
+    
+    For Each suggestion In suggestions
+        index = index + 1
+        
+        ' Show preview and get user action
+        userAction = ShowSuggestionPreviewV4(suggestion, index, totalCount)
+        
+        Select Case UCase$(userAction)
+            Case "ACCEPT"
+                ' Apply the suggestion
+                If ProcessSuggestionV4(suggestion) Then
+                    acceptedCount = acceptedCount + 1
+                    Debug.Print "  [" & index & "/" & totalCount & "] ACCEPTED"
+                Else
+                    Debug.Print "  [" & index & "/" & totalCount & "] ACCEPT FAILED"
+                    rejectedCount = rejectedCount + 1
+                End If
+                
+            Case "REJECT"
+                rejectedCount = rejectedCount + 1
+                Debug.Print "  [" & index & "/" & totalCount & "] REJECTED"
+                
+            Case "SKIP"
+                skippedCount = skippedCount + 1
+                Debug.Print "  [" & index & "/" & totalCount & "] SKIPPED"
+                
+            Case "ACCEPT_ALL"
+                ' Accept this one and all remaining
+                If ProcessSuggestionV4(suggestion) Then
+                    acceptedCount = acceptedCount + 1
+                End If
+                
+                ' Process remaining suggestions without preview
+                Dim remainingSuggestion As Object
+                Dim remainingIndex As Long
+                remainingIndex = index
+                
+                For Each remainingSuggestion In suggestions
+                    remainingIndex = remainingIndex + 1
+                    If remainingIndex > index Then
+                        If ProcessSuggestionV4(remainingSuggestion) Then
+                            acceptedCount = acceptedCount + 1
+                        Else
+                            rejectedCount = rejectedCount + 1
+                        End If
+                    End If
+                Next remainingSuggestion
+                
+                Exit For
+                
+            Case "STOP"
+                skippedCount = skippedCount + (totalCount - index + 1)
+                Debug.Print "  [" & index & "/" & totalCount & "] STOPPED by user"
+                Exit For
+                
+            Case Else
+                ' Treat unknown as skip
+                skippedCount = skippedCount + 1
+        End Select
+    Next suggestion
+    
+    ' Report results
+    Dim duration As Single
+    duration = Timer - startTime
+    
+    Dim report As String
+    report = "Interactive Review V4 Complete!" & vbCrLf & vbCrLf
+    report = report & "Total Suggestions: " & totalCount & vbCrLf
+    report = report & "Accepted: " & acceptedCount & vbCrLf
+    report = report & "Rejected: " & rejectedCount & vbCrLf
+    report = report & "Skipped: " & skippedCount & vbCrLf
+    report = report & "Duration: " & Format(duration, "0.0") & " seconds"
+    
+    Debug.Print report
+    MsgBox report, vbInformation, "Review Complete"
+    
+    Exit Sub
+    
+ErrorHandler:
+    MsgBox "Error in RunInteractiveReview_V4: " & Err.Description, vbCritical, "Error"
+End Sub
+
+Private Function ShowSuggestionPreviewV4(ByVal suggestion As Object, ByVal index As Long, ByVal total As Long) As String
+    ' V4 Preview function - shows target reference and resolved range
+    
+    On Error GoTo ErrorHandler
+    
+    Dim targetRef As String
+    Dim action As String
+    Dim explanation As String
+    Dim targetRange As Range
+    Dim previewForm As frmSuggestionPreview
+    Dim findText As String
+    Dim replaceText As String
+    Dim styleKey As String
+    
+    ' Extract fields
+    targetRef = GetSuggestionText(suggestion, "target", "")
+    action = GetSuggestionText(suggestion, "action", "")
+    explanation = GetSuggestionText(suggestion, "explanation", "")
+    
+    ' Resolve target
+    Set targetRange = ResolveTargetToRange(targetRef)
+    
+    ' Create preview form
+    Set previewForm = New frmSuggestionPreview
+    
+    If targetRange Is Nothing Then
+        ' Target not found - show error in preview
+        previewForm.LoadSuggestionV4 suggestion, index, total, Nothing, Nothing, "Target not found: " & targetRef
+    Else
+        ' Build preview text based on action type
+        Select Case LCase$(action)
+            Case "replace"
+                findText = GetSuggestionText(suggestion, "find", "")
+                replaceText = GetSuggestionText(suggestion, "replace", "")
+                previewForm.LoadSuggestionV4 suggestion, index, total, targetRange, targetRange, ""
+                
+            Case "apply_style"
+                styleKey = GetSuggestionText(suggestion, "style", "")
+                previewForm.LoadSuggestionV4 suggestion, index, total, targetRange, targetRange, ""
+                
+            Case Else
+                previewForm.LoadSuggestionV4 suggestion, index, total, targetRange, targetRange, ""
+        End Select
+        
+        ' Highlight the target range
+        targetRange.HighlightColorIndex = wdYellow
+    End If
+    
+    ' Show form and wait for user action
+    previewForm.Show vbModal
+    
+    ' Get user action
+    ShowSuggestionPreviewV4 = previewForm.UserAction
+    
+    ' Clear highlighting
+    If Not targetRange Is Nothing Then
+        targetRange.HighlightColorIndex = wdNoHighlight
+    End If
+    
+    ' Cleanup
+    Unload previewForm
+    Set previewForm = Nothing
+    
+    Exit Function
+    
+ErrorHandler:
+    Debug.Print "Error in ShowSuggestionPreviewV4: " & Err.Description
+    ShowSuggestionPreviewV4 = "SKIP"
 End Function
 
 Private Function PromptUserToSelectTable(ByVal searchTitle As String, ByVal rowHeader As String, ByVal columnHeader As String) As Table
@@ -5173,6 +6391,86 @@ Sub StartAiReview()
 
     Dim reviewForm As New frmReviewer
     reviewForm.Show
+End Sub
+
+' =========================================================================================
+' === PUBLIC ENTRY POINTS FOR DSM (V4 Architecture) ======================================
+' =========================================================================================
+
+Public Sub GenerateAndShowStructureMap()
+    ' Public entry point to generate and display the Document Structure Map
+    ' Can be called from ribbon, form, or directly for testing
+    
+    On Error GoTo ErrorHandler
+    
+    Debug.Print vbCrLf & "================ GENERATING DOCUMENT STRUCTURE MAP ================"
+    
+    ' Clear any existing map
+    ClearDocumentStructureMap
+    
+    ' Build new map
+    BuildDocumentStructureMap ActiveDocument
+    
+    If g_DocumentMapCount = 0 Then
+        MsgBox "Document is empty or structure map could not be built.", vbExclamation, "Structure Map"
+        Exit Sub
+    End If
+    
+    ' Export as markdown
+    Dim markdown As String
+    markdown = ExportStructureMapAsMarkdown()
+    
+    ' Show in message box (for testing) or copy to clipboard
+    Debug.Print markdown
+    
+    ' Copy to clipboard
+    Dim dataObj As Object
+    Set dataObj = CreateObject("new:{1C3B4210-F441-11CE-B9EA-00AA006B1A69}")
+    dataObj.SetText markdown
+    dataObj.PutInClipboard
+    
+    MsgBox "Document Structure Map generated!" & vbCrLf & vbCrLf & _
+           "Elements mapped: " & g_DocumentMapCount & vbCrLf & _
+           "The map has been copied to your clipboard." & vbCrLf & vbCrLf & _
+           "Paste it into your LLM prompt to get structured suggestions.", _
+           vbInformation, "Structure Map Ready"
+    
+    Exit Sub
+    
+ErrorHandler:
+    MsgBox "Error generating structure map: " & Err.Description, vbCritical, "Error"
+End Sub
+
+Public Sub TestTargetResolution()
+    ' Test function to verify target resolution works correctly
+    
+    On Error Resume Next
+    
+    Debug.Print vbCrLf & "================ TESTING TARGET RESOLUTION ================"
+    
+    ' Build structure map
+    If Not g_DocumentMapBuilt Then
+        BuildDocumentStructureMap ActiveDocument
+    End If
+    
+    ' Test various target formats
+    Dim testTargets() As String
+    testTargets = Split("P1,P5,T1,T1.R1,T1.R2.C1,T1.H.C1", ",")
+    
+    Dim target As Variant
+    Dim rng As Range
+    
+    For Each target In testTargets
+        Set rng = ResolveTargetToRange(CStr(target))
+        If Not rng Is Nothing Then
+            Debug.Print "✓ " & target & " -> Found at position " & rng.Start & "-" & rng.End
+            Debug.Print "   Text preview: " & Left$(rng.Text, 50)
+        Else
+            Debug.Print "✗ " & target & " -> NOT FOUND"
+        End If
+    Next target
+    
+    Debug.Print "================ TEST COMPLETE ================"
 End Sub
 
 
