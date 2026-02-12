@@ -39,10 +39,8 @@ Private Sub cmdProcess_Click()
     Me.cmdProcess.Enabled = False
     DoEvents ' Allow the UI to update
 
-    ' --- Call the main processing logic from the module ---
-    RunReviewProcess Me
-    
-    ' When finished, close the form. The final report will be a MsgBox.
+    ' Processing is initiated by the calling entry point.
+    ' This button now only confirms input and closes the form.
     Me.Hide
 End Sub
 
@@ -56,7 +54,7 @@ Private Sub cmdValidate_Click()
     Debug.Print "User clicked: Validate"
     ' --- NEW: Validate JSON without running the full process ---
     Dim jsonString As String
-    Dim suggestions As Object
+    Dim isValid As Boolean
     
     jsonString = Me.txtJson.value
     If Trim(jsonString) = "" Then
@@ -64,24 +62,14 @@ Private Sub cmdValidate_Click()
         Exit Sub
     End If
     
-    ' Pre-process the string to clean it up
-    jsonString = PreProcessJson(jsonString)
-    
-    ' Attempt to parse
     On Error GoTo ErrorHandler
-    Set suggestions = LLM_ParseJson(jsonString)
-    On Error GoTo 0 ' Turn off error handling if parse is successful
-    
-    If suggestions Is Nothing Or Not TypeName(suggestions) = "Collection" Then
-        MsgBox "JSON Validation Failed!" & vbCrLf & vbCrLf & "The text is not a valid JSON array. Check for missing brackets, commas, or quotes.", vbCritical, "Validation Failed"
-    Else
-        MsgBox "JSON is valid! Found " & suggestions.Count & " items to process.", vbInformation, "Validation Successful"
-    End If
+    isValid = V4_ValidateToolCallsJsonText(jsonString, True)
+    On Error GoTo 0
     
     Exit Sub
 
 ErrorHandler:
-    HandleError "cmdValidate_Click", Err
+    MsgBox "Validation failed: " & Err.Description, vbCritical, "Validation Failed"
 End Sub
 
 Private Sub UserForm_Activate()

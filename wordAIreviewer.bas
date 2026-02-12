@@ -89,12 +89,6 @@ Option Explicit
 ' - UI now provides a progress indicator and validation.
 ' - Case sensitivity is now a user-configurable option.
 
-' Always returns a new Scripting.Dictionary without requiring a reference
-
-Private Function NewDictionary() As Object
-    Set NewDictionary = CreateObject("Scripting.Dictionary")
-End Function
-
 ' =========================================================================================
 ' === TABLE INDEX FUNCTIONS ===============================================================
 ' =========================================================================================
@@ -558,7 +552,7 @@ Private Sub ClearDocumentStructureMap()
     Erase g_DocumentMap
 End Sub
 
-Public Function ExportStructureMapAsMarkdown() As String
+Private Function ExportStructureMapAsMarkdown() As String
     ' Exports the structure map as markdown for LLM consumption
     ' Includes complete prompt instructions for the LLM
     
@@ -676,7 +670,7 @@ ErrorHandler:
     ExportStructureMapAsMarkdown = "# ERROR" & vbCrLf & "Failed to export structure map: " & Err.Description
 End Function
 
-Public Sub ExportStructureMapToFile()
+Private Sub ExportStructureMapToFile()
     ' Exports the structure map to a text file in the document's parent folder
     ' File is named: [DocumentName]_StructureMap.txt
     
@@ -997,7 +991,9 @@ Private Function ApplyHouseStyle(ByVal rng As Range, ByVal styleName As String) 
     On Error GoTo Fail
 
     Dim normalizedStyle As String
+    Dim macroName As String
     normalizedStyle = LCase$(Trim$(styleName))
+    macroName = ""
 
     ' Select the range (required by VA Addin style functions)
     rng.Select
@@ -1005,64 +1001,88 @@ Private Function ApplyHouseStyle(ByVal rng As Range, ByVal styleName As String) 
     Select Case normalizedStyle
         ' VA Addin Report Styles
         Case "heading_l1", "report level 1"
-            Call RChapter
-            ApplyHouseStyle = True
-            Exit Function
+            macroName = "RChapter"
 
         Case "heading_l2", "report level 2"
-            Call RSectionheading
-            ApplyHouseStyle = True
-            Exit Function
+            macroName = "RSectionheading"
 
         Case "heading_l3", "report level 3"
-            Call RSubsection
-            ApplyHouseStyle = True
-            Exit Function
+            macroName = "RSubsection"
 
         Case "heading_l4", "report level 4"
-            Call RHeadingL4
-            ApplyHouseStyle = True
-            Exit Function
+            macroName = "RHeadingL4"
 
         Case "body_text", "text", "report text"
-            Call RSection
-            ApplyHouseStyle = True
-            Exit Function
+            macroName = "RSection"
 
         Case "bullet", "report bullet"
-            Call RBullet
-            ApplyHouseStyle = True
-            Exit Function
+            macroName = "RBullet"
 
         Case "table_heading", "table heading"
-            Call Tableheading
-            ApplyHouseStyle = True
-            Exit Function
+            macroName = "Tableheading"
 
         Case "table_text", "table text"
-            Call Tabletext
-            ApplyHouseStyle = True
-            Exit Function
+            macroName = "Tabletext"
 
         Case "table_title", "report table number"
-            Call RTabletitle
-            ApplyHouseStyle = True
-            Exit Function
+            macroName = "RTabletitle"
 
         Case "figure", "report figure"
-            Call Rfigure
+            macroName = "Rfigure"
+    End Select
+
+    If Len(macroName) > 0 Then
+        If CallVaStyleMacro(macroName) Then
             ApplyHouseStyle = True
             Exit Function
+        End If
+        Debug.Print "  -> VA style macro unavailable, falling back: " & macroName
+    End If
 
-        Case Else
-            ' No matching VA Addin style - use fallback
-            ApplyHouseStyle = False
-            Exit Function
-    End Select
+    ' No matching macro or call failed - use fallback
+    ApplyHouseStyle = False
+    Exit Function
 
 Fail:
     ' Error occurred - use fallback
     ApplyHouseStyle = False
+End Function
+
+Private Function CallVaStyleMacro(ByVal macroName As String) As Boolean
+    ' Invokes a VA Addin style macro by name without compile-time dependency
+
+    On Error GoTo Fail
+
+    Dim candidates As Variant
+    Dim candidate As Variant
+
+    ' Try common macro name formats to handle Normal, add-in, or module-qualified macros
+    candidates = Array( _
+        macroName, _
+        "Module03Formatting." & macroName, _
+        "VA_Addin.Module03Formatting." & macroName, _
+        "VAAddin.Module03Formatting." & macroName)
+
+    For Each candidate In candidates
+        If Len(candidate) = 0 Then GoTo NextCandidate
+
+        On Error Resume Next
+        Application.Run candidate
+        If Err.Number = 0 Then
+            On Error GoTo Fail
+            CallVaStyleMacro = True
+            Exit Function
+        End If
+        On Error GoTo Fail
+NextCandidate:
+    Next candidate
+
+Fail:
+    If Err.Number <> 0 Then
+        Debug.Print "  -> CallVaStyleMacro failed: " & Err.Description
+        Err.Clear
+    End If
+    CallVaStyleMacro = False
 End Function
 
 ' =========================================================================================
@@ -1074,41 +1094,36 @@ Private Function ExecuteReplaceActionV4(ByVal targetRange As Range, ByVal findTe
     
     On Error GoTo ErrorHandler
     
-    Dim normalizedFind As String
-    Dim normalizedReplace As String
-    
-    normalizedFind = NormalizeForDocument(findText)
-    normalizedReplace = replaceText  ' Don't normalize replacement - preserve formatting tags
-    
-    ' Use existing ApplyFormattedReplacement if we have formatting tags
-    If InStr(1, replaceText, "<") > 0 Then
-        ' Check if text matches first
-        If InStr(1, NormalizeForDocument(targetRange.Text), normalizedFind) > 0 Then
-            ApplyFormattedReplacement targetRange, normalizedReplace
-            Debug.Print "  -> Replace action executed with formatting"
-            ExecuteReplaceActionV4 = True
-            Exit Function
-        End If
-    Else
-        ' Simple text replacement
-        With targetRange.Find
-            .ClearFormatting
-            .Text = normalizedFind
-            .Replacement.Text = normalizedReplace
-            .matchCase = matchCase
-            .Wrap = wdFindStop
-            .Forward = True
-            
-            If .Execute(Replace:=wdReplaceAll) Then
-                Debug.Print "  -> Replace action executed: '" & findText & "' -> '" & replaceText & "'"
-                ExecuteReplaceActionV4 = True
-                Exit Function
-            End If
-        End With
+    Dim actionRange As Range
+    Set actionRange = FindLongString(NormalizeForDocument(findText), targetRange, matchCase)
+    If actionRange Is Nothing Then
+        Debug.Print "  -> Replace action: text not found in target range"
+        ExecuteReplaceActionV4 = False
+        Exit Function
     End If
-    
-    Debug.Print "  -> Replace action: text not found in target range"
-    ExecuteReplaceActionV4 = False
+
+    ' Skip formatting-only changes if target already matches formatting and text.
+    If IsFormattingAlreadyApplied(actionRange, replaceText) Then
+        Debug.Print "  -> Replace action skipped (already matches): '" & findText & "'"
+        ExecuteReplaceActionV4 = True
+        Exit Function
+    End If
+
+    If InStr(1, replaceText, "<", vbBinaryCompare) > 0 Then
+        ' Formatted replacement - parse tags and apply with granular diff
+        ApplyFormattedReplacement actionRange, replaceText
+    ElseIf USE_GRANULAR_DIFF And Len(actionRange.Text) <= 1000 And Len(replaceText) <= 1000 Then
+        ' Plain text - use granular diff for minimal tracked changes
+        Dim diffOps As Collection
+        Set diffOps = ComputeDiff(actionRange.Text, replaceText)
+        ApplyDiffOperations actionRange, diffOps, Nothing
+    Else
+        ' Fallback for very long text - wholesale replacement
+        actionRange.Text = replaceText
+    End If
+
+    Debug.Print "  -> Replace action executed: '" & findText & "' -> '" & replaceText & "'"
+    ExecuteReplaceActionV4 = True
     Exit Function
     
 ErrorHandler:
@@ -1382,7 +1397,7 @@ ErrorHandler:
     ProcessSuggestionV4 = False
 End Function
 
-Public Sub ApplyLlmReview_V4()
+Private Sub ApplyLlmReview_V4()
     ' V4 Main entry point - uses Document Structure Map for deterministic targeting
     
     On Error GoTo ErrorHandler
@@ -1458,7 +1473,7 @@ ErrorHandler:
     MsgBox "Error in ApplyLlmReview_V4: " & Err.Description, vbCritical, "Error"
 End Sub
 
-Public Sub RunInteractiveReview_V4()
+Private Sub RunInteractiveReview_V4()
     ' V4 Interactive review - shows preview for each suggestion with accept/reject
     
     On Error GoTo ErrorHandler
@@ -2184,7 +2199,7 @@ End Function
 ' =========================================================================================
 ' === MAIN SUBROUTINE TO RUN ==============================================================
 ' =========================================================================================
-Sub ApplyLlmReview_V3()
+Private Sub ApplyLlmReview_V3()
     ' This sub now only serves to launch the UserForm.
     ' The form's code-behind now controls the workflow.
     Dim inputForm As New frmJsonInput
@@ -2199,7 +2214,7 @@ End Sub
 
 ' =========================================================================================
 
-Sub RunReviewProcess(ByVal TheForm As frmJsonInput)
+Private Sub RunReviewProcess(ByVal TheForm As frmJsonInput)
     ' *** WORKFLOW SELECTOR ***
     ' Set to True for INTERACTIVE mode (new), False for TRACKED CHANGES mode (old)
     Const USE_INTERACTIVE_MODE As Boolean = True
@@ -2297,7 +2312,7 @@ End Sub
 ' === NEW: INTERACTIVE REVIEW WORKFLOW ===================================================
 ' =========================================================================================
 
-Sub RunInteractiveReview(ByVal suggestions As Object, ByVal matchCase As Boolean, ByVal startTime As Single)
+Private Sub RunInteractiveReview(ByVal suggestions As Object, ByVal matchCase As Boolean, ByVal startTime As Single)
     ' This workflow shows each suggestion interactively and applies changes immediately
     ' based on user decisions. No tracked changes or comments are used.
     
@@ -2502,7 +2517,7 @@ End Function
 ' === OLD: TRACKED CHANGES REVIEW WORKFLOW (PRESERVED) ===================================
 ' =========================================================================================
 
-Sub RunTrackedChangesReview(ByVal TheForm As frmJsonInput, ByVal suggestions As Object, ByVal startTime As Single)
+Private Sub RunTrackedChangesReview(ByVal TheForm As frmJsonInput, ByVal suggestions As Object, ByVal startTime As Single)
     ' This is the ORIGINAL workflow that applies all changes as tracked changes,
     ' then opens the review form. Preserved for fallback/comparison.
     
@@ -2604,7 +2619,7 @@ End Sub
 
 ' =========================================================================================
 
-Public Sub HandleError(ByVal procedureName As String, ByVal errSource As ErrObject)
+Private Sub HandleError(ByVal procedureName As String, ByVal errSource As ErrObject)
     ' Provides a detailed, consistent error message and logs to the Immediate Window.
     Dim msg As String
     msg = "An unexpected error occurred in: " & procedureName & vbCrLf & vbCrLf
@@ -2627,44 +2642,6 @@ Public Sub HandleError(ByVal procedureName As String, ByVal errSource As ErrObje
 End Sub
 
 ' =========================================================================================
-
-' === CORE LOGIC AND HELPERS ==============================================================
-
-' =========================================================================================
-
-Private Function HasDictionaryKey(ByVal dict As Object, ByVal keyName As String) As Boolean
-    On Error GoTo CleanFail
-    HasDictionaryKey = False
-    If dict Is Nothing Then Exit Function
-    If TypeName(dict) = "Collection" Then Exit Function
-    If TypeName(dict) = "Dictionary" Or TypeName(dict) = "Scripting.Dictionary" Then
-        If dict.Exists(keyName) Then HasDictionaryKey = True
-        Exit Function
-    End If
-    If dict.Exists(keyName) Then HasDictionaryKey = True
-    Exit Function
-CleanFail:
-    HasDictionaryKey = False
-End Function
-
-Private Function GetSuggestionContextText(ByVal suggestion As Object) As String
-    On Error GoTo CleanFail
-    GetSuggestionContextText = "<missing context>"
-    If suggestion Is Nothing Then Exit Function
-    If TypeName(suggestion) = "Collection" Then Exit Function
-    If HasDictionaryKey(suggestion, "context") Then
-        Dim ctxValue As Variant
-        ctxValue = suggestion("context")
-        If IsNull(ctxValue) Then
-            GetSuggestionContextText = "<missing context>"
-        Else
-            GetSuggestionContextText = CStr(ctxValue)
-        End If
-    End If
-    Exit Function
-CleanFail:
-    GetSuggestionContextText = "<context error>"
-End Function
 
 Private Function ProcessSuggestion(ByRef searchRange As Range, ByVal suggestion As Object, ByVal matchCase As Boolean) As Boolean
     On Error GoTo ErrorHandler
@@ -2865,61 +2842,6 @@ Private Function HandleNotFoundContext(ByVal searchRange As Range, ByVal suggest
 ErrorHandler:
     Debug.Print "An error occurred in HandleNotFoundContext: " & Err.Description
     HandleNotFoundContext = False
-End Function
-
-Private Function GetSuggestionText(ByVal suggestion As Object, ByVal key As String, Optional ByVal defaultText As String = "") As String
-    ' Safely extracts a text value from a dictionary suggestion.
-    On Error GoTo CleanFail
-    If HasDictionaryKey(suggestion, key) Then
-        Dim val As Variant
-        val = suggestion(key)
-        If IsNull(val) Then
-            GetSuggestionText = defaultText
-        Else
-            GetSuggestionText = CStr(val)
-        End If
-    Else
-        GetSuggestionText = defaultText
-    End If
-    Exit Function
-CleanFail:
-    GetSuggestionText = defaultText
-End Function
-
-Private Function GetFirstSignificantWord(ByVal text As String) As String
-    ' Extracts the first word longer than 4 chars, or the very first word if none are long enough.
-    On Error Resume Next
-    Dim words() As String
-    Dim word As Variant
-    Dim cleanText As String
-
-    ' Simple cleanup to handle punctuation
-    cleanText = Replace(text, ",", " ")
-    cleanText = Replace(cleanText, ".", " ")
-    cleanText = Replace(cleanText, ";", " ")
-    cleanText = Replace(cleanText, ":", " ")
-    cleanText = Replace(cleanText, "'", " ")
-    cleanText = Replace(cleanText, """", " ")
-
-    words = Split(Trim(cleanText), " ")
-
-    ' Find first word > 4 chars
-    For Each word In words
-        If Len(word) > 4 Then
-            GetFirstSignificantWord = word
-            Exit Function
-        End If
-    Next word
-
-    ' If no word > 4 chars was found, return the first non-empty word
-    For Each word In words
-        If Len(word) > 0 Then
-            GetFirstSignificantWord = word
-            Exit Function
-        End If
-    Next word
-
-    GetFirstSignificantWord = "" ' Return empty if no words found
 End Function
 
 Private Sub ExecuteSingleAction(ByRef overallContextRange As Range, ByVal actionObject As Object, ByVal topLevelSuggestion As Object, ByVal matchCase As Boolean)
@@ -5619,9 +5541,14 @@ Private Sub ApplyDiffOperations(ByVal targetRange As Range, _
     Dim finalRange As Range
     Set finalRange = ActiveDocument.Range(targetRange.Start, currentPos)
 
-    ' Reset font and apply formatting segments
-    finalRange.Font.Reset
-    ApplyFormattingToSegments finalRange, formatSegments
+    ' Only reset font and apply formatting when explicit formatting segments exist.
+    ' For plain text replacements (no segments), preserve existing document formatting.
+    If Not formatSegments Is Nothing Then
+        If formatSegments.Count > 0 Then
+            finalRange.Font.Reset
+            ApplyFormattingToSegments finalRange, formatSegments
+        End If
+    End If
 
     Debug.Print "    [ApplyDiffOperations] Diff operations complete."
 End Sub
@@ -5768,7 +5695,7 @@ Private Sub AddFormattedChar(ByRef segments As Collection, ByVal charIndex As Lo
     segments.Add segment
 End Sub
 
-Public Sub UndoLlmReview()
+Private Sub UndoLlmReview()
     ' MODIFIED: This sub now rejects changes for a user-specified author,
     ' defaulting to the current user.
 
@@ -5839,7 +5766,7 @@ End Sub
 ' =========================================================================================
 ' === PreProcessJson (CLEANS THE RAW JSON STRING) =========================================
 ' =========================================================================================
-Function PreProcessJson(ByVal jsonString As String) As String
+Private Function PreProcessJson(ByVal jsonString As String) As String
     ' This function cleans common LLM output errors before parsing.
     Debug.Print "  - Pre-processing JSON string..."
     Dim temp As String
@@ -5926,7 +5853,7 @@ End Function
 ' Source: https://github.com/VBA-tools/VBA-JSON
 ' License: MIT
 '------------------------------------------------------------------------------------------
-Public Function LLM_ParseJson(ByVal jsonString As String) As Object
+Private Function LLM_ParseJson(ByVal jsonString As String) As Object
     On Error GoTo ParseError
     If jsonString = "" Then Exit Function
     Debug.Print "  - Parsing JSON (len=" & Len(jsonString) & ")..."
@@ -5983,92 +5910,10 @@ ErrorHandler:
 End Sub
 
 ' =========================================================================================
-' === NormalizeForDocument (HELPER for line breaks) =======================================
-' =========================================================================================
-
-Private Function NormalizeForDocument(ByVal value As String) As String
-    ' This function normalizes text for robust matching in Word documents.
-    ' It handles:
-    ' - Various newline characters (LF, CRLF) -> CR (Chr(13))
-    ' - Special whitespace (non-breaking spaces, tabs) -> regular spaces
-    ' - Multiple consecutive spaces -> single space
-    ' - Smart quotes and special characters -> standard equivalents
-
-    Dim result As String
-    result = value
-
-    If result = "" Then
-        NormalizeForDocument = ""
-        Exit Function
-    End If
-
-    ' 1. Handle line breaks - Replace the two-character CRLF first
-    result = Replace(result, vbCrLf, Chr(13))
-    result = Replace(result, vbLf, Chr(13))
-    
-    ' 2. Normalize special whitespace characters to regular spaces
-    ' Non-breaking space (Chr(160))
-    result = Replace(result, Chr(160), " ")
-    ' Tab characters
-    result = Replace(result, vbTab, " ")
-    ' Vertical tab (Chr(11))
-    result = Replace(result, Chr(11), " ")
-    ' Form feed (Chr(12))
-    result = Replace(result, Chr(12), " ")
-    
-    ' 3. Normalize smart quotes and special punctuation
-    ' Left double quotation mark (Chr(8220))
-    result = Replace(result, ChrW(8220), Chr(34))
-    ' Right double quotation mark (Chr(8221))
-    result = Replace(result, ChrW(8221), Chr(34))
-    ' Left single quotation mark (Chr(8216))
-    result = Replace(result, ChrW(8216), "'")
-    ' Right single quotation mark (Chr(8217))
-    result = Replace(result, ChrW(8217), "'")
-    ' En dash (Chr(8211))
-    result = Replace(result, ChrW(8211), "-")
-    ' Em dash (Chr(8212))
-    result = Replace(result, ChrW(8212), "-")
-    
-    ' 4. Collapse multiple consecutive spaces into a single space
-    ' (but preserve paragraph breaks)
-    Do While InStr(result, "  ") > 0
-        result = Replace(result, "  ", " ")
-    Loop
-    
-    ' 5. Trim leading/trailing spaces from each line (but not the whole string)
-    result = NormalizeLinesWhitespace(result)
-    
-    NormalizeForDocument = result
-End Function
-
-Private Function NormalizeLinesWhitespace(ByVal text As String) As String
-    ' Trims leading and trailing spaces from each line while preserving paragraph structure
-    Dim lines() As String
-    Dim i As Long
-    Dim result As String
-    
-    If text = "" Then
-        NormalizeLinesWhitespace = ""
-        Exit Function
-    End If
-    
-    lines = Split(text, Chr(13))
-    result = ""
-    
-    For i = LBound(lines) To UBound(lines)
-        If i > LBound(lines) Then result = result & Chr(13)
-        result = result & Trim(lines(i))
-    Next i
-    
-    NormalizeLinesWhitespace = result
-End Function
-
-' =========================================================================================
 ' === UTILITY SUBROUTINE TO CHECK FOR REMAINING CHANGES ===================================
 ' =========================================================================================
 
-Public Sub FinalCheckForRemainingChanges()
+Private Sub FinalCheckForRemainingChanges()
     ' This macro checks if any revisions or comments by the current user
     ' are still present in the document and provides a report.
 
@@ -6385,7 +6230,7 @@ End Sub
  
 ' =========================================================================================
  
-Sub StartAiReview()
+Private Sub StartAiReview()
 
     ' This sub launches the modeless review form.
 
@@ -6397,7 +6242,7 @@ End Sub
 ' === PUBLIC ENTRY POINTS FOR DSM (V4 Architecture) ======================================
 ' =========================================================================================
 
-Public Sub GenerateAndShowStructureMap()
+Private Sub GenerateAndShowStructureMap()
     ' Public entry point to generate and display the Document Structure Map
     ' Can be called from ribbon, form, or directly for testing
     
@@ -6441,7 +6286,7 @@ ErrorHandler:
     MsgBox "Error generating structure map: " & Err.Description, vbCritical, "Error"
 End Sub
 
-Public Sub TestTargetResolution()
+Private Sub TestTargetResolution()
     ' Test function to verify target resolution works correctly
     
     On Error Resume Next
@@ -6473,4 +6318,735 @@ Public Sub TestTargetResolution()
     Debug.Print "================ TEST COMPLETE ================"
 End Sub
 
+' =========================================================================================
+' === V4 TOOL-CALL PIPELINE (STRICT SCHEMA) ===============================================
+' =========================================================================================
 
+Private Function JsonEscape(ByVal inputText As String) As String
+    Dim s As String
+    s = inputText
+    s = Replace(s, "\", "\\")
+    s = Replace(s, """", Chr$(92) & """")
+    s = Replace(s, vbCrLf, "\n")
+    s = Replace(s, vbCr, "\n")
+    s = Replace(s, vbLf, "\n")
+    JsonEscape = s
+End Function
+
+Private Function BuildTaggedTextFromRange(ByVal sourceRange As Range) As String
+    On Error GoTo Fail
+
+    Dim plainText As String
+    plainText = sourceRange.Text
+    If Len(plainText) = 0 Then
+        BuildTaggedTextFromRange = ""
+        Exit Function
+    End If
+
+    Dim i As Long
+    Dim out As String
+    Dim inSub As Boolean
+    Dim inSup As Boolean
+    Dim inBold As Boolean
+    Dim inItalic As Boolean
+
+    For i = 1 To Len(plainText)
+        Dim chRange As Range
+        Set chRange = sourceRange.Duplicate
+        chRange.Start = sourceRange.Start + i - 1
+        chRange.End = chRange.Start + 1
+
+        Dim isSub As Boolean
+        Dim isSup As Boolean
+        Dim isBold As Boolean
+        Dim isItalic As Boolean
+
+        isSub = (chRange.Font.Subscript = True)
+        isSup = (chRange.Font.Superscript = True)
+        isBold = (chRange.Font.Bold = True)
+        isItalic = (chRange.Font.Italic = True)
+
+        If inSub And Not isSub Then out = out & "</sub>": inSub = False
+        If inSup And Not isSup Then out = out & "</sup>": inSup = False
+        If inBold And Not isBold Then out = out & "</b>": inBold = False
+        If inItalic And Not isItalic Then out = out & "</i>": inItalic = False
+
+        If isItalic And Not inItalic Then out = out & "<i>": inItalic = True
+        If isBold And Not inBold Then out = out & "<b>": inBold = True
+        If isSup And Not inSup Then out = out & "<sup>": inSup = True
+        If isSub And Not inSub Then out = out & "<sub>": inSub = True
+
+        out = out & Mid$(plainText, i, 1)
+    Next i
+
+    If inSub Then out = out & "</sub>"
+    If inSup Then out = out & "</sup>"
+    If inBold Then out = out & "</b>"
+    If inItalic Then out = out & "</i>"
+
+    BuildTaggedTextFromRange = out
+    Exit Function
+
+Fail:
+    BuildTaggedTextFromRange = sourceRange.Text
+End Function
+
+Private Function BuildFormatSpansJson(ByVal sourceRange As Range) As String
+    On Error GoTo Fail
+
+    Dim plainText As String
+    plainText = sourceRange.Text
+    If Len(plainText) = 0 Then
+        BuildFormatSpansJson = "[]"
+        Exit Function
+    End If
+
+    Dim spans As String
+    Dim i As Long
+    Dim runStart As Long
+    Dim runLen As Long
+    Dim runSub As Boolean
+    Dim runSup As Boolean
+    Dim runBold As Boolean
+    Dim runItalic As Boolean
+    Dim hasRun As Boolean
+
+    spans = ""
+    hasRun = False
+
+    For i = 1 To Len(plainText)
+        Dim chRange As Range
+        Set chRange = sourceRange.Duplicate
+        chRange.Start = sourceRange.Start + i - 1
+        chRange.End = chRange.Start + 1
+
+        Dim isSub As Boolean
+        Dim isSup As Boolean
+        Dim isBold As Boolean
+        Dim isItalic As Boolean
+
+        isSub = (chRange.Font.Subscript = True)
+        isSup = (chRange.Font.Superscript = True)
+        isBold = (chRange.Font.Bold = True)
+        isItalic = (chRange.Font.Italic = True)
+
+        If Not (isSub Or isSup Or isBold Or isItalic) Then
+            If hasRun Then
+                spans = spans & IIf(Len(spans) > 0, ",", "") & _
+                    "{""start"":" & runStart & ",""length"":" & runLen & ",""subscript"":" & LCase$(CStr(runSub)) & _
+                    ",""superscript"":" & LCase$(CStr(runSup)) & ",""bold"":" & LCase$(CStr(runBold)) & _
+                    ",""italic"":" & LCase$(CStr(runItalic)) & "}"
+                hasRun = False
+            End If
+            GoTo ContinueLoop
+        End If
+
+        If Not hasRun Then
+            runStart = i
+            runLen = 1
+            runSub = isSub
+            runSup = isSup
+            runBold = isBold
+            runItalic = isItalic
+            hasRun = True
+        ElseIf runSub = isSub And runSup = isSup And runBold = isBold And runItalic = isItalic Then
+            runLen = runLen + 1
+        Else
+            spans = spans & IIf(Len(spans) > 0, ",", "") & _
+                "{""start"":" & runStart & ",""length"":" & runLen & ",""subscript"":" & LCase$(CStr(runSub)) & _
+                ",""superscript"":" & LCase$(CStr(runSup)) & ",""bold"":" & LCase$(CStr(runBold)) & _
+                ",""italic"":" & LCase$(CStr(runItalic)) & "}"
+            runStart = i
+            runLen = 1
+            runSub = isSub
+            runSup = isSup
+            runBold = isBold
+            runItalic = isItalic
+            hasRun = True
+        End If
+
+ContinueLoop:
+    Next i
+
+    If hasRun Then
+        spans = spans & IIf(Len(spans) > 0, ",", "") & _
+            "{""start"":" & runStart & ",""length"":" & runLen & ",""subscript"":" & LCase$(CStr(runSub)) & _
+            ",""superscript"":" & LCase$(CStr(runSup)) & ",""bold"":" & LCase$(CStr(runBold)) & _
+            ",""italic"":" & LCase$(CStr(runItalic)) & "}"
+    End If
+
+    BuildFormatSpansJson = "[" & spans & "]"
+    Exit Function
+
+Fail:
+    BuildFormatSpansJson = "[]"
+End Function
+
+Private Function ExportStructureMapAsJsonV41() As String
+    On Error GoTo ErrorHandler
+
+    If Not g_DocumentMapBuilt Then
+        BuildDocumentStructureMap ActiveDocument
+    End If
+
+    Dim output As String
+    Dim i As Long
+    Dim elem As DocumentElement
+    Dim elementJson As String
+
+    output = "{""version"":""4.1"",""document"":{""name"":""" & JsonEscape(ActiveDocument.Name) & """,""generated_at"":""" & _
+             Format(Now, "yyyy-mm-dd\Thh:nn:ss") & """},""elements"":["
+
+    For i = 1 To g_DocumentMapCount
+        elem = g_DocumentMap(i)
+        elementJson = ""
+
+        If elem.ElementType = "paragraph" Then
+            Dim pRange As Range
+            Set pRange = ActiveDocument.Range(elem.StartPos, elem.EndPos)
+            elementJson = "{""id"":""" & elem.ElementID & """,""kind"":""paragraph"",""style"":""" & JsonEscape(elem.StyleName) & """,""text_plain"":""" & _
+                          JsonEscape(pRange.Text) & """,""text_tagged"":""" & JsonEscape(BuildTaggedTextFromRange(pRange)) & _
+                          """,""format_spans"":" & BuildFormatSpansJson(pRange) & "}"
+        ElseIf elem.ElementType = "table" Then
+            Dim tbl As Table
+            Set tbl = ResolveTableByID(elem.ElementID)
+            Dim cellsJson As String
+            Dim r As Long
+            Dim c As Long
+
+            cellsJson = ""
+            If Not tbl Is Nothing Then
+                For r = 1 To tbl.Rows.Count
+                    For c = 1 To tbl.Columns.Count
+                        Dim cellRange As Range
+                        On Error Resume Next
+                        Set cellRange = tbl.Cell(r, c).Range
+                        If Err.Number <> 0 Then
+                            Err.Clear
+                            On Error GoTo ErrorHandler
+                            GoTo SkipCell
+                        End If
+                        On Error GoTo ErrorHandler
+                        If cellRange.End > cellRange.Start Then cellRange.End = cellRange.End - 1
+                        cellsJson = cellsJson & IIf(Len(cellsJson) > 0, ",", "") & _
+                            "{""id"":""" & elem.ElementID & ".R" & r & ".C" & c & """,""text_plain"":""" & JsonEscape(cellRange.Text) & _
+                            """,""text_tagged"":""" & JsonEscape(BuildTaggedTextFromRange(cellRange)) & """,""format_spans"":" & BuildFormatSpansJson(cellRange) & "}"
+SkipCell:
+                    Next c
+                Next r
+            End If
+
+            elementJson = "{""id"":""" & elem.ElementID & """,""kind"":""table"",""rows"":" & elem.TableRowCount & ",""cols"":" & elem.TableColCount & ",""cells"":[" & cellsJson & "]}"
+        End If
+
+        output = output & IIf(i > 1, ",", "") & elementJson
+    Next i
+
+    output = output & "]}"
+    ExportStructureMapAsJsonV41 = output
+    Exit Function
+
+ErrorHandler:
+    ExportStructureMapAsJsonV41 = "{""version"":""4.1"",""error"":""" & JsonEscape(Err.Description) & """}"
+End Function
+
+Private Function IsAllowedToolName(ByVal toolName As String) As Boolean
+    Select Case LCase$(Trim$(toolName))
+        Case "replace_text", "apply_style", "add_comment", "delete_range", "replace_table", "insert_table_row", "delete_table_row"
+            IsAllowedToolName = True
+        Case Else
+            IsAllowedToolName = False
+    End Select
+End Function
+
+Private Function ParseV4ToolCalls(ByVal jsonString As String, ByRef toolCalls As Collection, ByRef validationErrors As String) As Boolean
+    On Error GoTo Fail
+
+    ParseV4ToolCalls = False
+    Set toolCalls = New Collection
+    validationErrors = ""
+
+    Dim parsed As Object
+    Set parsed = LLM_ParseJson(PreProcessJson(jsonString))
+    If parsed Is Nothing Then
+        validationErrors = "JSON parse failed."
+        Exit Function
+    End If
+
+    If Not HasDictionaryKey(parsed, "tool_calls") Then
+        validationErrors = "Root object must contain 'tool_calls'."
+        Exit Function
+    End If
+
+    If TypeName(parsed("tool_calls")) <> "Collection" Then
+        validationErrors = "'tool_calls' must be an array."
+        Exit Function
+    End If
+
+    Dim callObj As Object
+    Dim idx As Long
+    idx = 0
+    For Each callObj In parsed("tool_calls")
+        idx = idx + 1
+
+        If HasDictionaryKey(callObj, "context") Or HasDictionaryKey(callObj, "actions") Or HasDictionaryKey(callObj, "action") Then
+            validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": legacy V3 keys detected."
+            GoTo ContinueLoop
+        End If
+
+        If Not HasDictionaryKey(callObj, "tool") Then
+            validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": missing 'tool'."
+            GoTo ContinueLoop
+        End If
+        If Not HasDictionaryKey(callObj, "target") Then
+            validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": missing 'target'."
+            GoTo ContinueLoop
+        End If
+        If Not HasDictionaryKey(callObj, "args") Then
+            validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": missing 'args'."
+            GoTo ContinueLoop
+        End If
+
+        Dim toolName As String
+        toolName = LCase$(Trim$(GetSuggestionText(callObj, "tool", "")))
+        If Not IsAllowedToolName(toolName) Then
+            validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": unsupported tool '" & toolName & "'."
+            GoTo ContinueLoop
+        End If
+
+        If TypeName(callObj("args")) = "Collection" Then
+            validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": 'args' must be an object."
+            GoTo ContinueLoop
+        End If
+
+        Dim argsObj As Object
+        Set argsObj = callObj("args")
+
+        Select Case toolName
+            Case "replace_text"
+                If Not HasDictionaryKey(argsObj, "find") Or Not HasDictionaryKey(argsObj, "replace") Then
+                    validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": replace_text requires args.find and args.replace."
+                    GoTo ContinueLoop
+                End If
+            Case "apply_style"
+                If Not HasDictionaryKey(argsObj, "style") Then
+                    validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": apply_style requires args.style."
+                    GoTo ContinueLoop
+                End If
+            Case "add_comment"
+                If Not HasDictionaryKey(argsObj, "text") And Len(GetSuggestionText(callObj, "explanation", "")) = 0 Then
+                    validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": add_comment requires args.text or explanation."
+                    GoTo ContinueLoop
+                End If
+            Case "replace_table"
+                If Not HasDictionaryKey(argsObj, "markdown") Then
+                    validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": replace_table requires args.markdown."
+                    GoTo ContinueLoop
+                End If
+            Case "insert_table_row"
+                If Not HasDictionaryKey(argsObj, "data") Then
+                    validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": insert_table_row requires args.data."
+                    GoTo ContinueLoop
+                End If
+        End Select
+
+        toolCalls.Add callObj
+
+ContinueLoop:
+    Next callObj
+
+    ParseV4ToolCalls = (Len(validationErrors) = 0)
+    Exit Function
+
+Fail:
+    validationErrors = "Unexpected validator error: " & Err.Description
+End Function
+
+Private Function ConvertToolCallToSuggestion(ByVal callObj As Object) As Object
+    Dim suggestion As Object
+    Set suggestion = NewDictionary()
+
+    Dim toolName As String
+    toolName = LCase$(Trim$(GetSuggestionText(callObj, "tool", "")))
+    Dim argsObj As Object
+    Set argsObj = callObj("args")
+
+    suggestion("target") = GetSuggestionText(callObj, "target", "")
+    suggestion("explanation") = GetSuggestionText(callObj, "explanation", "")
+
+    Select Case toolName
+        Case "replace_text"
+            suggestion("action") = "replace"
+            suggestion("find") = GetSuggestionText(argsObj, "find", "")
+            suggestion("replace") = GetSuggestionText(argsObj, "replace", "")
+            If HasDictionaryKey(argsObj, "match_case") Then suggestion("match_case") = CBool(argsObj("match_case"))
+        Case "apply_style"
+            suggestion("action") = "apply_style"
+            suggestion("style") = GetSuggestionText(argsObj, "style", "")
+        Case "add_comment"
+            suggestion("action") = "comment"
+            If HasDictionaryKey(argsObj, "text") Then suggestion("explanation") = GetSuggestionText(argsObj, "text", "")
+        Case "delete_range"
+            suggestion("action") = "delete"
+        Case "replace_table"
+            suggestion("action") = "replace_table"
+            suggestion("replace") = GetSuggestionText(argsObj, "markdown", "")
+        Case "insert_table_row"
+            suggestion("action") = "insert_row"
+            If HasDictionaryKey(argsObj, "after_row") Then suggestion("after_row") = CLng(Val(CStr(argsObj("after_row"))))
+            If HasDictionaryKey(argsObj, "data") Then suggestion("data") = argsObj("data")
+        Case "delete_table_row"
+            suggestion("action") = "delete_row"
+    End Select
+
+    Set ConvertToolCallToSuggestion = suggestion
+End Function
+
+Private Function IsToolCallNoOp(ByVal callObj As Object, ByVal targetRange As Range) As Boolean
+    On Error GoTo CleanFail
+    IsToolCallNoOp = False
+
+    Dim toolName As String
+    toolName = LCase$(Trim$(GetSuggestionText(callObj, "tool", "")))
+    If toolName <> "replace_text" Then Exit Function
+
+    Dim argsObj As Object
+    Set argsObj = callObj("args")
+    Dim findText As String
+    Dim replaceText As String
+    Dim matchCase As Boolean
+    findText = GetSuggestionText(argsObj, "find", "")
+    replaceText = GetSuggestionText(argsObj, "replace", "")
+    matchCase = False
+    If HasDictionaryKey(argsObj, "match_case") Then matchCase = CBool(argsObj("match_case"))
+
+    Dim foundRange As Range
+    Set foundRange = FindLongString(NormalizeForDocument(findText), targetRange, matchCase)
+    If foundRange Is Nothing Then Exit Function
+
+    IsToolCallNoOp = IsFormattingAlreadyApplied(foundRange, replaceText)
+    Exit Function
+
+CleanFail:
+    IsToolCallNoOp = False
+End Function
+
+Private Function RunToolCallsInternal(ByVal jsonString As String, ByVal interactive As Boolean) As Boolean
+    On Error GoTo ErrorHandler
+
+    Dim toolCalls As Collection
+    Dim errors As String
+    Dim s As Object
+    If Not ParseV4ToolCalls(jsonString, toolCalls, errors) Then
+        MsgBox "V4 validation failed:" & vbCrLf & errors, vbCritical, "Invalid V4 Tool Calls"
+        Exit Function
+    End If
+
+    ClearDocumentStructureMap
+    BuildDocumentStructureMap ActiveDocument
+
+    Dim suggestions As New Collection
+    Dim callObj As Object
+    For Each callObj In toolCalls
+        suggestions.Add ConvertToolCallToSuggestion(callObj)
+    Next callObj
+
+    If interactive Then
+        Dim accepted As Long
+        Dim skipped As Long
+        Dim failed As Long
+        Dim idx As Long
+        Dim action As String
+        idx = 1
+
+        Do While idx <= suggestions.Count
+            Set s = suggestions(idx)
+            Dim tRange As Range
+            Set tRange = ResolveTargetToRange(GetSuggestionText(s, "target", ""))
+            If Not tRange Is Nothing Then
+                If IsToolCallNoOp(toolCalls(idx), tRange) Then
+                    skipped = skipped + 1
+                    idx = idx + 1
+                    GoTo NextLoop
+                End If
+            End If
+
+            action = ShowSuggestionPreviewV4(s, idx, suggestions.Count)
+            Select Case UCase$(action)
+                Case "ACCEPT"
+                    If ProcessSuggestionV4(s) Then accepted = accepted + 1 Else failed = failed + 1
+                Case "REJECT", "SKIP"
+                    skipped = skipped + 1
+                Case "ACCEPT_ALL"
+                    Dim j As Long
+                    For j = idx To suggestions.Count
+                        If ProcessSuggestionV4(suggestions(j)) Then accepted = accepted + 1 Else failed = failed + 1
+                    Next j
+                    idx = suggestions.Count + 1
+                    GoTo NextLoop
+                Case "STOP"
+                    skipped = skipped + (suggestions.Count - idx + 1)
+                    Exit Do
+                Case Else
+                    skipped = skipped + 1
+            End Select
+            idx = idx + 1
+NextLoop:
+        Loop
+
+        MsgBox "V4 Interactive Review Complete" & vbCrLf & vbCrLf & _
+               "Applied: " & accepted & vbCrLf & _
+               "Skipped: " & skipped & vbCrLf & _
+               "Failed: " & failed, vbInformation, "V4 Complete"
+    Else
+        Dim okCount As Long
+        Dim failCount As Long
+        For Each s In suggestions
+            If ProcessSuggestionV4(s) Then
+                okCount = okCount + 1
+            Else
+                failCount = failCount + 1
+            End If
+        Next s
+        MsgBox "V4 Apply Complete" & vbCrLf & vbCrLf & _
+               "Applied: " & okCount & vbCrLf & _
+               "Failed: " & failCount, vbInformation, "V4 Complete"
+    End If
+
+    RunToolCallsInternal = True
+    Exit Function
+
+ErrorHandler:
+    MsgBox "Error in V4 processing: " & Err.Description, vbCritical, "V4 Error"
+    RunToolCallsInternal = False
+End Function
+
+' =========================================================================================
+' === PUBLIC ENTRY POINTS (KEEP THIS SECTION LAST) =======================================
+' =========================================================================================
+
+Public Sub V4_GenerateDocumentMap()
+    On Error GoTo ErrorHandler
+
+    ClearDocumentStructureMap
+    BuildDocumentStructureMap ActiveDocument
+    If g_DocumentMapCount = 0 Then
+        MsgBox "Document is empty or map generation failed.", vbExclamation, "V4 Map"
+        Exit Sub
+    End If
+
+    Dim mapJson As String
+    mapJson = ExportStructureMapAsJsonV41()
+
+    Dim dataObj As Object
+    Set dataObj = CreateObject("new:{1C3B4210-F441-11CE-B9EA-00AA006B1A69}")
+    dataObj.SetText mapJson
+    dataObj.PutInClipboard
+
+    MsgBox "V4 document map copied to clipboard." & vbCrLf & _
+           "Elements: " & g_DocumentMapCount, vbInformation, "V4 Map Ready"
+    Exit Sub
+
+ErrorHandler:
+    MsgBox "Error generating V4 document map: " & Err.Description, vbCritical, "V4 Error"
+End Sub
+
+Public Sub V4_CopyDocumentMapToClipboard()
+    V4_GenerateDocumentMap
+End Sub
+
+Public Sub V4_ValidateToolCallsJson()
+    Dim inputForm As New frmJsonInput
+    inputForm.Show vbModal
+    If Len(Trim$(inputForm.txtJson.Value)) = 0 Then Exit Sub
+    Call V4_ValidateToolCallsJsonText(inputForm.txtJson.Value, True)
+End Sub
+
+Public Function V4_ValidateToolCallsJsonText(ByVal jsonString As String, Optional ByVal showMessages As Boolean = False) As Boolean
+    Dim toolCalls As Collection
+    Dim errors As String
+    V4_ValidateToolCallsJsonText = ParseV4ToolCalls(jsonString, toolCalls, errors)
+    If showMessages Then
+        If V4_ValidateToolCallsJsonText Then
+            MsgBox "Valid V4 tool-call JSON." & vbCrLf & "Calls: " & toolCalls.Count, vbInformation, "Validation Successful"
+        Else
+            MsgBox "Invalid V4 tool-call JSON:" & vbCrLf & errors, vbCritical, "Validation Failed"
+        End If
+    End If
+End Function
+
+Public Function V4_ProcessToolCallsJson(ByVal jsonString As String, ByVal interactive As Boolean) As Boolean
+    V4_ProcessToolCallsJson = RunToolCallsInternal(jsonString, interactive)
+End Function
+
+Public Sub V4_ApplyToolCalls()
+    Dim inputForm As New frmJsonInput
+    inputForm.Show vbModal
+    If Len(Trim$(inputForm.txtJson.Value)) = 0 Then Exit Sub
+    Call RunToolCallsInternal(inputForm.txtJson.Value, False)
+End Sub
+
+Public Sub V4_RunInteractiveReview()
+    Dim inputForm As New frmJsonInput
+    inputForm.Show vbModal
+    If Len(Trim$(inputForm.txtJson.Value)) = 0 Then Exit Sub
+    Call RunToolCallsInternal(inputForm.txtJson.Value, True)
+End Sub
+
+Public Sub V4_TestTargetResolution()
+    TestTargetResolution
+End Sub
+
+Public Sub V4_FinalCheckForRemainingChanges()
+    FinalCheckForRemainingChanges
+End Sub
+
+' =========================================================================================
+' === FILE-BASED ENTRY POINTS (for Claude Code integration) ===============================
+' =========================================================================================
+'
+' These subs read/write JSON to a temp folder instead of clipboard/form,
+' enabling automated review via Claude Code's report-checking skill.
+'
+' Exchange folder: %TEMP%\claude_review\
+' Export file:     {doc_stem}_dsm.json        (document structure map)
+' Import file:     {doc_stem}_toolcalls.json  (LLM-generated tool calls)
+' Backup file:     {doc_stem}_backup.docx     (pre-review safety copy)
+
+Private Function GetClaudeReviewFolder() As String
+    ' Returns the temp exchange folder path, creating it if needed.
+    Dim folderPath As String
+    folderPath = Environ("TEMP") & "\claude_review"
+    If Dir(folderPath, vbDirectory) = "" Then
+        MkDir folderPath
+    End If
+    GetClaudeReviewFolder = folderPath & "\"
+End Function
+
+Private Function GetDocStem() As String
+    ' Returns the active document filename without extension.
+    ' E.g. "6246.260211.NIA" from "6246.260211.NIA.docx"
+    Dim docName As String
+    docName = ActiveDocument.Name
+    If InStrRev(docName, ".") > 0 Then
+        GetDocStem = Left(docName, InStrRev(docName, ".") - 1)
+    Else
+        GetDocStem = docName
+    End If
+End Function
+
+Public Sub V4_ExportDocumentMapToFile()
+    ' Exports the DSM as JSON to %TEMP%\claude_review\{stem}_dsm.json
+    ' Also copies to clipboard for convenience.
+    On Error GoTo ErrorHandler
+
+    ' Verify we have a saved document (not a new unsaved doc)
+    If ActiveDocument.Path = "" Then
+        MsgBox "Please save the document first.", vbExclamation, "V4 Export"
+        Exit Sub
+    End If
+
+    ClearDocumentStructureMap
+    BuildDocumentStructureMap ActiveDocument
+    If g_DocumentMapCount = 0 Then
+        MsgBox "Document is empty or map generation failed.", vbExclamation, "V4 Export"
+        Exit Sub
+    End If
+
+    Dim mapJson As String
+    mapJson = ExportStructureMapAsJsonV41()
+
+    ' Write to file
+    Dim filePath As String
+    filePath = GetClaudeReviewFolder() & GetDocStem() & "_dsm.json"
+
+    Dim fileNum As Integer
+    fileNum = FreeFile
+    Open filePath For Output As #fileNum
+    Print #fileNum, mapJson
+    Close #fileNum
+
+    ' Also copy to clipboard
+    Dim dataObj As Object
+    Set dataObj = CreateObject("new:{1C3B4210-F441-11CE-B9EA-00AA006B1A69}")
+    dataObj.SetText mapJson
+    dataObj.PutInClipboard
+
+    MsgBox "V4 document map exported." & vbCrLf & _
+           "File: " & filePath & vbCrLf & _
+           "Elements: " & g_DocumentMapCount & vbCrLf & _
+           "(Also copied to clipboard)", vbInformation, "V4 Export Ready"
+    Exit Sub
+
+ErrorHandler:
+    MsgBox "Error exporting V4 document map: " & Err.Description, vbCritical, "V4 Export Error"
+End Sub
+
+Public Sub V4_ImportAndApplyToolCalls()
+    ' Reads tool_calls JSON from %TEMP%\claude_review\{stem}_toolcalls.json
+    ' Creates a backup of the document, enables tracked changes, then applies.
+    On Error GoTo ErrorHandler
+
+    If ActiveDocument.Path = "" Then
+        MsgBox "Please save the document first.", vbExclamation, "V4 Import"
+        Exit Sub
+    End If
+
+    ' Check tool_calls file exists
+    Dim toolCallsPath As String
+    toolCallsPath = GetClaudeReviewFolder() & GetDocStem() & "_toolcalls.json"
+    If Dir(toolCallsPath) = "" Then
+        MsgBox "Tool calls file not found:" & vbCrLf & toolCallsPath, vbExclamation, "V4 Import"
+        Exit Sub
+    End If
+
+    ' Create backup before applying any changes
+    Dim backupPath As String
+    backupPath = GetClaudeReviewFolder() & GetDocStem() & "_backup.docx"
+    ActiveDocument.SaveAs2 FileName:=ActiveDocument.FullName  ' Save current state first
+    FileCopy ActiveDocument.FullName, backupPath
+
+    ' Read tool_calls JSON from file
+    Dim fileNum As Integer
+    Dim jsonString As String
+    Dim fileLine As String
+    fileNum = FreeFile
+    Open toolCallsPath For Input As #fileNum
+    Do Until EOF(fileNum)
+        Line Input #fileNum, fileLine
+        jsonString = jsonString & fileLine & vbCrLf
+    Loop
+    Close #fileNum
+
+    ' Enable tracked changes
+    Dim previousTrackState As Boolean
+    previousTrackState = ActiveDocument.TrackRevisions
+    ActiveDocument.TrackRevisions = True
+
+    ' Confirm with user
+    Dim msg As String
+    msg = "Ready to apply tool calls from:" & vbCrLf & toolCallsPath & vbCrLf & vbCrLf & _
+          "Backup saved to:" & vbCrLf & backupPath & vbCrLf & vbCrLf & _
+          "Tracked changes: ON" & vbCrLf & vbCrLf & _
+          "Run interactive review (Yes) or apply all (No)?"
+    Dim result As VbMsgBoxResult
+    result = MsgBox(msg, vbYesNoCancel + vbQuestion, "V4 Import & Apply")
+
+    If result = vbCancel Then
+        ActiveDocument.TrackRevisions = previousTrackState
+        Exit Sub
+    End If
+
+    ' Apply: Yes = interactive, No = apply all
+    Dim interactive As Boolean
+    interactive = (result = vbYes)
+    Call RunToolCallsInternal(jsonString, interactive)
+
+    ' Note: tracked changes left ON deliberately so user can review
+    MsgBox "Review complete. Tracked changes are ON." & vbCrLf & _
+           "Backup at: " & backupPath, vbInformation, "V4 Import Done"
+    Exit Sub
+
+ErrorHandler:
+    MsgBox "Error importing tool calls: " & Err.Description, vbCritical, "V4 Import Error"
+End Sub

@@ -15,7 +15,7 @@ Attribute VB_Creatable = False
 Attribute VB_PredeclaredId = True
 Attribute VB_Exposed = False
 ' =========================================================================================
-' === CODE FOR frmReviewer (FINAL VERSION with Grouping, Shortcuts, and Exit Check) =====
+' === CODE FOR frmReviewer (Accept / Skip / Ignore workflow) ============================
 ' =========================================================================================
 
 Option Explicit
@@ -30,39 +30,47 @@ Private Sub UserForm_Initialize()
     ' Capture the current user's name when the form is launched.
     ' All subsequent searches will look for changes made by this specific user.
     m_ReviewerName = Application.UserName
-    
+
     ' Position to the right side
     Me.StartUpPosition = 0 ' Manual
     Me.Left = Application.Left + Application.Width - Me.Width - 25
     Me.Top = Application.Top + 50
-    
-    ' Set Shortcut Keys
-    Me.btnFindNext.Accelerator = "N" ' Alt+N
-    Me.btnAccept.Accelerator = "A"   ' Alt+A
-    Me.btnReject.Accelerator = "R"   ' Alt+R
-    Me.btnClose.Accelerator = "C"    ' Alt+C
-    
+
+    ' Rename buttons for review workflow: Accept / Skip / Ignore / Close
+    Me.btnAccept.Caption = "&Accept"
+    Me.btnAccept.Accelerator = "A"    ' Alt+A
+    Me.btnReject.Caption = "&Skip"
+    Me.btnReject.Accelerator = "S"    ' Alt+S  - reject but save suggestion as comment
+    Me.btnFindNext.Caption = "&Ignore"
+    Me.btnFindNext.Accelerator = "I"  ' Alt+I  - do nothing, advance to next
+    Me.btnClose.Accelerator = "C"     ' Alt+C
+
     If m_ReviewerName = "" Then
         MsgBox "Warning: Your user name is not set in Word's options. The review tool may not find any changes.", vbExclamation
     End If
-    
-    ' Start the search from the beginning of the document.
+
+    ' Start the search from the beginning and auto-navigate to the first suggestion.
     Set m_CurrentRange = ActiveDocument.Content
     m_CurrentRange.Collapse wdCollapseStart
-End Sub
-
-' --- BUTTON CLICK HANDLERS ---
-Private Sub btnFindNext_Click()
     FindNextSuggestion
 End Sub
 
+' --- BUTTON CLICK HANDLERS ---
+
 Private Sub btnAccept_Click()
-    ProcessCurrentSuggestion True ' True = Accept
+    ' Accept: apply tracked changes, delete AI comments, advance.
+    ProcessCurrentSuggestion True
     FindNextSuggestion
 End Sub
 
 Private Sub btnReject_Click()
-    ProcessCurrentSuggestion False ' False = Reject
+    ' Skip: reject tracked changes but save the suggestion as a comment for later.
+    SkipCurrentSuggestion
+    FindNextSuggestion
+End Sub
+
+Private Sub btnFindNext_Click()
+    ' Ignore: leave tracked changes untouched and advance to the next group.
     FindNextSuggestion
 End Sub
 
@@ -76,7 +84,7 @@ End Sub
 Private Sub UserForm_QueryClose(Cancel As Integer, CloseMode As Integer)
     ' This event fires whenever the form is about to close, for any reason.
     ' We call our standalone checking macro from here.
-    FinalCheckForRemainingChanges
+    V4_FinalCheckForRemainingChanges
 End Sub
 
 
@@ -129,6 +137,96 @@ Private Sub ProcessCurrentSuggestion(ByVal Accept As Boolean)
             End If
         End With
     Next i
+
+    Application.ScreenUpdating = True
+    On Error GoTo 0
+End Sub
+
+Private Sub SkipCurrentSuggestion()
+    ' Reject tracked changes but preserve the suggestion as a comment so
+    ' the user can revisit it later.
+    If m_CurrentRange Is Nothing Then Exit Sub
+
+    Dim i As Long
+    Application.ScreenUpdating = False
+    On Error Resume Next
+
+    ' --- 1. Collect a description of every revision in the group ---
+    Dim suggText As String
+    suggText = ""
+
+    For i = 1 To ActiveDocument.Revisions.Count
+        With ActiveDocument.Revisions(i)
+            If .Author = m_ReviewerName And RangesOverlap(.Range, m_CurrentRange) Then
+                If Len(suggText) > 0 Then suggText = suggText & "; "
+                Select Case .Type
+                    Case wdRevisionInsert
+                        suggText = suggText & "insert """ & Left$(.Range.Text, 120) & """"
+                    Case wdRevisionDelete
+                        suggText = suggText & "delete """ & Left$(.Range.Text, 120) & """"
+                    Case Else
+                        suggText = suggText & "change """ & Left$(.Range.Text, 120) & """"
+                End Select
+            End If
+        End With
+    Next i
+
+    ' --- 2. Capture any existing AI comment text (rationale / notes) ---
+    Dim noteText As String
+    noteText = ""
+
+    For i = 1 To ActiveDocument.Comments.Count
+        With ActiveDocument.Comments(i)
+            If .Author = m_ReviewerName And RangesOverlap(.Range, m_CurrentRange) Then
+                If Len(noteText) > 0 Then noteText = noteText & "; "
+                noteText = noteText & Left$(.Range.Text, 200)
+            End If
+        End With
+    Next i
+
+    ' --- 3. Note the anchor position before modifying anything ---
+    Dim anchorStart As Long
+    anchorStart = m_CurrentRange.Start
+
+    ' --- 4. Reject all tracked revisions in the group ---
+    For i = ActiveDocument.Revisions.Count To 1 Step -1
+        With ActiveDocument.Revisions(i)
+            If .Author = m_ReviewerName And RangesOverlap(.Range, m_CurrentRange) Then
+                .Reject
+            End If
+        End With
+    Next i
+
+    ' --- 5. Delete existing AI comments in the group ---
+    For i = ActiveDocument.Comments.Count To 1 Step -1
+        With ActiveDocument.Comments(i)
+            If .Author = m_ReviewerName And RangesOverlap(.Range, m_CurrentRange) Then
+                .Delete
+            End If
+        End With
+    Next i
+
+    ' --- 6. Build and add a skip comment at the anchor position ---
+    Dim commentBody As String
+    commentBody = ""
+    If Len(suggText) > 0 Then commentBody = "Suggested: " & suggText
+    If Len(noteText) > 0 Then
+        If Len(commentBody) > 0 Then commentBody = commentBody & vbCrLf
+        commentBody = commentBody & "Note: " & noteText
+    End If
+
+    If Len(commentBody) > 0 Then
+        ' Anchor to the word at the original change position
+        Dim safeEnd As Long
+        safeEnd = anchorStart + 1
+        If safeEnd > ActiveDocument.Content.End Then safeEnd = ActiveDocument.Content.End
+        Dim commentRange As Range
+        Set commentRange = ActiveDocument.Range(anchorStart, safeEnd)
+        commentRange.MoveEnd wdWord, 1
+
+        ActiveDocument.Comments.Add Range:=commentRange, _
+            Text:="[Skipped] " & commentBody
+    End If
 
     Application.ScreenUpdating = True
     On Error GoTo 0
