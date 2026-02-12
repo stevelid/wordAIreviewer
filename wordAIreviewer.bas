@@ -171,7 +171,7 @@ Private Function GetTableTitleBelow(ByVal tbl As Table) As String
             GoTo ContinueLoop
         End If
 
-        t = Trim$(NormalizeForDocument(p.Range.Text))
+        t = Trim$(NormalizeForDocument(GetParagraphTextFinalView(p)))
 
         ' Skip empty paragraphs and very short ones
         If Len(t) > 3 Then
@@ -214,7 +214,7 @@ Private Function GetTableCaptionAbove(ByVal tbl As Table) As String
             GoTo ContinueLoop
         End If
 
-        t = Trim$(NormalizeForDocument(p.Range.Text))
+        t = Trim$(NormalizeForDocument(GetParagraphTextFinalView(p)))
 
         ' Skip empty paragraphs
         If Len(t) > 3 Then
@@ -247,7 +247,7 @@ Private Function GetTableHeaderRowText(ByVal tbl As Table) As String
     Set row = tbl.Rows(1)
 
     For Each c In row.Cells
-        result = result & " " & Trim$(NormalizeForDocument(c.Range.Text))
+        result = result & " " & Trim$(NormalizeForDocument(GetCellTextFinalView(c)))
     Next c
 
     GetTableHeaderRowText = Trim$(result)
@@ -388,6 +388,203 @@ Private Sub ClearTableIndex()
 End Sub
 
 ' =========================================================================================
+' === FINAL VIEW TEXT EXTRACTION (for tracked changes handling) =============================
+' =========================================================================================
+
+Private Function GetParagraphTextFinalView(ByVal para As Paragraph) As String
+    ' Extracts paragraph text as it appears in Word's "Final" view.
+    ' - Insertions (w:ins) are INCLUDED
+    ' - Deletions (w:del) are EXCLUDED
+    ' This matches Word's "Final" display mode without actually accepting changes.
+    
+    On Error GoTo Fail
+
+    Dim rng As Range
+    Set rng = para.Range
+    GetParagraphTextFinalView = Trim$(GetRangeTextFinalView(rng))
+    Exit Function
+
+Fail:
+    GetParagraphTextFinalView = Trim$(para.Range.Text)
+End Function
+
+Private Function GetRangeTextFinalView(ByVal rng As Range) As String
+    ' Extracts range text as shown in "Final" view:
+    ' includes insertions, excludes deletions.
+
+    On Error GoTo Fail
+
+    If rng Is Nothing Then
+        GetRangeTextFinalView = ""
+        Exit Function
+    End If
+
+    Dim workRange As Range
+    Set workRange = rng.Duplicate
+
+    If workRange.Revisions.Count = 0 Then
+        GetRangeTextFinalView = workRange.Text
+    Else
+        GetRangeTextFinalView = GetTextExcludingDeletions(workRange)
+    End If
+    Exit Function
+
+Fail:
+    If rng Is Nothing Then
+        GetRangeTextFinalView = ""
+    Else
+        GetRangeTextFinalView = rng.Text
+    End If
+End Function
+
+Private Function GetTextExcludingDeletions(ByVal rng As Range) As String
+    ' Helper to extract text from a range, excluding any deleted text.
+
+    On Error GoTo Fail
+
+    If rng Is Nothing Then
+        GetTextExcludingDeletions = ""
+        Exit Function
+    End If
+
+    Dim rev As Revision
+    Dim delCount As Long
+    Dim delStarts() As Long
+    Dim delEnds() As Long
+    Dim delStart As Long
+    Dim delEnd As Long
+
+    delCount = 0
+
+    ' Collect deletion ranges overlapping this range and clamp to bounds.
+    For Each rev In rng.Revisions
+        If rev.Type = wdRevisionDelete Then
+            delStart = rev.Range.Start
+            delEnd = rev.Range.End
+
+            If delStart < rng.Start Then delStart = rng.Start
+            If delEnd > rng.End Then delEnd = rng.End
+
+            If delEnd > delStart Then
+                delCount = delCount + 1
+                ReDim Preserve delStarts(1 To delCount)
+                ReDim Preserve delEnds(1 To delCount)
+                delStarts(delCount) = delStart
+                delEnds(delCount) = delEnd
+            End If
+        End If
+    Next rev
+
+    If delCount = 0 Then
+        GetTextExcludingDeletions = rng.Text
+        Exit Function
+    End If
+
+    ' Sort deletion ranges by start position (insertion sort).
+    Dim i As Long
+    Dim j As Long
+    Dim keyStart As Long
+    Dim keyEnd As Long
+
+    For i = 2 To delCount
+        keyStart = delStarts(i)
+        keyEnd = delEnds(i)
+        j = i - 1
+        Do While j >= 1 And delStarts(j) > keyStart
+            delStarts(j + 1) = delStarts(j)
+            delEnds(j + 1) = delEnds(j)
+            j = j - 1
+        Loop
+        delStarts(j + 1) = keyStart
+        delEnds(j + 1) = keyEnd
+    Next i
+
+    Dim doc As Document
+    Set doc = rng.Document
+
+    Dim result As String
+    Dim cursorPos As Long
+    Dim mergedStart As Long
+    Dim mergedEnd As Long
+    Dim subRng As Range
+
+    result = ""
+    cursorPos = rng.Start
+    mergedStart = delStarts(1)
+    mergedEnd = delEnds(1)
+
+    For i = 2 To delCount + 1
+        If i <= delCount And delStarts(i) <= mergedEnd Then
+            If delEnds(i) > mergedEnd Then mergedEnd = delEnds(i)
+        Else
+            If mergedStart > cursorPos Then
+                Set subRng = doc.Range(cursorPos, mergedStart)
+                result = result & subRng.Text
+            End If
+            cursorPos = mergedEnd
+
+            If i <= delCount Then
+                mergedStart = delStarts(i)
+                mergedEnd = delEnds(i)
+            End If
+        End If
+    Next i
+
+    If cursorPos < rng.End Then
+        Set subRng = doc.Range(cursorPos, rng.End)
+        result = result & subRng.Text
+    End If
+
+    GetTextExcludingDeletions = result
+    Exit Function
+
+Fail:
+    If rng Is Nothing Then
+        GetTextExcludingDeletions = ""
+    Else
+        GetTextExcludingDeletions = rng.Text
+    End If
+End Function
+
+Private Function StripCellEndMarkers(ByVal cellText As String) As String
+    ' Removes trailing Word table-cell end markers (Chr(13), Chr(7)).
+
+    Dim t As String
+    t = cellText
+
+    Do While Len(t) > 0
+        If Right$(t, 1) = Chr$(7) Or Right$(t, 1) = Chr$(13) Then
+            t = Left$(t, Len(t) - 1)
+        Else
+            Exit Do
+        End If
+    Loop
+
+    StripCellEndMarkers = t
+End Function
+
+Private Function GetCellTextFinalView(ByVal cell As Cell) As String
+    ' Extracts cell text as it appears in Word's "Final" view.
+    ' - Insertions (w:ins) are INCLUDED
+    ' - Deletions (w:del) are EXCLUDED
+    ' This matches Word's "Final" display mode without actually accepting changes.
+    
+    On Error GoTo Fail
+
+    Dim rng As Range
+    Dim finalText As String
+
+    Set rng = cell.Range
+    finalText = GetRangeTextFinalView(rng)
+    finalText = StripCellEndMarkers(finalText)
+    GetCellTextFinalView = Trim$(finalText)
+    Exit Function
+
+Fail:
+    GetCellTextFinalView = ""
+End Function
+
+' =========================================================================================
 ' === DOCUMENT STRUCTURE MAP (DSM) FUNCTIONS =============================================
 ' =========================================================================================
 
@@ -443,8 +640,8 @@ Private Sub BuildDocumentStructureMap(ByVal doc As Document)
             On Error GoTo ErrorHandler
             .StyleName = styleStr
             
-            ' Get full text content (no truncation for LLM review)
-            textPrev = Trim$(para.Range.Text)
+            ' Get full text content in 'Final' view (excludes deletions, includes insertions)
+            textPrev = GetParagraphTextFinalView(para)
             .TextPreview = textPrev
             
             ' Store position
@@ -518,7 +715,7 @@ Private Function GetTableTitleForDSM(ByVal tbl As Table, ByVal doc As Document) 
     ' Try paragraph after table first
     Set p = tbl.Range.Paragraphs(tbl.Range.Paragraphs.Count).Next
     If Not p Is Nothing Then
-        txt = Trim$(p.Range.Text)
+        txt = GetParagraphTextFinalView(p)
         If Len(txt) > 3 And Len(txt) < 200 Then
             GetTableTitleForDSM = txt
             Exit Function
@@ -528,21 +725,22 @@ Private Function GetTableTitleForDSM(ByVal tbl As Table, ByVal doc As Document) 
     ' Try paragraph before table
     Set p = tbl.Range.Paragraphs(1).Previous
     If Not p Is Nothing Then
-        txt = Trim$(p.Range.Text)
+        txt = GetParagraphTextFinalView(p)
         If Len(txt) > 3 And Len(txt) < 200 Then
             GetTableTitleForDSM = txt
             Exit Function
         End If
     End If
     
-    ' Fallback: use first cell content
+    ' Fallback: use first cell content in Final view
     If tbl.Rows.Count > 0 And tbl.Columns.Count > 0 Then
-        txt = Trim$(tbl.Cell(1, 1).Range.Text)
+        txt = GetCellTextFinalView(tbl.Cell(1, 1))
         If Len(txt) > 100 Then txt = Left$(txt, 100) & "..."
         GetTableTitleForDSM = txt
-    Else
-        GetTableTitleForDSM = "(Table)"
+        Exit Function
     End If
+    
+    GetTableTitleForDSM = "(Table)"
 End Function
 
 Private Sub ClearDocumentStructureMap()
@@ -759,10 +957,9 @@ Private Function ExportTableContentPreview(ByVal tableID As String) As String
     For r = 1 To maxRows
         output = output & "| " & r & " | "
         For c = 1 To maxCols
-            cellText = Trim$(tbl.Cell(r, c).Range.Text)
-            ' Remove cell markers
-            cellText = Replace(cellText, Chr(13), " ")
-            cellText = Replace(cellText, Chr(7), "")
+            cellText = GetCellTextFinalView(tbl.Cell(r, c))
+            cellText = Replace(cellText, vbCr, " ")
+            cellText = Replace(cellText, vbLf, " ")
             ' No truncation - show full cell content
             output = output & cellText & " | "
         Next c
@@ -3454,20 +3651,8 @@ Private Function GetCellText(ByVal c As Cell) As String
     ' Extracts normalized text from a cell
     On Error Resume Next
 
-    Dim cellRange As Range
-    Set cellRange = c.Range
-
-    ' Remove the cell end markers (Chr 13 & Chr 7)
     Dim txt As String
-    txt = cellRange.Text
-
-    ' Remove trailing cell marker
-    If Right$(txt, 1) = Chr$(7) Then
-        txt = Left$(txt, Len(txt) - 1)
-    End If
-    If Right$(txt, 1) = Chr$(13) Then
-        txt = Left$(txt, Len(txt) - 1)
-    End If
+    txt = GetCellTextFinalView(c)
 
     ' Normalize whitespace
     txt = NormalizeForDocument(txt)
@@ -6333,6 +6518,54 @@ Private Function JsonEscape(ByVal inputText As String) As String
     JsonEscape = s
 End Function
 
+Private Function RangeHasDeletionRevisions(ByVal sourceRange As Range) As Boolean
+    On Error GoTo Fail
+
+    Dim rev As Revision
+    For Each rev In sourceRange.Revisions
+        If rev.Type = wdRevisionDelete Then
+            If rev.Range.End > sourceRange.Start And rev.Range.Start < sourceRange.End Then
+                RangeHasDeletionRevisions = True
+                Exit Function
+            End If
+        End If
+    Next rev
+
+    RangeHasDeletionRevisions = False
+    Exit Function
+
+Fail:
+    RangeHasDeletionRevisions = False
+End Function
+
+Private Function BuildTaggedTextFromRangeFinalView(ByVal sourceRange As Range) As String
+    On Error GoTo Fail
+
+    If RangeHasDeletionRevisions(sourceRange) Then
+        BuildTaggedTextFromRangeFinalView = GetRangeTextFinalView(sourceRange)
+    Else
+        BuildTaggedTextFromRangeFinalView = BuildTaggedTextFromRange(sourceRange)
+    End If
+    Exit Function
+
+Fail:
+    BuildTaggedTextFromRangeFinalView = GetRangeTextFinalView(sourceRange)
+End Function
+
+Private Function BuildFormatSpansJsonFinalView(ByVal sourceRange As Range) As String
+    On Error GoTo Fail
+
+    If RangeHasDeletionRevisions(sourceRange) Then
+        BuildFormatSpansJsonFinalView = "[]"
+    Else
+        BuildFormatSpansJsonFinalView = BuildFormatSpansJson(sourceRange)
+    End If
+    Exit Function
+
+Fail:
+    BuildFormatSpansJsonFinalView = "[]"
+End Function
+
 Private Function BuildTaggedTextFromRange(ByVal sourceRange As Range) As String
     On Error GoTo Fail
 
@@ -6503,16 +6736,19 @@ Private Function ExportStructureMapAsJsonV41() As String
 
         If elem.ElementType = "paragraph" Then
             Dim pRange As Range
+            Dim pFinalText As String
             Set pRange = ActiveDocument.Range(elem.StartPos, elem.EndPos)
+            pFinalText = GetRangeTextFinalView(pRange)
             elementJson = "{""id"":""" & elem.ElementID & """,""kind"":""paragraph"",""style"":""" & JsonEscape(elem.StyleName) & """,""text_plain"":""" & _
-                          JsonEscape(pRange.Text) & """,""text_tagged"":""" & JsonEscape(BuildTaggedTextFromRange(pRange)) & _
-                          """,""format_spans"":" & BuildFormatSpansJson(pRange) & "}"
+                          JsonEscape(pFinalText) & """,""text_tagged"":""" & JsonEscape(BuildTaggedTextFromRangeFinalView(pRange)) & _
+                          """,""format_spans"":" & BuildFormatSpansJsonFinalView(pRange) & "}"
         ElseIf elem.ElementType = "table" Then
             Dim tbl As Table
             Set tbl = ResolveTableByID(elem.ElementID)
             Dim cellsJson As String
             Dim r As Long
             Dim c As Long
+            Dim cellFinalText As String
 
             cellsJson = ""
             If Not tbl Is Nothing Then
@@ -6528,9 +6764,10 @@ Private Function ExportStructureMapAsJsonV41() As String
                         End If
                         On Error GoTo ErrorHandler
                         If cellRange.End > cellRange.Start Then cellRange.End = cellRange.End - 1
+                        cellFinalText = GetCellTextFinalView(tbl.Cell(r, c))
                         cellsJson = cellsJson & IIf(Len(cellsJson) > 0, ",", "") & _
-                            "{""id"":""" & elem.ElementID & ".R" & r & ".C" & c & """,""text_plain"":""" & JsonEscape(cellRange.Text) & _
-                            """,""text_tagged"":""" & JsonEscape(BuildTaggedTextFromRange(cellRange)) & """,""format_spans"":" & BuildFormatSpansJson(cellRange) & "}"
+                            "{""id"":""" & elem.ElementID & ".R" & r & ".C" & c & """,""text_plain"":""" & JsonEscape(cellFinalText) & _
+                            """,""text_tagged"":""" & JsonEscape(BuildTaggedTextFromRangeFinalView(cellRange)) & """,""format_spans"":" & BuildFormatSpansJsonFinalView(cellRange) & "}"
 SkipCell:
                     Next c
                 Next r
