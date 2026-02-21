@@ -8,7 +8,57 @@
     Private Const PARSE_INVALID_ESCAPE_CHARACTER As Long = 6
 
     ' Feature flags
+    '
+    ' FEATURE FLAGS GUIDE (what they do + tradeoffs when disabling)
+    '
+    ' 1) USE_GRANULAR_DIFF
+    '    Purpose: Apply minimal text edits for plain replacements (better tracked-change readability).
+    '    Disable (False) pros: Faster on large replacements; simpler behavior.
+    '    Disable (False) cons: Coarser tracked changes (larger delete/insert blocks).
+    '
+    ' 2) INCLUDE_TABLE_PARAGRAPHS_IN_DSM
+    '    Purpose: Include paragraph entries that are inside tables in the DSM paragraph list.
+    '    Disable (False) pros: Smaller/faster DSM; avoids noisy duplicate coverage of table content.
+    '    Disable (False) cons: Cannot target in-table paragraphs by P# IDs; table edits should use T#.R#.C#.
+    '
+    ' 3) INCLUDE_DSM_LOCATION_METADATA
+    '    Purpose: Populate section/page metadata for DSM elements.
+    '    Disable (False) pros: Noticeably faster map/export (page/section lookups can be expensive).
+    '    Disable (False) cons: No section/page hints in exported DSM JSON.
+    '
+    ' 4) DSM_INCLUDE_TABLE_CELL_TAGGED_TEXT
+    '    Purpose: Export rich tagged text (text_tagged) for each table cell.
+    '    Disable (False) pros: Large speed-up for big/merged tables; smaller JSON payloads.
+    '    Disable (False) cons: Loses per-cell inline formatting tags in DSM output.
+    '
+    ' 5) DSM_INCLUDE_TABLE_CELL_FORMAT_SPANS
+    '    Purpose: Export per-cell format span arrays (format_spans) in DSM.
+    '    Disable (False) pros: Large speed-up for big/merged tables; less memory use.
+    '    Disable (False) cons: Loses precise formatting span diagnostics for table cells.
+    '
+    ' Recommended performance profile for large documents:
+    ' - INCLUDE_DSM_LOCATION_METADATA = False
+    ' - DSM_INCLUDE_TABLE_CELL_TAGGED_TEXT = False
+    ' - DSM_INCLUDE_TABLE_CELL_FORMAT_SPANS = False
+    ' Keep USE_GRANULAR_DIFF = True unless replacement speed is the top priority.
     Private Const USE_GRANULAR_DIFF As Boolean = True
+    Private Const INCLUDE_TABLE_PARAGRAPHS_IN_DSM As Boolean = False
+    Private Const INCLUDE_DSM_LOCATION_METADATA As Boolean = False ' Section/page lookups are expensive on large docs
+    ' DSM_*_MAX_* and DSM_INITIAL_CAPACITY below are tuning knobs, not on/off flags.
+    ' Lower values generally improve speed/memory usage but reduce preview/detail depth.
+    Private Const DSM_INITIAL_CAPACITY As Long = 256
+    Private Const DSM_PARAGRAPH_PREVIEW_MAX_CHARS As Long = 99999
+    Private Const DSM_TABLE_PREVIEW_MAX_ROWS As Long = 200
+    Private Const DSM_TABLE_PREVIEW_MAX_COLS As Long = 50
+    Private Const DSM_TABLE_CELL_PREVIEW_MAX_CHARS As Long = 99999
+    Private Const DSM_INCLUDE_TABLE_CELL_TAGGED_TEXT As Boolean = False
+    Private Const DSM_INCLUDE_TABLE_CELL_FORMAT_SPANS As Boolean = False
+    ' Performance tuning for long-running loops/logging.
+    Private Const VERBOSE_TRACE_LOGGING As Boolean = False
+    Private Const DSM_PARAGRAPH_PROGRESS_INTERVAL As Long = 100
+    Private Const DSM_TABLE_PROGRESS_INTERVAL As Long = 10
+    Private Const DSM_CELL_PROGRESS_INTERVAL As Long = 100
+    Private Const APPLY_PREFLIGHT_PROGRESS_INTERVAL As Long = 50
 
     ' Diff operation type constants
 Private Const DIFF_EQUAL As String = "equal"
@@ -44,6 +94,8 @@ End Type
 Private g_TableIndex() As TableIndexEntry
 Private g_TableIndexCount As Long
 Private g_TableIndexBuilt As Boolean
+Private g_TocFieldRanges As Collection
+Private g_TocFieldCacheBuilt As Boolean
 
 ' =========================================================================================
 ' === DOCUMENT STRUCTURE MAP (DSM) - V4 Architecture =====================================
@@ -60,12 +112,29 @@ Private Type DocumentElement
     TableRowCount As Long           ' For tables: number of rows
     TableColCount As Long           ' For tables: number of columns
     AssociatedTitleID As String     ' For tables: ID of title paragraph (if any)
+    SectionNumber As Long           ' Section index (Word numbering)
+    PageNumber As Long              ' Page number (Final view)
+    HeadingLevel As Long            ' Heading level for paragraphs (0 if not a heading)
+    TableTitle As String            ' Paragraph below table (if any)
+    TableCaption As String          ' Paragraph above table (if any)
+    WithinTable As Boolean          ' True when paragraph is inside a table
 End Type
 
 ' Global structure map
 Private g_DocumentMap() As DocumentElement
 Private g_DocumentMapCount As Long
 Private g_DocumentMapBuilt As Boolean
+
+' Tool registry cache
+Private g_ToolRegistry As Object
+Private g_ToolRegistryOrder As Collection
+
+' Last run metadata for COM/automation callers
+Private g_LastRunResultJson As String
+Private g_LastRunReportPath As String
+Private g_LastRunId As String
+Private g_LastActionErrorCode As String
+Private g_LastActionErrorMessage As String
 
 ' Target reference type for V4 architecture
 Private Type TargetReference
@@ -241,14 +310,21 @@ Private Function GetTableHeaderRowText(ByVal tbl As Table) As String
 
     Dim c As Cell
     Dim result As String
-    Dim row As row
+    Dim hasRow1Cell As Boolean
 
     result = ""
-    Set row = tbl.Rows(1)
 
-    For Each c In row.Cells
-        result = result & " " & Trim$(NormalizeForDocument(GetCellTextFinalView(c)))
+    For Each c In tbl.Range.Cells
+        If c.RowIndex = 1 Then
+            hasRow1Cell = True
+            result = result & " " & Trim$(NormalizeForDocument(GetCellTextFinalView(c)))
+        End If
     Next c
+
+    If Not hasRow1Cell Then
+        GetTableHeaderRowText = ""
+        Exit Function
+    End If
 
     GetTableHeaderRowText = Trim$(result)
     Exit Function
@@ -387,17 +463,53 @@ Private Sub ClearTableIndex()
     Erase g_TableIndex
 End Sub
 
+Private Sub TraceLog(ByVal message As String)
+    If VERBOSE_TRACE_LOGGING Then Debug.Print message
+End Sub
+
+Private Sub ClearTocFieldRangeCache()
+    Set g_TocFieldRanges = Nothing
+    g_TocFieldCacheBuilt = False
+End Sub
+
+Private Sub EnsureTocFieldRangeCache(ByVal doc As Document)
+    On Error GoTo Fail
+
+    If g_TocFieldCacheBuilt Then Exit Sub
+
+    Dim fld As field
+    Dim fldRange As Range
+
+    Set g_TocFieldRanges = New Collection
+    For Each fld In doc.Fields
+        If fld.Type = wdFieldTOC Then
+            Set fldRange = fld.Result
+            If Not fldRange Is Nothing Then g_TocFieldRanges.Add fldRange.Duplicate
+        End If
+    Next fld
+
+    g_TocFieldCacheBuilt = True
+    Exit Sub
+
+Fail:
+    Set g_TocFieldRanges = New Collection
+    g_TocFieldCacheBuilt = True
+End Sub
+
 ' =========================================================================================
 ' === FINAL VIEW TEXT EXTRACTION (for tracked changes handling) =============================
 ' =========================================================================================
 
 Private Function GetParagraphTextFinalView(ByVal para As Paragraph) As String
-    ' Extracts paragraph text as it appears in Word's "Final" view.
-    ' - Insertions (w:ins) are INCLUDED
-    ' - Deletions (w:del) are EXCLUDED
-    ' This matches Word's "Final" display mode without actually accepting changes.
-    
+    ' FAST PATH: if the document has no revisions, return paragraph text immediately.
+    ' SLOW PATH: only normalize tracked changes when revisions exist.
+
     On Error GoTo Fail
+
+    If para.Range.Document.Revisions.Count = 0 Then
+        GetParagraphTextFinalView = Trim$(para.Range.Text)
+        Exit Function
+    End If
 
     Dim rng As Range
     Set rng = para.Range
@@ -490,10 +602,14 @@ Private Function GetTextExcludingDeletions(ByVal rng As Range) As String
         keyStart = delStarts(i)
         keyEnd = delEnds(i)
         j = i - 1
-        Do While j >= 1 And delStarts(j) > keyStart
-            delStarts(j + 1) = delStarts(j)
-            delEnds(j + 1) = delEnds(j)
-            j = j - 1
+        Do While j >= 1
+            If delStarts(j) > keyStart Then
+                delStarts(j + 1) = delStarts(j)
+                delEnds(j + 1) = delEnds(j)
+                j = j - 1
+            Else
+                Exit Do
+            End If
         Loop
         delStarts(j + 1) = keyStart
         delEnds(j + 1) = keyEnd
@@ -514,19 +630,24 @@ Private Function GetTextExcludingDeletions(ByVal rng As Range) As String
     mergedEnd = delEnds(1)
 
     For i = 2 To delCount + 1
-        If i <= delCount And delStarts(i) <= mergedEnd Then
-            If delEnds(i) > mergedEnd Then mergedEnd = delEnds(i)
+        If i <= delCount Then
+            If delStarts(i) <= mergedEnd Then
+                If delEnds(i) > mergedEnd Then mergedEnd = delEnds(i)
+            Else
+                If mergedStart > cursorPos Then
+                    Set subRng = doc.Range(cursorPos, mergedStart)
+                    result = result & subRng.Text
+                End If
+                cursorPos = mergedEnd
+                mergedStart = delStarts(i)
+                mergedEnd = delEnds(i)
+            End If
         Else
             If mergedStart > cursorPos Then
                 Set subRng = doc.Range(cursorPos, mergedStart)
                 result = result & subRng.Text
             End If
             cursorPos = mergedEnd
-
-            If i <= delCount Then
-                mergedStart = delStarts(i)
-                mergedEnd = delEnds(i)
-            End If
         End If
     Next i
 
@@ -584,49 +705,294 @@ Fail:
     GetCellTextFinalView = ""
 End Function
 
+Private Function GetSafeTableRowCount(ByVal tbl As Table) As Long
+    ' Returns row count without failing on vertically merged tables.
+
+    On Error GoTo Fallback
+    GetSafeTableRowCount = tbl.Rows.Count
+    Exit Function
+
+Fallback:
+    Err.Clear
+    On Error GoTo Fail
+
+    Dim c As Cell
+    Dim maxRow As Long
+    maxRow = 0
+
+    For Each c In tbl.Range.Cells
+        If c.RowIndex > maxRow Then maxRow = c.RowIndex
+    Next c
+
+    GetSafeTableRowCount = maxRow
+    Exit Function
+
+Fail:
+    GetSafeTableRowCount = 0
+End Function
+
+Private Function GetSafeTableColCount(ByVal tbl As Table) As Long
+    ' Returns column count without failing on merged-cell tables.
+
+    On Error GoTo Fallback
+    GetSafeTableColCount = tbl.Columns.Count
+    Exit Function
+
+Fallback:
+    Err.Clear
+    On Error GoTo Fail
+
+    Dim c As Cell
+    Dim maxCol As Long
+    maxCol = 0
+
+    For Each c In tbl.Range.Cells
+        If c.ColumnIndex > maxCol Then maxCol = c.ColumnIndex
+    Next c
+
+    GetSafeTableColCount = maxCol
+    Exit Function
+
+Fail:
+    GetSafeTableColCount = 0
+End Function
+
+Private Function TryGetTableCell(ByVal tbl As Table, ByVal rowNum As Long, ByVal colNum As Long, ByRef outCell As Cell) As Boolean
+    ' Tries direct row/column addressing first, then falls back to merged-cell tolerant lookup.
+
+    On Error GoTo Fail
+    Set outCell = Nothing
+
+    If rowNum <= 0 Or colNum <= 0 Then
+        TryGetTableCell = False
+        Exit Function
+    End If
+
+    On Error Resume Next
+    Set outCell = tbl.Cell(rowNum, colNum)
+    If Err.Number = 0 And Not outCell Is Nothing Then
+        On Error GoTo Fail
+        TryGetTableCell = True
+        Exit Function
+    End If
+    Err.Clear
+    On Error GoTo Fail
+
+    Dim c As Cell
+    Dim rowFallback As Cell
+    Dim rowFallbackCol As Long
+    Dim colFallback As Cell
+    Dim colFallbackRow As Long
+
+    rowFallbackCol = 0
+    colFallbackRow = 0
+
+    For Each c In tbl.Range.Cells
+        If c.RowIndex = rowNum Then
+            If c.ColumnIndex = colNum Then
+                Set outCell = c
+                TryGetTableCell = True
+                Exit Function
+            End If
+
+            ' Horizontal merge fallback: choose the closest anchor cell on the same row.
+            If c.ColumnIndex <= colNum And c.ColumnIndex > rowFallbackCol Then
+                Set rowFallback = c
+                rowFallbackCol = c.ColumnIndex
+            End If
+        End If
+
+        ' Vertical merge fallback: choose the closest anchor cell in the same column above.
+        If c.ColumnIndex = colNum Then
+            If c.RowIndex <= rowNum And c.RowIndex > colFallbackRow Then
+                Set colFallback = c
+                colFallbackRow = c.RowIndex
+            End If
+        End If
+    Next c
+
+    If Not rowFallback Is Nothing Then
+        Set outCell = rowFallback
+        TryGetTableCell = True
+        Exit Function
+    End If
+
+    If Not colFallback Is Nothing Then
+        Set outCell = colFallback
+        TryGetTableCell = True
+        Exit Function
+    End If
+
+    TryGetTableCell = False
+    Exit Function
+
+Fail:
+    Set outCell = Nothing
+    TryGetTableCell = False
+End Function
+
+Private Function TryGetTableRowRange(ByVal tbl As Table, ByVal rowNum As Long, ByRef outRange As Range) As Boolean
+    ' Gets a row range with fallback for vertically merged tables where tbl.Rows(rowNum) may fail.
+
+    On Error GoTo Fail
+    Set outRange = Nothing
+
+    If rowNum <= 0 Then
+        TryGetTableRowRange = False
+        Exit Function
+    End If
+
+    On Error Resume Next
+    Set outRange = tbl.Rows(rowNum).Range
+    If Err.Number = 0 And Not outRange Is Nothing Then
+        On Error GoTo Fail
+        TryGetTableRowRange = True
+        Exit Function
+    End If
+    Err.Clear
+    On Error GoTo Fail
+
+    Dim c As Cell
+    Dim minStart As Long
+    Dim maxEnd As Long
+    minStart = 0
+    maxEnd = 0
+
+    For Each c In tbl.Range.Cells
+        If c.RowIndex = rowNum Then
+            If minStart = 0 Or c.Range.Start < minStart Then minStart = c.Range.Start
+            If c.Range.End > maxEnd Then maxEnd = c.Range.End
+        End If
+    Next c
+
+    If minStart > 0 And maxEnd > minStart Then
+        Set outRange = tbl.Range.Document.Range(minStart, maxEnd)
+        TryGetTableRowRange = True
+    Else
+        TryGetTableRowRange = False
+    End If
+    Exit Function
+
+Fail:
+    Set outRange = Nothing
+    TryGetTableRowRange = False
+End Function
+
+Private Function TryGetFirstCellInRow(ByVal tbl As Table, ByVal rowNum As Long, ByRef outCell As Cell) As Boolean
+    ' Returns the left-most anchor cell on a logical row.
+
+    On Error GoTo Fail
+    Set outCell = Nothing
+
+    If rowNum <= 0 Then
+        TryGetFirstCellInRow = False
+        Exit Function
+    End If
+
+    Dim c As Cell
+    Dim minCol As Long
+    minCol = 0
+
+    For Each c In tbl.Range.Cells
+        If c.RowIndex = rowNum Then
+            If outCell Is Nothing Then
+                Set outCell = c
+                minCol = c.ColumnIndex
+            ElseIf c.ColumnIndex < minCol Then
+                Set outCell = c
+                minCol = c.ColumnIndex
+            End If
+        End If
+    Next c
+
+    TryGetFirstCellInRow = Not outCell Is Nothing
+    Exit Function
+
+Fail:
+    Set outCell = Nothing
+    TryGetFirstCellInRow = False
+End Function
+
+Private Function GetCellContentRange(ByVal c As Cell) As Range
+    ' Returns a duplicate cell range without trailing cell/paragraph markers.
+
+    On Error GoTo Fail
+
+    Dim rng As Range
+    Set rng = c.Range.Duplicate
+
+    Do While rng.End > rng.Start
+        Dim ch As String
+        ch = Right$(rng.Text, 1)
+        If ch = Chr$(7) Or ch = Chr$(13) Then
+            rng.End = rng.End - 1
+        Else
+            Exit Do
+        End If
+    Loop
+
+    Set GetCellContentRange = rng
+    Exit Function
+
+Fail:
+    Set GetCellContentRange = Nothing
+End Function
+
 ' =========================================================================================
 ' === DOCUMENT STRUCTURE MAP (DSM) FUNCTIONS =============================================
 ' =========================================================================================
 
 Private Sub BuildDocumentStructureMap(ByVal doc As Document)
     ' Builds a comprehensive structure map of the document
-    ' Maps every paragraph and table to a unique ID (P1, P2, T1, T2, etc.)
-    
     On Error GoTo ErrorHandler
     
-    Dim paraCount As Long
-    Dim tableCount As Long
-    Dim totalElements As Long
     Dim idx As Long
     Dim para As Paragraph
+    Dim paraRange As Range
     Dim tbl As Table
+    Dim tblRange As Range
     Dim styleStr As String
     Dim textPrev As String
+    Dim paraIdx As Long
+    Dim tblIdx As Long
+    Dim inTable As Boolean
+    Dim totalParagraphs As Long
+    Dim totalTables As Long
+    Dim docHasRevisions As Boolean
     
+    totalParagraphs = doc.Paragraphs.Count
+    totalTables = doc.Tables.Count
+    docHasRevisions = False
+    On Error Resume Next
+    docHasRevisions = (doc.Revisions.Count > 0)
+    Err.Clear
+    On Error GoTo ErrorHandler
+
     Debug.Print "Building Document Structure Map..."
-    
-    ' Count elements
-    paraCount = doc.Paragraphs.Count
-    tableCount = doc.Tables.Count
-    totalElements = paraCount + tableCount
-    
-    If totalElements = 0 Then
-        g_DocumentMapCount = 0
-        g_DocumentMapBuilt = True
-        Debug.Print "  -> Empty document, no elements to map"
-        Exit Sub
-    End If
-    
-    ' Allocate array
-    ReDim g_DocumentMap(1 To totalElements)
+    Debug.Print "Total Paragraphs to process: " & totalParagraphs
+
+    ' Allocate with growth headroom
+    ReDim g_DocumentMap(1 To DSM_INITIAL_CAPACITY)
     idx = 0
     
-    ' Map all paragraphs first
-    Dim paraIdx As Long
+    ' Map paragraphs
     paraIdx = 0
     For Each para In doc.Paragraphs
         paraIdx = paraIdx + 1
+
+        If paraIdx Mod DSM_PARAGRAPH_PROGRESS_INTERVAL = 0 Then
+            TraceLog "  -> DSM paragraph progress: " & paraIdx & "/" & totalParagraphs
+            DoEvents
+        End If
+
+        Set paraRange = para.Range
+        inTable = paraRange.Information(wdWithinTable)
+        If (Not INCLUDE_TABLE_PARAGRAPHS_IN_DSM) And inTable Then
+            GoTo ContinueParagraphLoop
+        End If
+
         idx = idx + 1
+        EnsureDocumentMapCapacity idx
         
         With g_DocumentMap(idx)
             .ElementID = "P" & paraIdx
@@ -640,70 +1006,218 @@ Private Sub BuildDocumentStructureMap(ByVal doc As Document)
             On Error GoTo ErrorHandler
             .StyleName = styleStr
             
-            ' Get full text content in 'Final' view (excludes deletions, includes insertions)
-            textPrev = GetParagraphTextFinalView(para)
-            .TextPreview = textPrev
+            ' Get full text content in 'Final' view
+            If docHasRevisions Then
+                textPrev = Trim$(GetRangeTextFinalView(paraRange))
+            Else
+                textPrev = Trim$(paraRange.Text)
+            End If
+            .TextPreview = LimitPreviewText(textPrev, DSM_PARAGRAPH_PREVIEW_MAX_CHARS)
             
             ' Store position
-            .StartPos = para.Range.Start
-            .EndPos = para.Range.End
+            .StartPos = paraRange.Start
+            .EndPos = paraRange.End
             
             .TableRowCount = 0
             .TableColCount = 0
             .AssociatedTitleID = ""
+            If INCLUDE_DSM_LOCATION_METADATA Then
+                .SectionNumber = GetRangeSectionNumber(paraRange)
+                .PageNumber = GetRangePageNumber(paraRange)
+            Else
+                .SectionNumber = 0
+                .PageNumber = 0
+            End If
+            .HeadingLevel = GetHeadingLevelFromStyle(styleStr)
+            .TableTitle = ""
+            .TableCaption = ""
+            .WithinTable = inTable
         End With
         
-        If paraIdx Mod 100 = 0 Then
-            Debug.Print "  -> Mapped " & paraIdx & " paragraphs..."
-        End If
+ContinueParagraphLoop:
     Next para
     
-    ' Map all tables
-    Dim tblIdx As Long
+    Debug.Print "Paragraphs complete. Total Tables to process: " & totalTables
+    
+    ' Map tables
     tblIdx = 0
     For Each tbl In doc.Tables
         tblIdx = tblIdx + 1
         idx = idx + 1
+
+        If tblIdx Mod DSM_TABLE_PROGRESS_INTERVAL = 0 Then
+            TraceLog "  -> DSM table progress: " & tblIdx & "/" & totalTables
+            DoEvents
+        End If
+        
+        EnsureDocumentMapCapacity idx
+        Set tblRange = tbl.Range
         
         With g_DocumentMap(idx)
             .ElementID = "T" & tblIdx
             .ElementType = "table"
             .StyleName = ""
             
-            ' Get table title (look for paragraph before/after table)
             textPrev = GetTableTitleForDSM(tbl, doc)
-            .TextPreview = textPrev
+            .TextPreview = LimitPreviewText(textPrev, DSM_PARAGRAPH_PREVIEW_MAX_CHARS)
             
-            ' Store position
-            .StartPos = tbl.Range.Start
-            .EndPos = tbl.Range.End
+            .StartPos = tblRange.Start
+            .EndPos = tblRange.End
             
-            ' Store dimensions
-            On Error Resume Next
-            .TableRowCount = tbl.Rows.Count
-            .TableColCount = tbl.Columns.Count
-            If Err.Number <> 0 Then
-                .TableRowCount = 0
-                .TableColCount = 0
-            End If
-            Err.Clear
-            On Error GoTo ErrorHandler
+            .TableRowCount = GetSafeTableRowCount(tbl)
+            .TableColCount = GetSafeTableColCount(tbl)
             
             .AssociatedTitleID = ""
+            .SectionNumber = 0
+            .PageNumber = 0
+            .HeadingLevel = 0
+            
+            .TableTitle = GetTableTitleBelow(tbl)
+            .TableCaption = GetTableCaptionAbove(tbl)
+            .WithinTable = False
         End With
     Next tbl
-    
+
+    If idx = 0 Then
+        g_DocumentMapCount = 0
+        g_DocumentMapBuilt = True
+        Exit Sub
+    End If
+
+    TraceLog "Sorting map by position..."
+    ReDim Preserve g_DocumentMap(1 To idx)
     g_DocumentMapCount = idx
+    SortDocumentMapByStartPos
     g_DocumentMapBuilt = True
     
     Debug.Print "  -> Structure map built: " & paraIdx & " paragraphs, " & tblIdx & " tables"
     Exit Sub
     
 ErrorHandler:
-    Debug.Print "Error building structure map: " & Err.Description
+    Debug.Print "Error building structure map: " & Err.Description & " (idx=" & idx & ", paraIdx=" & paraIdx & ", tblIdx=" & tblIdx & ")"
     g_DocumentMapCount = 0
     g_DocumentMapBuilt = False
 End Sub
+
+Private Sub EnsureDocumentMapCapacity(ByVal requiredIndex As Long)
+    Dim currentUpper As Long
+    Dim newUpper As Long
+
+    If requiredIndex <= 0 Then Exit Sub
+
+    currentUpper = UBound(g_DocumentMap)
+    If requiredIndex <= currentUpper Then Exit Sub
+
+    newUpper = currentUpper
+    Do While newUpper < requiredIndex
+        If newUpper < 1024 Then
+            newUpper = newUpper * 2
+        Else
+            newUpper = newUpper + 1024
+        End If
+    Loop
+
+    ReDim Preserve g_DocumentMap(1 To newUpper)
+End Sub
+
+Private Sub SortDocumentMapByStartPos()
+    Dim i As Long
+    Dim j As Long
+    Dim tmp As DocumentElement
+
+    If g_DocumentMapCount <= 1 Then Exit Sub
+
+    For i = 2 To g_DocumentMapCount
+        tmp = g_DocumentMap(i)
+        j = i - 1
+        Do While j >= 1
+            If g_DocumentMap(j).StartPos > tmp.StartPos Then
+                g_DocumentMap(j + 1) = g_DocumentMap(j)
+                j = j - 1
+            Else
+                Exit Do
+            End If
+        Loop
+        g_DocumentMap(j + 1) = tmp
+    Next i
+End Sub
+
+Private Function GetRangeSectionNumber(ByVal rng As Range) As Long
+    On Error GoTo Fail
+    If rng Is Nothing Then Exit Function
+    GetRangeSectionNumber = rng.Information(wdActiveEndSectionNumber)
+    Exit Function
+Fail:
+    GetRangeSectionNumber = 0
+End Function
+
+Private Function GetRangePageNumber(ByVal rng As Range) As Long
+    On Error GoTo Fail
+    If rng Is Nothing Then Exit Function
+    GetRangePageNumber = rng.Information(wdActiveEndAdjustedPageNumber)
+    Exit Function
+Fail:
+    GetRangePageNumber = 0
+End Function
+
+Private Function GetHeadingLevelFromStyle(ByVal styleName As String) As Long
+    Dim normalized As String
+    Dim suffix As String
+    normalized = LCase$(Trim$(styleName))
+
+    If Left$(normalized, 8) = "heading " Then
+        suffix = Trim$(Mid$(normalized, 9))
+    ElseIf Left$(normalized, 13) = "report level " Then
+        suffix = Trim$(Mid$(normalized, 14))
+    Else
+        GetHeadingLevelFromStyle = 0
+        Exit Function
+    End If
+
+    If Len(suffix) > 0 And IsNumeric(suffix) Then
+        GetHeadingLevelFromStyle = CLng(Val(suffix))
+    Else
+        GetHeadingLevelFromStyle = 0
+    End If
+End Function
+
+Private Function LimitPreviewText(ByVal text As String, ByVal maxChars As Long) As String
+    Dim normalized As String
+    normalized = Replace(text, vbCr, " ")
+    normalized = Replace(normalized, vbLf, " ")
+    normalized = Trim$(normalized)
+
+    If maxChars <= 0 Then
+        LimitPreviewText = normalized
+        Exit Function
+    End If
+
+    If Len(normalized) > maxChars Then
+        LimitPreviewText = Left$(normalized, maxChars) & "..."
+    Else
+        LimitPreviewText = normalized
+    End If
+End Function
+
+Private Function ResolveBodyParagraphRange(ByVal paragraphNum As Long) As Range
+    On Error GoTo Fail
+
+    Dim para As Paragraph
+
+    If paragraphNum <= 0 Then GoTo Fail
+    If paragraphNum > ActiveDocument.Paragraphs.Count Then GoTo Fail
+
+    Set para = ActiveDocument.Paragraphs(paragraphNum)
+    If para Is Nothing Then GoTo Fail
+
+    If (Not INCLUDE_TABLE_PARAGRAPHS_IN_DSM) And para.Range.Information(wdWithinTable) Then GoTo Fail
+
+    Set ResolveBodyParagraphRange = para.Range.Duplicate
+    Exit Function
+
+Fail:
+    Set ResolveBodyParagraphRange = Nothing
+End Function
 
 Private Function GetTableTitleForDSM(ByVal tbl As Table, ByVal doc As Document) As String
     ' Gets a descriptive title for the table (paragraph before or after)
@@ -732,9 +1246,10 @@ Private Function GetTableTitleForDSM(ByVal tbl As Table, ByVal doc As Document) 
         End If
     End If
     
-    ' Fallback: use first cell content in Final view
-    If tbl.Rows.Count > 0 And tbl.Columns.Count > 0 Then
-        txt = GetCellTextFinalView(tbl.Cell(1, 1))
+    ' Fallback: use first logical cell content in Final view.
+    Dim firstCell As Cell
+    If TryGetTableCell(tbl, 1, 1, firstCell) Then
+        txt = GetCellTextFinalView(firstCell)
         If Len(txt) > 100 Then txt = Left$(txt, 100) & "..."
         GetTableTitleForDSM = txt
         Exit Function
@@ -748,11 +1263,11 @@ Private Sub ClearDocumentStructureMap()
     g_DocumentMapCount = 0
     g_DocumentMapBuilt = False
     Erase g_DocumentMap
+    ClearTocFieldRangeCache
 End Sub
 
 Private Function ExportStructureMapAsMarkdown() As String
-    ' Exports the structure map as markdown for LLM consumption
-    ' Includes complete prompt instructions for the LLM
+    ' Exports the structure map as annotated markdown for the V5 search/replace workflow.
     
     On Error GoTo ErrorHandler
     
@@ -768,96 +1283,28 @@ Private Function ExportStructureMapAsMarkdown() As String
     Dim output As String
     Dim i As Long
     Dim elem As DocumentElement
+    Dim paraRange As Range
+    Dim paraText As String
     
-    ' Add LLM prompt instructions at the beginning
-    output = "You are a technical document reviewer for acoustics and noise impact assessment reports. You will receive a Document Structure Map (DSM) showing the structure of a Word document with unique IDs for each element." & vbCrLf & vbCrLf
-    
-    output = output & "## IMPORTANT: Response Format" & vbCrLf & vbCrLf
-    output = output & "Return a JSON array of suggestions. Each suggestion MUST have:" & vbCrLf
-    output = output & "- ""target"": Element ID from the structure map (e.g., ""P5"", ""T2.R3.C2"")" & vbCrLf
-    output = output & "- ""action"": One of the action types listed below" & vbCrLf
-    output = output & "- ""explanation"": Brief reason for the change" & vbCrLf & vbCrLf
-    
-    output = output & "## Action Types" & vbCrLf & vbCrLf
-    output = output & "### replace" & vbCrLf
-    output = output & "Find and replace text within the target element." & vbCrLf
-    output = output & "Required: ""find"", ""replace"" | Optional: ""match_case"" (true/false)" & vbCrLf
-    output = output & "Example: {""target"": ""P5"", ""action"": ""replace"", ""find"": ""recieved"", ""replace"": ""received"", ""explanation"": ""Spelling""}" & vbCrLf & vbCrLf
-    
-    output = output & "### apply_style" & vbCrLf
-    output = output & "Apply a document style to the target element." & vbCrLf
-    output = output & "Required: ""style""" & vbCrLf
-    output = output & "Available styles: heading_l1, heading_l2, heading_l3, heading_l4, body_text, bullet, table_heading, table_text, table_title, figure" & vbCrLf
-    output = output & "Example: {""target"": ""P12"", ""action"": ""apply_style"", ""style"": ""heading_l2"", ""explanation"": ""Should be section heading""}" & vbCrLf & vbCrLf
-    
-    output = output & "### comment" & vbCrLf
-    output = output & "Add a comment to the target element." & vbCrLf
-    output = output & "Required: ""explanation"" (becomes the comment text)" & vbCrLf
-    output = output & "Example: {""target"": ""P8"", ""action"": ""comment"", ""explanation"": ""Consider adding methodology details""}" & vbCrLf & vbCrLf
-    
-    output = output & "### replace_table" & vbCrLf
-    output = output & "Replace entire table with new markdown table." & vbCrLf
-    output = output & "Required: ""replace"" (markdown table format)" & vbCrLf
-    output = output & "Example: {""target"": ""T1"", ""action"": ""replace_table"", ""replace"": ""| Col1 | Col2 |\n|---|---|\n| A | B |"", ""explanation"": ""Updated data""}" & vbCrLf & vbCrLf
-    
-    output = output & "### insert_row" & vbCrLf
-    output = output & "Insert a new row in a table." & vbCrLf
-    output = output & "Required: ""data"" (array of cell values) | Optional: ""after_row"" (row number, default 0)" & vbCrLf
-    output = output & "Example: {""target"": ""T2"", ""action"": ""insert_row"", ""after_row"": 3, ""data"": [""Location 4"", ""55"", ""47""], ""explanation"": ""Added missing location""}" & vbCrLf & vbCrLf
-    
-    output = output & "### delete_row" & vbCrLf
-    output = output & "Delete a table row. Target must be a row reference (e.g., ""T2.R5"")" & vbCrLf
-    output = output & "Example: {""target"": ""T2.R5"", ""action"": ""delete_row"", ""explanation"": ""Duplicate entry""}" & vbCrLf & vbCrLf
-    
-    output = output & "## Target Reference Format" & vbCrLf & vbCrLf
-    output = output & "- P{n} = Paragraph number (e.g., P5 = 5th paragraph)" & vbCrLf
-    output = output & "- T{n} = Table number (e.g., T2 = 2nd table)" & vbCrLf
-    output = output & "- T{n}.R{r} = Table row (e.g., T2.R3 = Table 2, Row 3)" & vbCrLf
-    output = output & "- T{n}.R{r}.C{c} = Table cell (e.g., T2.R3.C2 = Table 2, Row 3, Column 2)" & vbCrLf
-    output = output & "- T{n}.H.C{c} = Table header cell (e.g., T2.H.C1 = Table 2, Header, Column 1)" & vbCrLf & vbCrLf
-    
-    output = output & "## Review Guidelines" & vbCrLf & vbCrLf
-    output = output & "Focus on:" & vbCrLf
-    output = output & "1. Technical accuracy (noise levels, standards, calculations)" & vbCrLf
-    output = output & "2. Consistency (terminology, units, formatting)" & vbCrLf
-    output = output & "3. Clarity (sentence structure, paragraph flow)" & vbCrLf
-    output = output & "4. Compliance (BS8233, WHO guidelines, planning policy)" & vbCrLf
-    output = output & "5. Completeness (missing sections, incomplete tables)" & vbCrLf & vbCrLf
-    
-    output = output & "## Formatting in Replacements" & vbCrLf & vbCrLf
-    output = output & "You can use HTML-like tags in ""replace"" text:" & vbCrLf
-    output = output & "- <b>text</b> for bold" & vbCrLf
-    output = output & "- <i>text</i> for italic" & vbCrLf
-    output = output & "- <sub>text</sub> for subscript" & vbCrLf
-    output = output & "- <sup>text</sup> for superscript" & vbCrLf
-    output = output & "Example: ""55 <b>dB</b> L<sub>Aeq</sub>""" & vbCrLf & vbCrLf
-    
-    output = output & "---" & vbCrLf & vbCrLf
     output = output & "# DOCUMENT STRUCTURE MAP" & vbCrLf
     output = output & "Generated: " & Format(Now, "yyyy-mm-dd hh:nn:ss") & vbCrLf & vbCrLf
-    output = output & "## Paragraphs and Tables" & vbCrLf & vbCrLf
+    output = output & "## Annotated Content" & vbCrLf & vbCrLf
     
     For i = 1 To g_DocumentMapCount
         elem = g_DocumentMap(i)
         
         If elem.ElementType = "paragraph" Then
-            ' Format: ## P5 [Style Name] "Text preview..."
-            output = output & "## " & elem.ElementID
-            If Len(elem.StyleName) > 0 Then
-                output = output & " [" & elem.StyleName & "]"
-            End If
-            output = output & " """ & elem.TextPreview & """" & vbCrLf
+            Set paraRange = ActiveDocument.Range(elem.StartPos, elem.EndPos)
+            paraText = Trim$(NormalizeForDocument(GetRangeTextFinalView(paraRange)))
+            output = output & "[" & elem.ElementID & "] " & paraText & vbCrLf & vbCrLf
             
         ElseIf elem.ElementType = "table" Then
-            ' Format: ## T2 (5 rows x 3 cols) "Title..."
-            output = output & vbCrLf & "## " & elem.ElementID
-            If elem.TableRowCount > 0 And elem.TableColCount > 0 Then
-                output = output & " (" & elem.TableRowCount & " rows x " & elem.TableColCount & " cols)"
+            output = output & "## Table " & elem.ElementID
+            If Len(elem.TextPreview) > 0 Then
+                output = output & ": " & NormalizeForDocument(elem.TextPreview)
             End If
-            output = output & " """ & elem.TextPreview & """" & vbCrLf
-            
-            ' Add table content preview
-            output = output & ExportTableContentPreview(elem.ElementID) & vbCrLf
+            output = output & vbCrLf
+            output = output & ExportTableContentPreview(elem.ElementID) & vbCrLf & vbCrLf
         End If
     Next i
     
@@ -917,11 +1364,24 @@ ErrorHandler:
     MsgBox "Error exporting structure map: " & Err.Description, vbCritical, "Export Error"
 End Sub
 
+Private Function EscapeMarkdownCellPreview(ByVal cellValue As String) As String
+    Dim normalized As String
+
+    normalized = NormalizeForDocument(cellValue)
+    normalized = Replace(normalized, vbCrLf, " ")
+    normalized = Replace(normalized, vbCr, " ")
+    normalized = Replace(normalized, vbLf, " ")
+    normalized = Replace(normalized, "|", "\|")
+    normalized = Trim$(normalized)
+
+    EscapeMarkdownCellPreview = normalized
+End Function
+
 Private Function ExportTableContentPreview(ByVal tableID As String) As String
     ' Exports table content in markdown format for preview
-    ' Shows first 5 rows maximum
+    ' Uses bounded previews to keep DSM generation responsive on large tables.
     
-    On Error Resume Next
+    On Error GoTo Fail
     
     Dim tbl As Table
     Dim r As Long
@@ -930,6 +1390,12 @@ Private Function ExportTableContentPreview(ByVal tableID As String) As String
     Dim output As String
     Dim maxRows As Long
     Dim maxCols As Long
+    Dim actualRows As Long
+    Dim actualCols As Long
+    Dim cellLookup As Object
+    Dim tblCell As Cell
+    Dim lookupKey As String
+    Dim cellCounter As Long
     
     ' Find the table
     Set tbl = ResolveTableByID(tableID)
@@ -938,37 +1404,71 @@ Private Function ExportTableContentPreview(ByVal tableID As String) As String
         Exit Function
     End If
     
-    maxRows = tbl.Rows.Count
-    ' Show all rows for LLM review
+    Set cellLookup = NewDictionary()
+    cellCounter = 0
+    For Each tblCell In tbl.Range.Cells
+        lookupKey = CStr(tblCell.RowIndex) & ":" & CStr(tblCell.ColumnIndex)
+        If Not cellLookup.Exists(lookupKey) Then
+            cellLookup.Add lookupKey, EscapeMarkdownCellPreview(LimitPreviewText(GetCellTextFinalView(tblCell), DSM_TABLE_CELL_PREVIEW_MAX_CHARS))
+        End If
+        cellCounter = cellCounter + 1
+        If cellCounter Mod 100 = 0 Then DoEvents
+    Next tblCell
+
+    actualRows = GetSafeTableRowCount(tbl)
+    actualCols = GetSafeTableColCount(tbl)
+
+    maxRows = actualRows
+    If maxRows > DSM_TABLE_PREVIEW_MAX_ROWS Then maxRows = DSM_TABLE_PREVIEW_MAX_ROWS
     
-    maxCols = tbl.Columns.Count
-    ' Show all columns for LLM review
+    maxCols = actualCols
+    If maxCols > DSM_TABLE_PREVIEW_MAX_COLS Then maxCols = DSM_TABLE_PREVIEW_MAX_COLS
     
-    output = "| R | "
+    If maxRows = 0 Or maxCols = 0 Then
+        ExportTableContentPreview = "(Table has no readable cells)"
+        Exit Function
+    End If
+
+    output = "|"
     For c = 1 To maxCols
-        output = output & "C" & c & " | "
+        lookupKey = "1:" & CStr(c)
+        If cellLookup.Exists(lookupKey) Then
+            cellText = CStr(cellLookup(lookupKey))
+        Else
+            cellText = ""
+        End If
+        output = output & " [" & tableID & ".H.C" & c & "] " & cellText & " |"
     Next c
-    output = output & vbCrLf & "|---|"
+    output = output & vbCrLf & "|"
     For c = 1 To maxCols
         output = output & "---|"
     Next c
     output = output & vbCrLf
     
-    For r = 1 To maxRows
-        output = output & "| " & r & " | "
+    For r = 2 To maxRows
+        output = output & "|"
         For c = 1 To maxCols
-            cellText = GetCellTextFinalView(tbl.Cell(r, c))
-            cellText = Replace(cellText, vbCr, " ")
-            cellText = Replace(cellText, vbLf, " ")
-            ' No truncation - show full cell content
-            output = output & cellText & " | "
+            lookupKey = CStr(r) & ":" & CStr(c)
+            If cellLookup.Exists(lookupKey) Then
+                cellText = CStr(cellLookup(lookupKey))
+            Else
+                cellText = ""
+            End If
+            output = output & " [" & tableID & ".R" & r & ".C" & c & "] " & cellText & " |"
         Next c
         output = output & vbCrLf
+        If r Mod 10 = 0 Then DoEvents
     Next r
     
-    ' All rows shown - no truncation message needed
+    If actualRows > maxRows Or actualCols > maxCols Then
+        output = output & "(Preview truncated to " & maxRows & " rows x " & maxCols & " columns)" & vbCrLf
+    End If
     
     ExportTableContentPreview = output
+    Exit Function
+
+Fail:
+    ExportTableContentPreview = "(Table preview unavailable: " & Err.Description & ")"
 End Function
 
 Private Function ResolveTableByID(ByVal tableID As String) As Table
@@ -991,7 +1491,7 @@ End Function
 
 Private Function ParseTargetReference(ByVal targetRef As String) As TargetReference
     ' Parses target reference string into structured format
-    ' Formats: P5, T2, T2.R3, T2.R3.C2, T2.H.C2
+    ' Formats: P5, T2, T2.R3, T2.H, T2.R3.C2, T2.H.C2
     
     On Error GoTo ParseError
     
@@ -1012,7 +1512,7 @@ Private Function ParseTargetReference(ByVal targetRef As String) As TargetRefere
         result.IsValid = True
         
     ElseIf firstChar = "T" Then
-        ' Table reference: T2, T2.R3, T2.R3.C2, T2.H.C2
+        ' Table reference: T2, T2.R3, T2.H, T2.R3.C2, T2.H.C2
         parts = Split(targetRef, ".")
         
         ' Extract table number
@@ -1024,10 +1524,16 @@ Private Function ParseTargetReference(ByVal targetRef As String) As TargetRefere
             result.IsValid = True
             
         ElseIf UBound(parts) = 1 Then
-            ' T2.R3 - table row
+            ' T2.R3 or T2.H - table row
             If Left$(parts(1), 1) = "R" Then
                 result.TargetType = "table_row"
                 result.RowNum = CLng(Mid$(parts(1), 2))
+                result.IsHeaderRow = False
+                result.IsValid = True
+            ElseIf parts(1) = "H" Then
+                result.TargetType = "table_row"
+                result.RowNum = 1
+                result.IsHeaderRow = True
                 result.IsValid = True
             Else
                 GoTo ParseError
@@ -1082,7 +1588,7 @@ ParseError:
         .ColNum = 0
         .IsHeaderRow = False
     End With
-    Debug.Print "Failed to parse target reference: " & targetRef
+    TraceLog "Failed to parse target reference: " & targetRef
 End Function
 
 Private Function ResolveTargetToRange(ByVal targetRef As String) As Range
@@ -1092,21 +1598,19 @@ Private Function ResolveTargetToRange(ByVal targetRef As String) As Range
     On Error GoTo ErrorHandler
     
     Dim ref As TargetReference
-    Dim elem As DocumentElement
-    Dim i As Long
     Dim tbl As Table
-    Dim foundElem As Boolean
+    Dim rowCount As Long
     
     ' Ensure structure map is built
-    If Not g_DocumentMapBuilt Then
-        BuildDocumentStructureMap ActiveDocument
-    End If
+    ' If Not g_DocumentMapBuilt Then
+    '     BuildDocumentStructureMap ActiveDocument
+    ' End If
     
     ' Parse the reference
     ref = ParseTargetReference(targetRef)
     
     If Not ref.IsValid Then
-        Debug.Print "Invalid target reference: " & targetRef
+        TraceLog "Invalid target reference: " & targetRef
         Set ResolveTargetToRange = Nothing
         Exit Function
     End If
@@ -1114,23 +1618,19 @@ Private Function ResolveTargetToRange(ByVal targetRef As String) As Range
     ' Resolve based on type
     Select Case ref.TargetType
         Case "paragraph"
-            ' Find paragraph in structure map
-            For i = 1 To g_DocumentMapCount
-                elem = g_DocumentMap(i)
-                If elem.ElementType = "paragraph" And elem.ElementID = "P" & ref.ParagraphNum Then
-                    ' Return range for this paragraph
-                    Set ResolveTargetToRange = ActiveDocument.Range(elem.StartPos, elem.EndPos)
-                    Debug.Print "Resolved " & targetRef & " to paragraph at position " & elem.StartPos
-                    Exit Function
-                End If
-            Next i
+            ' Resolve paragraph against the current document to avoid stale coordinates after earlier edits.
+            Set ResolveTargetToRange = ResolveBodyParagraphRange(ref.ParagraphNum)
+            If Not ResolveTargetToRange Is Nothing Then
+                TraceLog "Resolved " & targetRef & " to paragraph at position " & ResolveTargetToRange.Start
+                Exit Function
+            End If
             
         Case "table"
             ' Return entire table range
             Set tbl = ResolveTableByID("T" & ref.TableNum)
             If Not tbl Is Nothing Then
                 Set ResolveTargetToRange = tbl.Range
-                Debug.Print "Resolved " & targetRef & " to table"
+                TraceLog "Resolved " & targetRef & " to table"
                 Exit Function
             End If
             
@@ -1138,10 +1638,14 @@ Private Function ResolveTargetToRange(ByVal targetRef As String) As Range
             ' Return row range
             Set tbl = ResolveTableByID("T" & ref.TableNum)
             If Not tbl Is Nothing Then
-                If ref.RowNum > 0 And ref.RowNum <= tbl.Rows.Count Then
-                    Set ResolveTargetToRange = tbl.Rows(ref.RowNum).Range
-                    Debug.Print "Resolved " & targetRef & " to table row"
-                    Exit Function
+                Dim rowRange As Range
+                rowCount = GetSafeTableRowCount(tbl)
+                If ref.RowNum > 0 And ref.RowNum <= rowCount Then
+                    If TryGetTableRowRange(tbl, ref.RowNum, rowRange) Then
+                        Set ResolveTargetToRange = rowRange
+                        TraceLog "Resolved " & targetRef & " to table row"
+                        Exit Function
+                    End If
                 End If
             End If
             
@@ -1149,29 +1653,33 @@ Private Function ResolveTargetToRange(ByVal targetRef As String) As Range
             ' Return cell range
             Set tbl = ResolveTableByID("T" & ref.TableNum)
             If Not tbl Is Nothing Then
-                If ref.RowNum > 0 And ref.RowNum <= tbl.Rows.Count Then
-                    If ref.ColNum > 0 And ref.ColNum <= tbl.Columns.Count Then
-                        Dim cellRange As Range
-                        Set cellRange = tbl.Cell(ref.RowNum, ref.ColNum).Range
-                        ' Remove cell end marker
-                        If cellRange.End > cellRange.Start Then
-                            cellRange.End = cellRange.End - 1
+                Dim colCount As Long
+                rowCount = GetSafeTableRowCount(tbl)
+                colCount = GetSafeTableColCount(tbl)
+                If ref.RowNum > 0 And ref.RowNum <= rowCount Then
+                    If ref.ColNum > 0 And ref.ColNum <= colCount Then
+                        Dim targetCell As Cell
+                        If TryGetTableCell(tbl, ref.RowNum, ref.ColNum, targetCell) Then
+                            Dim cellRange As Range
+                            Set cellRange = GetCellContentRange(targetCell)
+                            If Not cellRange Is Nothing Then
+                                Set ResolveTargetToRange = cellRange
+                                TraceLog "Resolved " & targetRef & " to table cell"
+                                Exit Function
+                            End If
                         End If
-                        Set ResolveTargetToRange = cellRange
-                        Debug.Print "Resolved " & targetRef & " to table cell"
-                        Exit Function
                     End If
                 End If
             End If
     End Select
     
     ' If we get here, resolution failed
-    Debug.Print "Failed to resolve target: " & targetRef
+    TraceLog "Failed to resolve target: " & targetRef
     Set ResolveTargetToRange = Nothing
     Exit Function
     
 ErrorHandler:
-    Debug.Print "Error resolving target " & targetRef & ": " & Err.Description
+    TraceLog "Error resolving target " & targetRef & ": " & Err.Description
     Set ResolveTargetToRange = Nothing
 End Function
 
@@ -1286,6 +1794,16 @@ End Function
 ' === V4 ACTION EXECUTORS (DSM-Based) ====================================================
 ' =========================================================================================
 
+Private Sub ClearLastActionError()
+    g_LastActionErrorCode = ""
+    g_LastActionErrorMessage = ""
+End Sub
+
+Private Sub SetLastActionError(ByVal errorCode As String, ByVal message As String)
+    g_LastActionErrorCode = errorCode
+    g_LastActionErrorMessage = message
+End Sub
+
 Private Function ExecuteReplaceActionV4(ByVal targetRange As Range, ByVal findText As String, ByVal replaceText As String, Optional ByVal matchCase As Boolean = False) As Boolean
     ' V4 Replace action - find and replace within the resolved target range
     
@@ -1294,14 +1812,15 @@ Private Function ExecuteReplaceActionV4(ByVal targetRange As Range, ByVal findTe
     Dim actionRange As Range
     Set actionRange = FindLongString(NormalizeForDocument(findText), targetRange, matchCase)
     If actionRange Is Nothing Then
-        Debug.Print "  -> Replace action: text not found in target range"
+        TraceLog "  -> Replace action: text not found in target range"
+        SetLastActionError "TEXT_NOT_FOUND", "Find text was not found inside the resolved target."
         ExecuteReplaceActionV4 = False
         Exit Function
     End If
 
     ' Skip formatting-only changes if target already matches formatting and text.
     If IsFormattingAlreadyApplied(actionRange, replaceText) Then
-        Debug.Print "  -> Replace action skipped (already matches): '" & findText & "'"
+        TraceLog "  -> Replace action skipped (already matches): '" & findText & "'"
         ExecuteReplaceActionV4 = True
         Exit Function
     End If
@@ -1319,12 +1838,14 @@ Private Function ExecuteReplaceActionV4(ByVal targetRange As Range, ByVal findTe
         actionRange.Text = replaceText
     End If
 
-    Debug.Print "  -> Replace action executed: '" & findText & "' -> '" & replaceText & "'"
+    TraceLog "  -> Replace action executed: '" & findText & "' -> '" & replaceText & "'"
+    ClearLastActionError
     ExecuteReplaceActionV4 = True
     Exit Function
     
 ErrorHandler:
-    Debug.Print "  -> Error in ExecuteReplaceActionV4: " & Err.Description
+    TraceLog "  -> Error in ExecuteReplaceActionV4: " & Err.Description
+    SetLastActionError "EXECUTION_ERROR", Err.Description
     ExecuteReplaceActionV4 = False
 End Function
 
@@ -1336,6 +1857,7 @@ Private Function ExecuteApplyStyleActionV4(ByVal targetRange As Range, ByVal sty
     ' Try VA Addin style first
     If ApplyHouseStyle(targetRange, styleKey) Then
         Debug.Print "  -> Style applied via VA Addin: " & styleKey
+        ClearLastActionError
         ExecuteApplyStyleActionV4 = True
         Exit Function
     End If
@@ -1345,9 +1867,11 @@ Private Function ExecuteApplyStyleActionV4(ByVal targetRange As Range, ByVal sty
     targetRange.Style = styleKey
     If Err.Number = 0 Then
         Debug.Print "  -> Style applied directly: " & styleKey
+        ClearLastActionError
         ExecuteApplyStyleActionV4 = True
     Else
         Debug.Print "  -> Style not found: " & styleKey
+        SetLastActionError "STYLE_NOT_FOUND", "Style token not found: " & styleKey
         ExecuteApplyStyleActionV4 = False
     End If
     On Error GoTo ErrorHandler
@@ -1356,6 +1880,7 @@ Private Function ExecuteApplyStyleActionV4(ByVal targetRange As Range, ByVal sty
     
 ErrorHandler:
     Debug.Print "  -> Error in ExecuteApplyStyleActionV4: " & Err.Description
+    SetLastActionError "EXECUTION_ERROR", Err.Description
     ExecuteApplyStyleActionV4 = False
 End Function
 
@@ -1366,11 +1891,13 @@ Private Function ExecuteCommentActionV4(ByVal targetRange As Range, ByVal commen
     
     ActiveDocument.Comments.Add Range:=targetRange, Text:=commentText
     Debug.Print "  -> Comment added: " & Left$(commentText, 50)
+    ClearLastActionError
     ExecuteCommentActionV4 = True
     Exit Function
     
 ErrorHandler:
     Debug.Print "  -> Error in ExecuteCommentActionV4: " & Err.Description
+    SetLastActionError "EXECUTION_ERROR", Err.Description
     ExecuteCommentActionV4 = False
 End Function
 
@@ -1381,11 +1908,13 @@ Private Function ExecuteDeleteActionV4(ByVal targetRange As Range) As Boolean
     
     targetRange.Delete
     Debug.Print "  -> Content deleted"
+    ClearLastActionError
     ExecuteDeleteActionV4 = True
     Exit Function
     
 ErrorHandler:
     Debug.Print "  -> Error in ExecuteDeleteActionV4: " & Err.Description
+    SetLastActionError "EXECUTION_ERROR", Err.Description
     ExecuteDeleteActionV4 = False
 End Function
 
@@ -1399,9 +1928,11 @@ Private Function ExecuteReplaceTableActionV4(ByVal targetRange As Range, ByVal m
     
     If Not newTable Is Nothing Then
         Debug.Print "  -> Table replaced successfully"
+        ClearLastActionError
         ExecuteReplaceTableActionV4 = True
     Else
         Debug.Print "  -> Table replacement failed"
+        SetLastActionError "TABLE_REPLACE_FAILED", "Markdown conversion did not return a table."
         ExecuteReplaceTableActionV4 = False
     End If
     
@@ -1409,6 +1940,7 @@ Private Function ExecuteReplaceTableActionV4(ByVal targetRange As Range, ByVal m
     
 ErrorHandler:
     Debug.Print "  -> Error in ExecuteReplaceTableActionV4: " & Err.Description
+    SetLastActionError "EXECUTION_ERROR", Err.Description
     ExecuteReplaceTableActionV4 = False
 End Function
 
@@ -1422,11 +1954,13 @@ Private Function ExecuteInsertRowActionV4(ByVal tableRef As String, ByVal afterR
     Dim newRow As Row
     Dim colIndex As Long
     Dim cellRange As Range
+    Dim rowCount As Long
     
     ' Parse table reference
     ref = ParseTargetReference(tableRef)
     If Not ref.IsValid Or ref.TargetType <> "table" Then
         Debug.Print "  -> Invalid table reference: " & tableRef
+        SetLastActionError "TARGET_NOT_FOUND", "Invalid table reference: " & tableRef
         ExecuteInsertRowActionV4 = False
         Exit Function
     End If
@@ -1435,15 +1969,35 @@ Private Function ExecuteInsertRowActionV4(ByVal tableRef As String, ByVal afterR
     Set tbl = ResolveTableByID("T" & ref.TableNum)
     If tbl Is Nothing Then
         Debug.Print "  -> Table not found: " & tableRef
+        SetLastActionError "TARGET_NOT_FOUND", "Table not found: " & tableRef
         ExecuteInsertRowActionV4 = False
         Exit Function
     End If
     
-    ' Insert row
-    If afterRow >= tbl.Rows.Count Then
+    ' Insert row (fallback to append when merged structure blocks indexed insertion).
+    rowCount = GetSafeTableRowCount(tbl)
+    If rowCount = 0 Then
+        SetLastActionError "TABLE_STRUCTURE_UNSUPPORTED", "Unable to determine row count for this table (possibly complex merges)."
+        ExecuteInsertRowActionV4 = False
+        Exit Function
+    End If
+
+    On Error Resume Next
+    If afterRow >= rowCount Then
         Set newRow = tbl.Rows.Add  ' Add at end
     Else
         Set newRow = tbl.Rows.Add(tbl.Rows(afterRow + 1))  ' Add after specified row
+        If Err.Number <> 0 Then
+            Err.Clear
+            Set newRow = tbl.Rows.Add
+        End If
+    End If
+    On Error GoTo ErrorHandler
+
+    If newRow Is Nothing Then
+        SetLastActionError "TABLE_STRUCTURE_UNSUPPORTED", "Unable to insert row in this merged table structure."
+        ExecuteInsertRowActionV4 = False
+        Exit Function
     End If
     
     ' Populate cells if data provided
@@ -1458,11 +2012,13 @@ Private Function ExecuteInsertRowActionV4(ByVal tableRef As String, ByVal afterR
     End If
     
     Debug.Print "  -> Row inserted after row " & afterRow
+    ClearLastActionError
     ExecuteInsertRowActionV4 = True
     Exit Function
     
 ErrorHandler:
     Debug.Print "  -> Error in ExecuteInsertRowActionV4: " & Err.Description
+    SetLastActionError "EXECUTION_ERROR", Err.Description
     ExecuteInsertRowActionV4 = False
 End Function
 
@@ -1473,6 +2029,7 @@ Private Function ExecuteDeleteRowActionV4(ByVal targetRange As Range) As Boolean
     
     If Not targetRange.Information(wdWithinTable) Then
         Debug.Print "  -> Target is not within a table"
+        SetLastActionError "TARGET_NOT_FOUND", "Target does not resolve to a table row."
         ExecuteDeleteRowActionV4 = False
         Exit Function
     End If
@@ -1485,11 +2042,13 @@ Private Function ExecuteDeleteRowActionV4(ByVal targetRange As Range) As Boolean
     
     tbl.Rows(rowNum).Delete
     Debug.Print "  -> Row " & rowNum & " deleted"
+    ClearLastActionError
     ExecuteDeleteRowActionV4 = True
     Exit Function
     
 ErrorHandler:
     Debug.Print "  -> Error in ExecuteDeleteRowActionV4: " & Err.Description
+    SetLastActionError "EXECUTION_ERROR", Err.Description
     ExecuteDeleteRowActionV4 = False
 End Function
 
@@ -1511,16 +2070,20 @@ Private Function ProcessSuggestionV4(ByVal suggestion As Object) As Boolean
     Dim explanation As String
     Dim matchCase As Boolean
     Dim success As Boolean
+
+    ClearLastActionError
     
     ' Extract required fields
     If Not HasDictionaryKey(suggestion, "target") Then
-        Debug.Print "  -> Missing 'target' field"
+        TraceLog "  -> Missing 'target' field"
+        SetLastActionError "INVALID_TOOL_CALL", "Missing 'target' field."
         ProcessSuggestionV4 = False
         Exit Function
     End If
     
     If Not HasDictionaryKey(suggestion, "action") Then
-        Debug.Print "  -> Missing 'action' field"
+        TraceLog "  -> Missing 'action' field"
+        SetLastActionError "INVALID_TOOL_CALL", "Missing 'action' field."
         ProcessSuggestionV4 = False
         Exit Function
     End If
@@ -1529,12 +2092,19 @@ Private Function ProcessSuggestionV4(ByVal suggestion As Object) As Boolean
     action = LCase$(Trim$(GetSuggestionText(suggestion, "action", "")))
     explanation = GetSuggestionText(suggestion, "explanation", "")
     
-    Debug.Print "  Processing: " & targetRef & " | Action: " & action
+    TraceLog "  Processing: " & targetRef & " | Action: " & action
     
-    ' Resolve target to range
-    Set targetRange = ResolveTargetToRange(targetRef)
+    ' NEW: Use the Pre-Resolved Range if available, otherwise fallback to lookup
+    If HasDictionaryKey(suggestion, "pre_resolved_range") Then
+        Set targetRange = suggestion("pre_resolved_range")
+        TraceLog "  -> Using pre-resolved Range for: " & targetRef
+    Else
+        Set targetRange = ResolveTargetToRange(targetRef)
+    End If
+    
     If targetRange Is Nothing Then
-        Debug.Print "  -> Failed to resolve target: " & targetRef
+        TraceLog "  -> Failed to resolve target: " & targetRef
+        SetLastActionError "TARGET_NOT_FOUND", "Target could not be resolved: " & targetRef
         ProcessSuggestionV4 = False
         Exit Function
     End If
@@ -1582,7 +2152,8 @@ Private Function ProcessSuggestionV4(ByVal suggestion As Object) As Boolean
             success = ExecuteDeleteRowActionV4(targetRange)
             
         Case Else
-            Debug.Print "  -> Unknown action type: " & action
+            TraceLog "  -> Unknown action type: " & action
+            SetLastActionError "INVALID_TOOL_CALL", "Unknown action type: " & action
             success = False
     End Select
     
@@ -1590,7 +2161,8 @@ Private Function ProcessSuggestionV4(ByVal suggestion As Object) As Boolean
     Exit Function
     
 ErrorHandler:
-    Debug.Print "  -> Error in ProcessSuggestionV4: " & Err.Description
+    TraceLog "  -> Error in ProcessSuggestionV4: " & Err.Description
+    SetLastActionError "EXECUTION_ERROR", Err.Description
     ProcessSuggestionV4 = False
 End Function
 
@@ -1969,27 +2541,32 @@ Private Function IsRangeInTOC(ByVal testRange As Range) As Boolean
     ' Checks if a given range is within a Table of Contents field
     ' Returns True if the range is inside a TOC, False otherwise
 
-    On Error Resume Next
+    On Error GoTo Fail
 
-    Dim field As field
+    If testRange Is Nothing Then
+        IsRangeInTOC = False
+        Exit Function
+    End If
+
+    EnsureTocFieldRangeCache testRange.Document
+    If g_TocFieldRanges Is Nothing Then
+        IsRangeInTOC = False
+        Exit Function
+    End If
+
     Dim fieldRange As Range
-
-    ' Check all fields in the document for TOC fields
-    For Each field In ActiveDocument.Fields
-        If field.Type = wdFieldTOC Then
-            Set fieldRange = field.Result
-
-            ' Check if testRange overlaps with this TOC field
-            If Not fieldRange Is Nothing Then
-                If testRange.Start >= fieldRange.Start And testRange.Start < fieldRange.End Then
-                    IsRangeInTOC = True
-                    Debug.Print "    -> Skipping match: Range is within TOC at position " & fieldRange.Start
-                    Exit Function
-                End If
-            End If
+    For Each fieldRange In g_TocFieldRanges
+        If testRange.Start >= fieldRange.Start And testRange.Start < fieldRange.End Then
+            IsRangeInTOC = True
+            TraceLog "    -> Skipping match: Range is within TOC at position " & fieldRange.Start
+            Exit Function
         End If
-    Next field
+    Next fieldRange
 
+    IsRangeInTOC = False
+    Exit Function
+
+Fail:
     IsRangeInTOC = False
 End Function
 
@@ -2414,6 +2991,8 @@ End Sub
 Private Sub RunReviewProcess(ByVal TheForm As frmJsonInput)
     ' *** WORKFLOW SELECTOR ***
     ' Set to True for INTERACTIVE mode (new), False for TRACKED CHANGES mode (old)
+    ' Disable (False) pros: Applies all suggestions in one pass with summary/fallback comments.
+    ' Disable (False) cons: Less granular operator control than per-suggestion interactive approval.
     Const USE_INTERACTIVE_MODE As Boolean = True
 
     Dim jsonString As String
@@ -3470,7 +4049,9 @@ Private Function pv_ParseString() As String
     p_Index = p_Index + 1
     Dim EndIndex As Long
     EndIndex = InStr(p_Index, p_Json, Chr$(34))
-    Do While EndIndex > 0 And Mid$(p_Json, EndIndex - 1, 1) = "\"
+    Do While EndIndex > 0
+        If EndIndex <= 1 Then Exit Do
+        If Mid$(p_Json, EndIndex - 1, 1) <> "\" Then Exit Do
         EndIndex = InStr(EndIndex + 1, p_Json, Chr$(34))
     Loop
     pv_ParseString = Mid$(p_Json, p_Index, EndIndex - p_Index)
@@ -3612,7 +4193,7 @@ Private Function ConvertMarkdownToTable(ByVal targetRange As Range, ByVal markdo
     On Error GoTo ErrorHandler
 
     ApplyFormattingToTableCells newTable
-    Debug.Print "  - New table created successfully with " & newTable.Rows.Count & " rows and " & newTable.Columns.Count & " columns."
+    Debug.Print "  - New table created successfully with " & GetSafeTableRowCount(newTable) & " rows and " & GetSafeTableColCount(newTable) & " columns."
     Set ConvertMarkdownToTable = newTable
     Exit Function
 ErrorHandler:
@@ -3668,7 +4249,7 @@ Private Function FindCellByAdjacentContent(ByVal tbl As Table, _
                                            ByVal hasHintCol As Boolean) As Cell
     ' Uses adjacent cell content to pinpoint the exact cell
 
-    On Error Resume Next
+    On Error GoTo Fail
 
     Dim cellContent As String
     Dim aboveText As String
@@ -3688,13 +4269,23 @@ Private Function FindCellByAdjacentContent(ByVal tbl As Table, _
     Dim endRow As Long
     Dim startCol As Long
     Dim endCol As Long
+    Dim maxRows As Long
+    Dim maxCols As Long
+
+    maxRows = GetSafeTableRowCount(tbl)
+    maxCols = GetSafeTableColCount(tbl)
+
+    If maxRows = 0 Or maxCols = 0 Then
+        Set FindCellByAdjacentContent = Nothing
+        Exit Function
+    End If
 
     If hasHintRow Then
         startRow = hintRow
         endRow = hintRow
     Else
         startRow = 1
-        endRow = tbl.Rows.Count
+        endRow = maxRows
     End If
 
     If hasHintCol Then
@@ -3702,7 +4293,16 @@ Private Function FindCellByAdjacentContent(ByVal tbl As Table, _
         endCol = hintCol
     Else
         startCol = 1
-        endCol = tbl.Columns.Count
+        endCol = maxCols
+    End If
+
+    If startRow < 1 Then startRow = 1
+    If endRow > maxRows Then endRow = maxRows
+    If startCol < 1 Then startCol = 1
+    If endCol > maxCols Then endCol = maxCols
+    If startRow > endRow Or startCol > endCol Then
+        Set FindCellByAdjacentContent = Nothing
+        Exit Function
     End If
 
     ' Search through the candidate cells
@@ -3727,13 +4327,7 @@ Private Function FindCellByAdjacentContent(ByVal tbl As Table, _
         For r = startRow To endRow
             For c = startCol To endCol
                 Dim currentCell As Cell
-                On Error Resume Next
-                Set currentCell = tbl.Cell(r, c)
-                If Err.Number <> 0 Then
-                    Err.Clear
-                    GoTo NextCell
-                End If
-                On Error GoTo 0
+                If Not TryGetTableCell(tbl, r, c, currentCell) Then GoTo NextCell
 
                 ' Check if this cell matches all criteria
                 Dim matches As Boolean
@@ -3753,66 +4347,50 @@ Private Function FindCellByAdjacentContent(ByVal tbl As Table, _
 
                 ' Check above
                 If matches And Len(aboveText) > 0 And r > 1 Then
-                    On Error Resume Next
                     Dim aboveCell As Cell
-                    Set aboveCell = tbl.Cell(r - 1, c)
-                    If Err.Number = 0 Then
+                    If TryGetTableCell(tbl, r - 1, c, aboveCell) Then
                         If Not TextMatchesHeuristic(aboveText, GetCellText(aboveCell)) Then
                             matches = False
                         End If
                     Else
                         matches = False
                     End If
-                    Err.Clear
-                    On Error GoTo 0
                 End If
 
                 ' Check below
-                If matches And Len(belowText) > 0 And r < tbl.Rows.Count Then
-                    On Error Resume Next
+                If matches And Len(belowText) > 0 And r < maxRows Then
                     Dim belowCell As Cell
-                    Set belowCell = tbl.Cell(r + 1, c)
-                    If Err.Number = 0 Then
+                    If TryGetTableCell(tbl, r + 1, c, belowCell) Then
                         If Not TextMatchesHeuristic(belowText, GetCellText(belowCell)) Then
                             matches = False
                         End If
                     Else
                         matches = False
                     End If
-                    Err.Clear
-                    On Error GoTo 0
                 End If
 
                 ' Check left
                 If matches And Len(leftText) > 0 And c > 1 Then
-                    On Error Resume Next
                     Dim leftCell As Cell
-                    Set leftCell = tbl.Cell(r, c - 1)
-                    If Err.Number = 0 Then
+                    If TryGetTableCell(tbl, r, c - 1, leftCell) Then
                         If Not TextMatchesHeuristic(leftText, GetCellText(leftCell)) Then
                             matches = False
                         End If
                     Else
                         matches = False
                     End If
-                    Err.Clear
-                    On Error GoTo 0
                 End If
 
                 ' Check right
-                If matches And Len(rightText) > 0 And c < tbl.Columns.Count Then
-                    On Error Resume Next
+                If matches And Len(rightText) > 0 And c < maxCols Then
                     Dim rightCell As Cell
-                    Set rightCell = tbl.Cell(r, c + 1)
-                    If Err.Number = 0 Then
+                    If TryGetTableCell(tbl, r, c + 1, rightCell) Then
                         If Not TextMatchesHeuristic(rightText, GetCellText(rightCell)) Then
                             matches = False
                         End If
                     Else
                         matches = False
                     End If
-                    Err.Clear
-                    On Error GoTo 0
                 End If
 
                 If matches Then
@@ -3850,41 +4428,59 @@ NextCell:
 
     ' Not found
     Set FindCellByAdjacentContent = Nothing
+    Exit Function
+
+Fail:
+    Set FindCellByAdjacentContent = Nothing
 End Function
 
 Private Function FindCellInTableRobust(ByVal tbl As Table, _
                                        ByVal rowHeader As String, _
                                        ByVal colHeader As String, _
                                        ByVal tableCellInfo As Object) As Range
-    On Error Resume Next
+    On Error GoTo Fail
 
     Dim foundColHeader As Range
     Dim finalCell As Range
-
-    Dim targetRow As Row
     Dim hintRow As Long
     Dim hintCol As Long
     Dim hasHintRow As Boolean
     Dim hasHintCol As Boolean
+    Dim targetRowNum As Long
+    Dim hasTargetRow As Boolean
+    Dim maxRows As Long
+    Dim maxCols As Long
+
     hasHintRow = False
     hasHintCol = False
+    hasTargetRow = False
+    maxRows = GetSafeTableRowCount(tbl)
+    maxCols = GetSafeTableColCount(tbl)
+
+    If maxRows = 0 Or maxCols = 0 Then
+        Set FindCellInTableRobust = Nothing
+        Exit Function
+    End If
 
     If Len(rowHeader) > 0 Then
         Dim r As Long
-        For r = 1 To tbl.Rows.Count
+        For r = 1 To maxRows
             Dim rowFirstText As String
             rowFirstText = ""
-            On Error Resume Next
-            rowFirstText = GetCellText(tbl.Cell(r, 1))
-            On Error GoTo 0
+            Dim rowFirstCell As Cell
+            If TryGetFirstCellInRow(tbl, r, rowFirstCell) Then
+                rowFirstText = GetCellText(rowFirstCell)
+            End If
+
             If TextMatchesHeuristic(rowHeader, rowFirstText) Then
-                Set targetRow = tbl.Rows(r)
+                targetRowNum = r
+                hasTargetRow = True
                 hintRow = r
                 hasHintRow = True
                 Exit For
             End If
         Next r
-        If targetRow Is Nothing Then
+        If Not hasTargetRow Then
             Debug.Print "    -> Row Header '" & rowHeader & "' not found in table."
             Set FindCellInTableRobust = Nothing
             Exit Function
@@ -3894,18 +4490,19 @@ Private Function FindCellInTableRobust(ByVal tbl As Table, _
     If Len(colHeader) > 0 Then
         Dim headerCell As Cell
         Dim headerRowScan As Long
-        For headerRowScan = 1 To tbl.Rows.Count
+        Dim headerText As String
+
+        For headerRowScan = 1 To maxRows
             If headerRowScan > 3 Then Exit For
-            Dim headerRow As Row
-            Set headerRow = tbl.Rows(headerRowScan)
-            For Each headerCell In headerRow.Cells
-                Dim headerText As String
-                headerText = GetCellText(headerCell)
-                If TextMatchesHeuristic(colHeader, headerText) Then
-                    Set foundColHeader = headerCell.Range
-                    hintCol = headerCell.ColumnIndex
-                    hasHintCol = True
-                    Exit For
+            For Each headerCell In tbl.Range.Cells
+                If headerCell.RowIndex = headerRowScan Then
+                    headerText = GetCellText(headerCell)
+                    If TextMatchesHeuristic(colHeader, headerText) Then
+                        Set foundColHeader = headerCell.Range
+                        hintCol = headerCell.ColumnIndex
+                        hasHintCol = True
+                        Exit For
+                    End If
                 End If
             Next headerCell
             If Not foundColHeader Is Nothing Then Exit For
@@ -3918,56 +4515,70 @@ Private Function FindCellInTableRobust(ByVal tbl As Table, _
 
     If HasDictionaryKey(tableCellInfo, "adjacentCells") Then
         Dim adj As Object
-        Set adj = tableCellInfo("adjacentCells")
         Dim adjCell As Cell
+        Set adj = tableCellInfo("adjacentCells")
         Set adjCell = FindCellByAdjacentContent(tbl, adj, hintRow, hintCol, hasHintRow, hasHintCol)
         If Not adjCell Is Nothing Then
             Set finalCell = adjCell.Range
         End If
     End If
 
-    If finalCell Is Nothing And Not targetRow Is Nothing Then
+    If finalCell Is Nothing And hasTargetRow Then
         Dim cell As Cell
         Dim cellIdx As Long
         cellIdx = 0
 
-        For Each cell In targetRow.Cells
-            cellIdx = cellIdx + 1
+        For Each cell In tbl.Range.Cells
+            If cell.RowIndex = targetRowNum Then
+                cellIdx = cellIdx + 1
 
-            If Not foundColHeader Is Nothing Then
-                If PositionsRoughlyAlign(cell.Range, foundColHeader) Then
-                    Set finalCell = cell.Range
-                    Exit For
+                If Not foundColHeader Is Nothing Then
+                    If PositionsRoughlyAlign(cell.Range, foundColHeader) Then
+                        Set finalCell = cell.Range
+                        Exit For
+                    End If
                 End If
-            End If
 
-            If Len(colHeader) = 0 And cellIdx = 2 Then
-                Set finalCell = cell.Range
+                If Len(colHeader) = 0 And cellIdx = 2 Then
+                    Set finalCell = cell.Range
+                End If
             End If
         Next cell
     End If
 
     If finalCell Is Nothing And Not foundColHeader Is Nothing Then
-        ' As a fallback, scan all rows for the aligned column header position
-        Dim tblRow As Row
-        For Each tblRow In tbl.Rows
-            For Each cell In tblRow.Cells
-                If PositionsRoughlyAlign(cell.Range, foundColHeader) Then
-                    Set finalCell = cell.Range
-                    Exit For
-                End If
-            Next cell
-            If Not finalCell Is Nothing Then Exit For
-        Next tblRow
+        ' As a fallback, scan all cells for the aligned column header position.
+        For Each cell In tbl.Range.Cells
+            If PositionsRoughlyAlign(cell.Range, foundColHeader) Then
+                Set finalCell = cell.Range
+                Exit For
+            End If
+        Next cell
     End If
 
     If Not finalCell Is Nothing Then
+        Dim contentCell As Cell
+        If finalCell.Cells.Count > 0 Then
+            Set contentCell = finalCell.Cells(1)
+            Dim contentRange As Range
+            Set contentRange = GetCellContentRange(contentCell)
+            If Not contentRange Is Nothing Then
+                Set FindCellInTableRobust = contentRange
+                Exit Function
+            End If
+        End If
+
         If finalCell.End > finalCell.Start Then finalCell.End = finalCell.End - 1
         Set FindCellInTableRobust = finalCell
     Else
         Debug.Print "    -> Cell not found after row/column matching."
         Set FindCellInTableRobust = Nothing
     End If
+    Exit Function
+
+Fail:
+    Debug.Print "    -> Error in FindCellInTableRobust: " & Err.Description
+    Set FindCellInTableRobust = Nothing
 End Function
 
 Private Function FindTableCell(ByVal suggestion As Object, ByVal searchRange As Range) As Range
@@ -5531,7 +6142,7 @@ Private Function ComputeDiff(ByVal oldText As String, ByVal newText As String) A
     Dim deleteOp As Object
     Dim insertOp As Object
 
-    Debug.Print "    [ComputeDiff] oldText length: " & Len(oldText) & ", newText length: " & Len(newText)
+    TraceLog "    [ComputeDiff] oldText length: " & Len(oldText) & ", newText length: " & Len(newText)
 
     ' Handle edge cases
     If oldText = newText Then
@@ -5540,7 +6151,7 @@ Private Function ComputeDiff(ByVal oldText As String, ByVal newText As String) A
         equalOp("Operation") = DIFF_EQUAL
         equalOp("Text") = oldText
         result.Add equalOp
-        Debug.Print "    [ComputeDiff] Texts are identical."
+        TraceLog "    [ComputeDiff] Texts are identical."
         Set ComputeDiff = result
         Exit Function
     End If
@@ -5551,7 +6162,7 @@ Private Function ComputeDiff(ByVal oldText As String, ByVal newText As String) A
         insertOp("Operation") = DIFF_INSERT
         insertOp("Text") = newText
         result.Add insertOp
-        Debug.Print "    [ComputeDiff] Old text empty, full insert."
+        TraceLog "    [ComputeDiff] Old text empty, full insert."
         Set ComputeDiff = result
         Exit Function
     End If
@@ -5562,7 +6173,7 @@ Private Function ComputeDiff(ByVal oldText As String, ByVal newText As String) A
         deleteOp("Operation") = DIFF_DELETE
         deleteOp("Text") = oldText
         result.Add deleteOp
-        Debug.Print "    [ComputeDiff] New text empty, full delete."
+        TraceLog "    [ComputeDiff] New text empty, full delete."
         Set ComputeDiff = result
         Exit Function
     End If
@@ -5576,7 +6187,7 @@ Private Function ComputeDiff(ByVal oldText As String, ByVal newText As String) A
         equalOp("Operation") = DIFF_EQUAL
         equalOp("Text") = Left$(oldText, prefixLen)
         result.Add equalOp
-        Debug.Print "    [ComputeDiff] Common prefix length: " & prefixLen
+        TraceLog "    [ComputeDiff] Common prefix length: " & prefixLen
     End If
 
     ' Work on middle section (after prefix, before suffix)
@@ -5594,7 +6205,7 @@ Private Function ComputeDiff(ByVal oldText As String, ByVal newText As String) A
         suffixText = Right$(oldMiddle, suffixLen)
         oldMiddle = Left$(oldMiddle, Len(oldMiddle) - suffixLen)
         newMiddle = Left$(newMiddle, Len(newMiddle) - suffixLen)
-        Debug.Print "    [ComputeDiff] Common suffix length: " & suffixLen
+        TraceLog "    [ComputeDiff] Common suffix length: " & suffixLen
     End If
 
     ' Process the differing middle section
@@ -5603,7 +6214,7 @@ Private Function ComputeDiff(ByVal oldText As String, ByVal newText As String) A
         deleteOp("Operation") = DIFF_DELETE
         deleteOp("Text") = oldMiddle
         result.Add deleteOp
-        Debug.Print "    [ComputeDiff] Delete: '" & oldMiddle & "'"
+        TraceLog "    [ComputeDiff] Delete: '" & oldMiddle & "'"
     End If
 
     If Len(newMiddle) > 0 Then
@@ -5611,7 +6222,7 @@ Private Function ComputeDiff(ByVal oldText As String, ByVal newText As String) A
         insertOp("Operation") = DIFF_INSERT
         insertOp("Text") = newMiddle
         result.Add insertOp
-        Debug.Print "    [ComputeDiff] Insert: '" & newMiddle & "'"
+        TraceLog "    [ComputeDiff] Insert: '" & newMiddle & "'"
     End If
 
     ' Add common suffix
@@ -5623,7 +6234,7 @@ Private Function ComputeDiff(ByVal oldText As String, ByVal newText As String) A
     End If
 
     Set ComputeDiff = result
-    Debug.Print "    [ComputeDiff] Total operations: " & result.Count
+    TraceLog "    [ComputeDiff] Total operations: " & result.Count
 End Function
 
 ' Determines whether to use granular diff or fall back to wholesale replacement
@@ -5632,34 +6243,34 @@ Private Function ShouldUseGranularDiff(ByVal oldText As String, _
                                        ByVal formatSegments As Collection) As Boolean
     ' Check global feature flag first
     If Not USE_GRANULAR_DIFF Then
-        Debug.Print "    [ShouldUseGranularDiff] Feature disabled globally."
+        TraceLog "    [ShouldUseGranularDiff] Feature disabled globally."
         ShouldUseGranularDiff = False
         Exit Function
     End If
 
     ' Rule 1: Text too long? Use fallback for performance
     If Len(oldText) > 1000 Or Len(newText) > 1000 Then
-        Debug.Print "    [ShouldUseGranularDiff] Text too long, using fallback."
+        TraceLog "    [ShouldUseGranularDiff] Text too long, using fallback."
         ShouldUseGranularDiff = False
         Exit Function
     End If
 
     ' Rule 2: No formatting or simple formatting? Use granular
     If formatSegments Is Nothing Or formatSegments.Count = 0 Then
-        Debug.Print "    [ShouldUseGranularDiff] No formatting, using granular diff."
+        TraceLog "    [ShouldUseGranularDiff] No formatting, using granular diff."
         ShouldUseGranularDiff = True
         Exit Function
     End If
 
     ' Rule 3: Simple formatting (<=  3 segments)? Use granular
     If formatSegments.Count <= 3 Then
-        Debug.Print "    [ShouldUseGranularDiff] Simple formatting (" & formatSegments.Count & " segments), using granular diff."
+        TraceLog "    [ShouldUseGranularDiff] Simple formatting (" & formatSegments.Count & " segments), using granular diff."
         ShouldUseGranularDiff = True
         Exit Function
     End If
 
     ' Rule 4: Complex formatting? Use fallback
-    Debug.Print "    [ShouldUseGranularDiff] Complex formatting (" & formatSegments.Count & " segments), using fallback."
+    TraceLog "    [ShouldUseGranularDiff] Complex formatting (" & formatSegments.Count & " segments), using fallback."
     ShouldUseGranularDiff = False
 End Function
 
@@ -5667,7 +6278,7 @@ End Function
 Private Sub ApplyDiffOperations(ByVal targetRange As Range, _
                                 ByVal diffOps As Collection, _
                                 ByVal formatSegments As Collection)
-    Debug.Print "    [ApplyDiffOperations] Applying " & diffOps.Count & " diff operations..."
+    TraceLog "    [ApplyDiffOperations] Applying " & diffOps.Count & " diff operations..."
 
     ' Track position as we modify the document
     Dim currentPos As Long
@@ -5686,20 +6297,20 @@ Private Sub ApplyDiffOperations(ByVal targetRange As Range, _
         Dim opLen As Long
         opLen = Len(opText)
 
-        Debug.Print "    [ApplyDiffOperations] Op #" & opIndex & ": " & opType & " (length=" & opLen & ")"
+        TraceLog "    [ApplyDiffOperations] Op #" & opIndex & ": " & opType & " (length=" & opLen & ")"
 
         Select Case opType
             Case DIFF_EQUAL
                 ' Skip over unchanged text
                 currentPos = currentPos + opLen
-                Debug.Print "    [ApplyDiffOperations] EQUAL: Skipping " & opLen & " chars, now at " & currentPos
+                TraceLog "    [ApplyDiffOperations] EQUAL: Skipping " & opLen & " chars, now at " & currentPos
 
             Case DIFF_DELETE
                 ' Delete this text (will show as tracked deletion)
                 If opLen > 0 Then
                     Dim delRange As Range
                     Set delRange = ActiveDocument.Range(currentPos, currentPos + opLen)
-                    Debug.Print "    [ApplyDiffOperations] DELETE: Deleting range " & currentPos & " to " & (currentPos + opLen) & " ('" & Left$(opText, 20) & "')"
+                    TraceLog "    [ApplyDiffOperations] DELETE: Deleting range " & currentPos & " to " & (currentPos + opLen) & " ('" & Left$(opText, 20) & "')"
                     delRange.Delete
                     ' Note: currentPos stays same after deletion
                 End If
@@ -5709,18 +6320,18 @@ Private Sub ApplyDiffOperations(ByVal targetRange As Range, _
                 If opLen > 0 Then
                     Dim insRange As Range
                     Set insRange = ActiveDocument.Range(currentPos, currentPos)
-                    Debug.Print "    [ApplyDiffOperations] INSERT: Inserting at " & currentPos & " ('" & Left$(opText, 20) & "')"
+                    TraceLog "    [ApplyDiffOperations] INSERT: Inserting at " & currentPos & " ('" & Left$(opText, 20) & "')"
                     insRange.Text = opText
                     currentPos = currentPos + opLen
                 End If
 
             Case Else
-                Debug.Print "    [ApplyDiffOperations] WARNING: Unknown operation type: " & opType
+                TraceLog "    [ApplyDiffOperations] WARNING: Unknown operation type: " & opType
         End Select
     Next op
 
     ' Apply formatting after text changes are complete
-    Debug.Print "    [ApplyDiffOperations] Text changes complete. Final position: " & currentPos
+    TraceLog "    [ApplyDiffOperations] Text changes complete. Final position: " & currentPos
 
     ' Determine the new range after all modifications
     Dim finalRange As Range
@@ -5735,18 +6346,18 @@ Private Sub ApplyDiffOperations(ByVal targetRange As Range, _
         End If
     End If
 
-    Debug.Print "    [ApplyDiffOperations] Diff operations complete."
+    TraceLog "    [ApplyDiffOperations] Diff operations complete."
 End Sub
 
 ' Applies formatting segments to a range (extracted from old ApplyFormattedReplacement)
 Private Sub ApplyFormattingToSegments(ByVal targetRange As Range, ByVal segments As Collection)
     If segments Is Nothing Then
-        Debug.Print "    [ApplyFormattingToSegments] No segments to apply."
+        TraceLog "    [ApplyFormattingToSegments] No segments to apply."
         Exit Sub
     End If
 
     If segments.Count = 0 Then
-        Debug.Print "    [ApplyFormattingToSegments] Segments collection is empty."
+        TraceLog "    [ApplyFormattingToSegments] Segments collection is empty."
         Exit Sub
     End If
 
@@ -5754,7 +6365,7 @@ Private Sub ApplyFormattingToSegments(ByVal targetRange As Range, ByVal segments
     baseStart = targetRange.Start
     Dim segment As Object
 
-    Debug.Print "    [ApplyFormattingToSegments] Applying " & segments.Count & " formatting segments..."
+    TraceLog "    [ApplyFormattingToSegments] Applying " & segments.Count & " formatting segments..."
 
     For Each segment In segments
         Dim formattedRange As Range
@@ -5775,12 +6386,12 @@ Private Sub ApplyFormattingToSegments(ByVal targetRange As Range, ByVal segments
         End With
     Next segment
 
-    Debug.Print "    [ApplyFormattingToSegments] Formatting applied."
+    TraceLog "    [ApplyFormattingToSegments] Formatting applied."
 End Sub
 
 ' Applies formatting when only formatting changes (no text changes)
 Private Sub ApplyFormattingOnly(ByVal targetRange As Range, ByVal segments As Collection)
-    Debug.Print "    [ApplyFormattingOnly] Text identical, applying formatting only..."
+    TraceLog "    [ApplyFormattingOnly] Text identical, applying formatting only..."
 
     ' Reset formatting first
     targetRange.Font.Reset
@@ -6211,16 +6822,37 @@ Private Sub InsertTableRow(ByVal actionObject As Object, _
 
     ' Step 3: Insert new row
     Dim newRow As Row
+    Dim rowCount As Long
+    rowCount = GetSafeTableRowCount(tbl)
+
+    If rowCount = 0 Then
+        Err.Raise vbObjectError + 526, "InsertTableRow", "Unable to determine row count for this merged table."
+    End If
+
+    On Error Resume Next
     If insertPosition = "before" Then
         Set newRow = tbl.Rows.Add(tbl.Rows(targetRowNum))
         ' newRow is now BEFORE targetRowNum (insertion shifts indices)
+        If Err.Number <> 0 Then
+            Err.Clear
+            Set newRow = tbl.Rows.Add
+        End If
     Else ' "after"
-        If targetRowNum < tbl.Rows.Count Then
+        If targetRowNum < rowCount Then
             Set newRow = tbl.Rows.Add(tbl.Rows(targetRowNum + 1))
+            If Err.Number <> 0 Then
+                Err.Clear
+                Set newRow = tbl.Rows.Add
+            End If
         Else
             ' Adding after last row
             Set newRow = tbl.Rows.Add
         End If
+    End If
+    On Error GoTo ErrorHandler
+
+    If newRow Is Nothing Then
+        Err.Raise vbObjectError + 527, "InsertTableRow", "Unable to insert row in this merged table structure."
     End If
 
     ' Step 4: Copy formatting from adjacent row
@@ -6450,8 +7082,8 @@ Private Sub GenerateAndShowStructureMap()
     Dim markdown As String
     markdown = ExportStructureMapAsMarkdown()
     
-    ' Show in message box (for testing) or copy to clipboard
-    Debug.Print markdown
+    ' Avoid printing very large DSM payloads to the Immediate window.
+    Debug.Print "DSM markdown generated (" & Len(markdown) & " chars)"
     
     ' Copy to clipboard
     Dim dataObj As Object
@@ -6541,11 +7173,10 @@ End Function
 Private Function BuildTaggedTextFromRangeFinalView(ByVal sourceRange As Range) As String
     On Error GoTo Fail
 
-    If RangeHasDeletionRevisions(sourceRange) Then
-        BuildTaggedTextFromRangeFinalView = GetRangeTextFinalView(sourceRange)
-    Else
-        BuildTaggedTextFromRangeFinalView = BuildTaggedTextFromRange(sourceRange)
-    End If
+    Dim taggedText As String
+    Dim spansJson As String
+    BuildTaggedAndSpansFromRangeFinalView sourceRange, taggedText, spansJson
+    BuildTaggedTextFromRangeFinalView = taggedText
     Exit Function
 
 Fail:
@@ -6555,33 +7186,71 @@ End Function
 Private Function BuildFormatSpansJsonFinalView(ByVal sourceRange As Range) As String
     On Error GoTo Fail
 
-    If RangeHasDeletionRevisions(sourceRange) Then
-        BuildFormatSpansJsonFinalView = "[]"
-    Else
-        BuildFormatSpansJsonFinalView = BuildFormatSpansJson(sourceRange)
-    End If
+    Dim taggedText As String
+    Dim spansJson As String
+    BuildTaggedAndSpansFromRangeFinalView sourceRange, taggedText, spansJson
+    BuildFormatSpansJsonFinalView = spansJson
     Exit Function
 
 Fail:
     BuildFormatSpansJsonFinalView = "[]"
 End Function
 
-Private Function BuildTaggedTextFromRange(ByVal sourceRange As Range) As String
+Private Function RangeHasAnyInlineFormatting(ByVal sourceRange As Range) As Boolean
+    ' Fast-path check: if the whole range reports plain formatting, skip character scanning.
+
+    On Error GoTo Fail
+
+    If sourceRange Is Nothing Then
+        RangeHasAnyInlineFormatting = False
+        Exit Function
+    End If
+
+    With sourceRange.Font
+        If .Bold = 0 And .Italic = 0 And .Subscript = 0 And .Superscript = 0 Then
+            RangeHasAnyInlineFormatting = False
+        Else
+            RangeHasAnyInlineFormatting = True
+        End If
+    End With
+    Exit Function
+
+Fail:
+    ' If uncertain, keep robust behavior by taking the detailed path.
+    RangeHasAnyInlineFormatting = True
+End Function
+
+Private Sub BuildTaggedAndSpansFromRange(ByVal sourceRange As Range, ByRef taggedText As String, ByRef spansJson As String)
     On Error GoTo Fail
 
     Dim plainText As String
     plainText = sourceRange.Text
     If Len(plainText) = 0 Then
-        BuildTaggedTextFromRange = ""
-        Exit Function
+        taggedText = ""
+        spansJson = "[]"
+        Exit Sub
+    End If
+
+    If Not RangeHasAnyInlineFormatting(sourceRange) Then
+        taggedText = plainText
+        spansJson = "[]"
+        Exit Sub
     End If
 
     Dim i As Long
     Dim out As String
+    Dim spans As String
     Dim inSub As Boolean
     Dim inSup As Boolean
     Dim inBold As Boolean
     Dim inItalic As Boolean
+    Dim hasRun As Boolean
+    Dim runStart As Long
+    Dim runLen As Long
+    Dim runSub As Boolean
+    Dim runSup As Boolean
+    Dim runBold As Boolean
+    Dim runItalic As Boolean
 
     For i = 1 To Len(plainText)
         Dim chRange As Range
@@ -6599,6 +7268,7 @@ Private Function BuildTaggedTextFromRange(ByVal sourceRange As Range) As String
         isBold = (chRange.Font.Bold = True)
         isItalic = (chRange.Font.Italic = True)
 
+        ' Build tagged text.
         If inSub And Not isSub Then out = out & "</sub>": inSub = False
         If inSup And Not isSup Then out = out & "</sup>": inSup = False
         If inBold And Not isBold Then out = out & "</b>": inBold = False
@@ -6610,59 +7280,8 @@ Private Function BuildTaggedTextFromRange(ByVal sourceRange As Range) As String
         If isSub And Not inSub Then out = out & "<sub>": inSub = True
 
         out = out & Mid$(plainText, i, 1)
-    Next i
 
-    If inSub Then out = out & "</sub>"
-    If inSup Then out = out & "</sup>"
-    If inBold Then out = out & "</b>"
-    If inItalic Then out = out & "</i>"
-
-    BuildTaggedTextFromRange = out
-    Exit Function
-
-Fail:
-    BuildTaggedTextFromRange = sourceRange.Text
-End Function
-
-Private Function BuildFormatSpansJson(ByVal sourceRange As Range) As String
-    On Error GoTo Fail
-
-    Dim plainText As String
-    plainText = sourceRange.Text
-    If Len(plainText) = 0 Then
-        BuildFormatSpansJson = "[]"
-        Exit Function
-    End If
-
-    Dim spans As String
-    Dim i As Long
-    Dim runStart As Long
-    Dim runLen As Long
-    Dim runSub As Boolean
-    Dim runSup As Boolean
-    Dim runBold As Boolean
-    Dim runItalic As Boolean
-    Dim hasRun As Boolean
-
-    spans = ""
-    hasRun = False
-
-    For i = 1 To Len(plainText)
-        Dim chRange As Range
-        Set chRange = sourceRange.Duplicate
-        chRange.Start = sourceRange.Start + i - 1
-        chRange.End = chRange.Start + 1
-
-        Dim isSub As Boolean
-        Dim isSup As Boolean
-        Dim isBold As Boolean
-        Dim isItalic As Boolean
-
-        isSub = (chRange.Font.Subscript = True)
-        isSup = (chRange.Font.Superscript = True)
-        isBold = (chRange.Font.Bold = True)
-        isItalic = (chRange.Font.Italic = True)
-
+        ' Build spans.
         If Not (isSub Or isSup Or isBold Or isItalic) Then
             If hasRun Then
                 spans = spans & IIf(Len(spans) > 0, ",", "") & _
@@ -6701,6 +7320,11 @@ Private Function BuildFormatSpansJson(ByVal sourceRange As Range) As String
 ContinueLoop:
     Next i
 
+    If inSub Then out = out & "</sub>"
+    If inSup Then out = out & "</sup>"
+    If inBold Then out = out & "</b>"
+    If inItalic Then out = out & "</i>"
+
     If hasRun Then
         spans = spans & IIf(Len(spans) > 0, ",", "") & _
             "{""start"":" & runStart & ",""length"":" & runLen & ",""subscript"":" & LCase$(CStr(runSub)) & _
@@ -6708,14 +7332,348 @@ ContinueLoop:
             ",""italic"":" & LCase$(CStr(runItalic)) & "}"
     End If
 
-    BuildFormatSpansJson = "[" & spans & "]"
+    taggedText = out
+    spansJson = "[" & spans & "]"
+    Exit Sub
+
+Fail:
+    taggedText = sourceRange.Text
+    spansJson = "[]"
+End Sub
+
+Private Sub BuildTaggedAndSpansFromRangeFinalView(ByVal sourceRange As Range, ByRef taggedText As String, ByRef spansJson As String)
+    On Error GoTo Fail
+
+    If RangeHasDeletionRevisions(sourceRange) Then
+        taggedText = GetRangeTextFinalView(sourceRange)
+        spansJson = "[]"
+    Else
+        BuildTaggedAndSpansFromRange sourceRange, taggedText, spansJson
+    End If
+    Exit Sub
+
+Fail:
+    taggedText = GetRangeTextFinalView(sourceRange)
+    spansJson = "[]"
+End Sub
+
+Private Function BuildTaggedTextFromRange(ByVal sourceRange As Range) As String
+    On Error GoTo Fail
+
+    Dim taggedText As String
+    Dim spansJson As String
+    BuildTaggedAndSpansFromRange sourceRange, taggedText, spansJson
+    BuildTaggedTextFromRange = taggedText
+    Exit Function
+
+Fail:
+    BuildTaggedTextFromRange = sourceRange.Text
+End Function
+
+Private Function BuildFormatSpansJson(ByVal sourceRange As Range) As String
+    On Error GoTo Fail
+
+    Dim taggedText As String
+    Dim spansJson As String
+    BuildTaggedAndSpansFromRange sourceRange, taggedText, spansJson
+    BuildFormatSpansJson = spansJson
     Exit Function
 
 Fail:
     BuildFormatSpansJson = "[]"
 End Function
 
-Private Function ExportStructureMapAsJsonV41() As String
+Private Function BuildJsonStringArray(ByVal items As Variant) As String
+    Dim result As String
+    Dim i As Long
+    Dim lowerBound As Long
+    Dim upperBound As Long
+
+    If IsEmpty(items) Then
+        BuildJsonStringArray = "[]"
+        Exit Function
+    End If
+
+    If Not IsArray(items) Then
+        BuildJsonStringArray = "[]"
+        Exit Function
+    End If
+
+    On Error GoTo EmptyArray
+    lowerBound = LBound(items)
+    upperBound = UBound(items)
+    On Error GoTo 0
+
+    result = "["
+    For i = lowerBound To upperBound
+        If i > lowerBound Then
+            result = result & ","
+        End If
+        result = result & """" & JsonEscape(CStr(items(i))) & """"
+    Next i
+    result = result & "]"
+    BuildJsonStringArray = result
+    Exit Function
+
+EmptyArray:
+    BuildJsonStringArray = "[]"
+End Function
+
+Private Sub AddToolDefinition(ByVal name As String, ByVal action As String, ByVal description As String, ByVal targetRequirement As String, _
+    ByVal requiredArgs As Variant, ByVal optionalArgs As Variant, ByVal exampleTarget As String, _
+    ByVal exampleArgsJson As String, ByVal exampleExplanation As String, ByVal notes As Variant)
+
+    Dim def As Object
+    Set def = CreateObject("Scripting.Dictionary")
+
+    def("name") = name
+    def("action") = action
+    def("description") = description
+    def("target_requirement") = targetRequirement
+    def("required_args") = requiredArgs
+    def("optional_args") = optionalArgs
+    def("example_target") = exampleTarget
+    def("example_args_json") = exampleArgsJson
+    def("example_explanation") = exampleExplanation
+    def("notes") = notes
+
+    g_ToolRegistry.Add LCase$(name), def
+    g_ToolRegistryOrder.Add def
+End Sub
+
+Private Sub InitializeToolRegistry()
+    If Not g_ToolRegistry Is Nothing Then Exit Sub
+
+    Set g_ToolRegistry = CreateObject("Scripting.Dictionary")
+    Set g_ToolRegistryOrder = New Collection
+
+    AddToolDefinition "replace_text", "replace", _
+        "Find and replace text strictly within the resolved target range.", _
+        "Use paragraph IDs (P#) or table cell references (T#.R#.C#) so replacements stay scoped.", _
+        Array("find", "replace"), _
+        Array("match_case"), _
+        "P12", _
+        "{""find"":""recieved"",""replace"":""received""}", _
+        "Correct spelling or update terminology without touching adjacent content.", _
+        Array("Never rely on document-wide search—provide the exact text expected inside the target.", _
+              "You may use <b>, <i>, <sub>, and <sup> tags in the replace string when formatting is required.")
+
+    AddToolDefinition "apply_style", "apply_style", _
+        "Apply a predefined style to the resolved range.", _
+        "Works best with full-paragraph targets (P#).", _
+        Array("style"), _
+        Empty, _
+        "P3", _
+        "{""style"":""heading_l2""}", _
+        "Promote or demote headings to match the report outline.", _
+        Array("Supported tokens appear in the tooling.style_tokens list (e.g., heading_l2, table_heading).", _
+              "If a VA macro is unavailable the macro falls back to direct Word style application.")
+
+    AddToolDefinition "add_comment", "comment", _
+        "Insert a Word comment anchored to the target range.", _
+        "Target can be any paragraph, table, row, or cell reference.", _
+        Empty, _
+        Empty, _
+        "P8", _
+        "{""text"":""Clarify the propagation model assumptions.""}", _
+        "Request clarifications or note issues that cannot be auto-fixed.", _
+        Array("If args.text is omitted the macro uses the suggestion's explanation, but providing text is preferred.")
+
+    AddToolDefinition "delete_range", "delete", _
+        "Remove the resolved target range (paragraph, row, or cell).", _
+        "Target must be a precise DSM ID; no partial matches are attempted.", _
+        Empty, _
+        Empty, _
+        "P15", _
+        "{}", _
+        "Remove duplicated sentences or redundant cells.", _
+        Array("Use sparingly—deleting entire sections should be accompanied by a comment explaining the rationale.")
+
+    AddToolDefinition "replace_table", "replace_table", _
+        "Replace an entire table with markdown content that will be converted to a Word table.", _
+        "Target must be the table ID (T#).", _
+        Array("markdown"), _
+        Empty, _
+        "T2", _
+        "{""markdown"":""| Location | Leq dB |\\n|---|---|\\n| Roof | 55 |""}", _
+        "Provide complete updated data when layout changes are easier than incremental edits.", _
+        Array("Include a header row and keep the column count consistent with the intended output.")
+
+    AddToolDefinition "insert_table_row", "insert_row", _
+        "Insert a row into the specified table.", _
+        "Target must be the table ID (T#).", _
+        Array("data"), _
+        Array("after_row"), _
+        "T3", _
+        "{""data"":[""Location 4"",""47 dB"",""Day""],""after_row"":3}", _
+        "Add missing measurement rows while preserving header and formatting.", _
+        Array("Provide one entry per column; omit after_row or set to 0 to insert at the top.")
+
+    AddToolDefinition "delete_table_row", "delete_row", _
+        "Delete a specific table row (including header rows when appropriate).", _
+        "Target must be a row reference such as T2.R5 or T2.H.", _
+        Empty, _
+        Empty, _
+        "T2.R5", _
+        "{}", _
+        "Use for duplicated or obsolete data rows.", _
+        Array("This removes the entire row; update nearby references or totals if needed.")
+End Sub
+
+Private Function GetToolRegistry() As Object
+    InitializeToolRegistry
+    Set GetToolRegistry = g_ToolRegistry
+End Function
+
+Private Function GetToolDefinition(ByVal toolName As String) As Object
+    Dim registry As Object
+    Dim normalized As String
+
+    normalized = LCase$(Trim$(toolName))
+    Set registry = GetToolRegistry()
+
+    If registry.Exists(normalized) Then
+        Set GetToolDefinition = registry(normalized)
+    Else
+        Set GetToolDefinition = Nothing
+    End If
+End Function
+
+Private Function BuildToolEntry(ByVal name As String, ByVal description As String, ByVal targetRequirement As String, _
+    ByVal requiredArgs As Variant, ByVal optionalArgs As Variant, ByVal exampleTarget As String, _
+    ByVal exampleArgsJson As String, ByVal exampleExplanation As String, ByVal notes As Variant) As String
+
+    Dim entry As String
+    entry = "{""name"":""" & JsonEscape(name) & """," & _
+            """description"":""" & JsonEscape(description) & """," & _
+            """target_requirements"":""" & JsonEscape(targetRequirement) & """," & _
+            """args"":{""required"":" & BuildJsonStringArray(requiredArgs) & ",""optional"":" & BuildJsonStringArray(optionalArgs) & "}," & _
+            """notes"":" & BuildJsonStringArray(notes) & "," & _
+            """example"":{""tool"":""" & JsonEscape(name) & """,""target"":""" & JsonEscape(exampleTarget) & """,""args"":" & exampleArgsJson & ",""explanation"":""" & JsonEscape(exampleExplanation) & """}}"
+
+    BuildToolEntry = entry
+End Function
+
+Private Function BuildTargetReferenceDocsJson() As String
+    Dim entries As Variant
+    Dim entry As Variant
+    Dim i As Long
+    Dim output As String
+
+    entries = Array( _
+        Array("paragraph", "P{n}", "Use for any paragraph listed in the DSM elements array. The numeric suffix matches the paragraph order.", "P5"), _
+        Array("table", "T{n}", "References an entire table. Use this when replacing a whole table or inserting rows relative to it.", "T2"), _
+        Array("table_row", "T{n}.R{r}", "References a specific row within table n (e.g., R1 = first data row).", "T2.R3"), _
+        Array("table_header_row", "T{n}.H", "References the table header row (equivalent to row 1).", "T2.H"), _
+        Array("table_cell", "T{n}.R{r}.C{c}", "References a single cell using row and column numbers.", "T2.R3.C2"), _
+        Array("table_header_cell", "T{n}.H.C{c}", "Targets a header row cell for formatting or text edits.", "T2.H.C1") _
+    )
+
+    output = "["
+    For i = LBound(entries) To UBound(entries)
+        entry = entries(i)
+        If i > LBound(entries) Then output = output & ","
+        output = output & "{""kind"":""" & JsonEscape(entry(0)) & """," & _
+                          """format"":""" & JsonEscape(entry(1)) & """," & _
+                          """description"":""" & JsonEscape(entry(2)) & """," & _
+                          """example"":""" & JsonEscape(entry(3)) & """}"
+    Next i
+    output = output & "]"
+    BuildTargetReferenceDocsJson = output
+End Function
+
+Private Function BuildToolDefinitionJson() As String
+    Dim output As String
+    Dim i As Long
+    Dim def As Object
+
+    InitializeToolRegistry
+
+    output = "["
+    If Not g_ToolRegistryOrder Is Nothing Then
+        For i = 1 To g_ToolRegistryOrder.Count
+            Set def = g_ToolRegistryOrder(i)
+            If i > 1 Then output = output & ","
+            output = output & BuildToolEntry( _
+                def("name"), _
+                def("description"), _
+                def("target_requirement"), _
+                def("required_args"), _
+                def("optional_args"), _
+                def("example_target"), _
+                def("example_args_json"), _
+                def("example_explanation"), _
+                def("notes"))
+        Next i
+    End If
+    output = output & "]"
+    BuildToolDefinitionJson = output
+End Function
+
+Private Function BuildResponseContractJson() As String
+    Dim responseNotes As Variant
+
+    responseNotes = Array( _
+        "Return valid JSON only (no Markdown code fences or commentary).", _
+        "Populate tool_calls with deterministic actions ordered by priority—earlier entries run first.", _
+        "args must always be a JSON object even when no fields are required (use {}).", _
+        "Set explanation to brief natural language so reviewers understand the reason for the change." _
+    )
+
+    BuildResponseContractJson = "{""root_object"":""" & JsonEscape("{ ""tool_calls"": [] }") & """," & _
+        """required_fields"":" & BuildJsonStringArray(Array("tool_calls")) & "," & _
+        """tool_call_entry"":{""required"":" & BuildJsonStringArray(Array("tool", "target", "args")) & ",""optional"":" & BuildJsonStringArray(Array("explanation")) & "}," & _
+        """notes"":" & BuildJsonStringArray(responseNotes) & "}"
+End Function
+
+Private Function BuildManualFallbackJson() As String
+    Dim steps As Variant
+    Dim notes As Variant
+
+    steps = Array( _
+        "Review the macro summary or log to identify which tool calls failed.", _
+        "Use the DSM target IDs (P#, T#, etc.) to locate the exact paragraphs or tables in Word.", _
+        "Apply the edit manually or adjust the JSON entry, then rerun V4_ApplyToolCalls when ready." _
+    )
+
+    notes = Array( _
+        "Failed items leave the document unchanged, so manual edits are safe to perform afterward.", _
+        "Turn on Track Changes before manual fixes if you need an audit trail." _
+    )
+
+    BuildManualFallbackJson = "{""trigger"":""" & JsonEscape("One or more tool calls failed to apply automatically.") & """," & _
+        """steps"":" & BuildJsonStringArray(steps) & "," & _
+        """notes"":" & BuildJsonStringArray(notes) & "}"
+End Function
+
+Private Function BuildToolingDocumentationJson() As String
+    Dim guidelines As Variant
+    Dim styleTokens As Variant
+
+    guidelines = Array( _
+        "Always anchor targets using DSM IDs from the elements array; never rely on searching raw text.", _
+        "Confine replacements to the resolved paragraph or cell to avoid accidental edits elsewhere.", _
+        "Paragraph IDs refer to body paragraphs; table cell text should be targeted with T#.R#.C# references.", _
+        "Favour table-specific tools (replace_table, insert_table_row, delete_table_row) for structured data changes.", _
+        "Add comments when recommending manual review steps or when data is missing.", _
+        "Keep tool calls atomic—one logical change per entry." _
+    )
+
+    styleTokens = Array("heading_l1", "heading_l2", "heading_l3", "heading_l4", "body_text", "bullet", "table_heading", "table_text", "table_title", "figure")
+
+    BuildToolingDocumentationJson = _
+        "{""overview"":""" & JsonEscape("Use these instructions to convert DSM v4.2 data into executable Word tool calls.") & """," & _
+        """ordering"":""" & JsonEscape("Elements are listed in document order (top-to-bottom).") & """," & _
+        """text_view"":""" & JsonEscape("Paragraph and table previews reflect Word's Final view (insertions included, deletions excluded).") & """," & _
+        """guidelines"":" & BuildJsonStringArray(guidelines) & "," & _
+        """style_tokens"":" & BuildJsonStringArray(styleTokens) & "," & _
+        """target_reference_format"":" & BuildTargetReferenceDocsJson() & "," & _
+        """response_contract"":" & BuildResponseContractJson() & "," & _
+        """tools"":" & BuildToolDefinitionJson() & "," & _
+        """manual_fallback"":" & BuildManualFallbackJson() & "}"
+End Function
+
+Private Function ExportStructureMapAsJsonV42() As String
     On Error GoTo ErrorHandler
 
     If Not g_DocumentMapBuilt Then
@@ -6726,74 +7684,169 @@ Private Function ExportStructureMapAsJsonV41() As String
     Dim i As Long
     Dim elem As DocumentElement
     Dim elementJson As String
+    Dim elementParts() As String
+    Dim docHasRevisions As Boolean
 
-    output = "{""version"":""4.1"",""document"":{""name"":""" & JsonEscape(ActiveDocument.Name) & """,""generated_at"":""" & _
-             Format(Now, "yyyy-mm-dd\Thh:nn:ss") & """},""elements"":["
+    docHasRevisions = False
+    On Error Resume Next
+    docHasRevisions = (ActiveDocument.Revisions.Count > 0)
+    Err.Clear
+    On Error GoTo ErrorHandler
+
+    output = "{""version"":""4.2"",""document"":{""name"":""" & JsonEscape(ActiveDocument.Name) & """,""generated_at"":""" & _
+             Format(Now, "yyyy-mm-dd\Thh:nn:ss") & """},""tooling"":" & BuildToolingDocumentationJson() & ",""elements"":["
+
+    If g_DocumentMapCount > 0 Then
+        ReDim elementParts(1 To g_DocumentMapCount)
+    End If
 
     For i = 1 To g_DocumentMapCount
         elem = g_DocumentMap(i)
         elementJson = ""
+        If i Mod 25 = 0 Then
+            TraceLog "  -> DSM JSON export progress: " & i & "/" & g_DocumentMapCount
+            DoEvents
+        End If
 
         If elem.ElementType = "paragraph" Then
             Dim pRange As Range
             Dim pFinalText As String
+            Dim pTaggedText As String
+            Dim pSpansJson As String
             Set pRange = ActiveDocument.Range(elem.StartPos, elem.EndPos)
-            pFinalText = GetRangeTextFinalView(pRange)
+            If docHasRevisions Then
+                pFinalText = GetRangeTextFinalView(pRange)
+                BuildTaggedAndSpansFromRangeFinalView pRange, pTaggedText, pSpansJson
+            Else
+                pFinalText = pRange.Text
+                BuildTaggedAndSpansFromRange pRange, pTaggedText, pSpansJson
+            End If
             elementJson = "{""id"":""" & elem.ElementID & """,""kind"":""paragraph"",""style"":""" & JsonEscape(elem.StyleName) & """,""text_plain"":""" & _
-                          JsonEscape(pFinalText) & """,""text_tagged"":""" & JsonEscape(BuildTaggedTextFromRangeFinalView(pRange)) & _
-                          """,""format_spans"":" & BuildFormatSpansJsonFinalView(pRange) & "}"
+                          JsonEscape(pFinalText) & """,""text_tagged"":""" & JsonEscape(pTaggedText) & _
+                          """,""format_spans"":" & pSpansJson & ",""range"":{""start"":" & elem.StartPos & _
+                          ",""end"":" & elem.EndPos & "},""section_number"":" & elem.SectionNumber & ",""page_number"":" & elem.PageNumber & _
+                          ",""heading_level"":" & elem.HeadingLevel & ",""within_table"":" & LCase$(CStr(elem.WithinTable)) & "}"
         ElseIf elem.ElementType = "table" Then
             Dim tbl As Table
             Set tbl = ResolveTableByID(elem.ElementID)
             Dim cellsJson As String
-            Dim r As Long
-            Dim c As Long
             Dim cellFinalText As String
+            Dim tableCell As Cell
+            Dim cellRange As Range
+            Dim exportedCellCount As Long
+            Dim cellTagged As String
+            Dim cellSpans As String
+            Dim cellTaggedAll As String
+            Dim cellSpansAll As String
 
             cellsJson = ""
             If Not tbl Is Nothing Then
-                For r = 1 To tbl.Rows.Count
-                    For c = 1 To tbl.Columns.Count
-                        Dim cellRange As Range
-                        On Error Resume Next
-                        Set cellRange = tbl.Cell(r, c).Range
-                        If Err.Number <> 0 Then
-                            Err.Clear
-                            On Error GoTo ErrorHandler
-                            GoTo SkipCell
+                TraceLog "  -> Exporting " & elem.ElementID & " cells..."
+                exportedCellCount = 0
+                For Each tableCell In tbl.Range.Cells
+                    Set cellRange = GetCellContentRange(tableCell)
+                    If Not cellRange Is Nothing Then
+                        If docHasRevisions Then
+                            cellFinalText = Trim$(GetRangeTextFinalView(cellRange))
+                        Else
+                            cellFinalText = Trim$(cellRange.Text)
                         End If
-                        On Error GoTo ErrorHandler
-                        If cellRange.End > cellRange.Start Then cellRange.End = cellRange.End - 1
-                        cellFinalText = GetCellTextFinalView(tbl.Cell(r, c))
+                        cellTagged = ""
+                        cellSpans = "[]"
+                        If DSM_INCLUDE_TABLE_CELL_TAGGED_TEXT Or DSM_INCLUDE_TABLE_CELL_FORMAT_SPANS Then
+                            If docHasRevisions Then
+                                BuildTaggedAndSpansFromRangeFinalView cellRange, cellTaggedAll, cellSpansAll
+                            Else
+                                BuildTaggedAndSpansFromRange cellRange, cellTaggedAll, cellSpansAll
+                            End If
+                            If DSM_INCLUDE_TABLE_CELL_TAGGED_TEXT Then cellTagged = cellTaggedAll
+                            If DSM_INCLUDE_TABLE_CELL_FORMAT_SPANS Then cellSpans = cellSpansAll
+                        End If
                         cellsJson = cellsJson & IIf(Len(cellsJson) > 0, ",", "") & _
-                            "{""id"":""" & elem.ElementID & ".R" & r & ".C" & c & """,""text_plain"":""" & JsonEscape(cellFinalText) & _
-                            """,""text_tagged"":""" & JsonEscape(BuildTaggedTextFromRangeFinalView(cellRange)) & """,""format_spans"":" & BuildFormatSpansJsonFinalView(cellRange) & "}"
-SkipCell:
-                    Next c
-                Next r
+                            "{""id"":""" & elem.ElementID & ".R" & tableCell.RowIndex & ".C" & tableCell.ColumnIndex & """,""text_plain"":""" & JsonEscape(cellFinalText) & _
+                            """,""text_tagged"":""" & JsonEscape(cellTagged) & """,""format_spans"":" & cellSpans & "}"
+                    End If
+
+                    exportedCellCount = exportedCellCount + 1
+                    If exportedCellCount Mod DSM_CELL_PROGRESS_INTERVAL = 0 Then DoEvents
+                Next tableCell
             End If
 
-            elementJson = "{""id"":""" & elem.ElementID & """,""kind"":""table"",""rows"":" & elem.TableRowCount & ",""cols"":" & elem.TableColCount & ",""cells"":[" & cellsJson & "]}"
+            elementJson = "{""id"":""" & elem.ElementID & """,""kind"":""table"",""rows"":" & elem.TableRowCount & ",""cols"":" & elem.TableColCount & _
+                          ",""range"":{""start"":" & elem.StartPos & ",""end"":" & elem.EndPos & "},""section_number"":" & elem.SectionNumber & _
+                          ",""page_number"":" & elem.PageNumber & ",""title_text"":""" & JsonEscape(elem.TableTitle) & """,""caption_text"":""" & _
+                          JsonEscape(elem.TableCaption) & """,""within_table"":false,""cells"":[" & cellsJson & "]}"
         End If
 
-        output = output & IIf(i > 1, ",", "") & elementJson
+        elementParts(i) = elementJson
     Next i
 
+    If g_DocumentMapCount > 0 Then
+        output = output & Join(elementParts, ",")
+    End If
     output = output & "]}"
-    ExportStructureMapAsJsonV41 = output
+    ExportStructureMapAsJsonV42 = output
     Exit Function
 
 ErrorHandler:
-    ExportStructureMapAsJsonV41 = "{""version"":""4.1"",""error"":""" & JsonEscape(Err.Description) & """}"
+    ExportStructureMapAsJsonV42 = "{""version"":""4.2"",""error"":""" & JsonEscape(Err.Description) & """}"
 End Function
 
 Private Function IsAllowedToolName(ByVal toolName As String) As Boolean
-    Select Case LCase$(Trim$(toolName))
-        Case "replace_text", "apply_style", "add_comment", "delete_range", "replace_table", "insert_table_row", "delete_table_row"
-            IsAllowedToolName = True
-        Case Else
-            IsAllowedToolName = False
-    End Select
+    Dim registry As Object
+    Dim normalized As String
+
+    normalized = LCase$(Trim$(toolName))
+    Set registry = GetToolRegistry()
+    IsAllowedToolName = registry.Exists(normalized)
+End Function
+
+Private Function GetMissingArgsList(ByVal argsObj As Object, ByVal requiredArgs As Variant) As String
+    Dim result As String
+    Dim i As Long
+    Dim argName As String
+
+    If IsEmpty(requiredArgs) Then
+        GetMissingArgsList = ""
+        Exit Function
+    End If
+
+    On Error GoTo CleanFail
+    For i = LBound(requiredArgs) To UBound(requiredArgs)
+        argName = CStr(requiredArgs(i))
+        If Not HasDictionaryKey(argsObj, argName) Then
+            result = result & IIf(Len(result) > 0, ", ", "") & argName
+        End If
+    Next i
+    GetMissingArgsList = result
+    Exit Function
+
+CleanFail:
+    GetMissingArgsList = ""
+End Function
+
+Private Function IsDictionaryLikeObject(ByVal value As Variant) As Boolean
+    On Error GoTo Fail
+
+    If Not IsObject(value) Then
+        IsDictionaryLikeObject = False
+        Exit Function
+    End If
+
+    If TypeName(value) = "Collection" Then
+        IsDictionaryLikeObject = False
+        Exit Function
+    End If
+
+    Dim hasKey As Boolean
+    hasKey = value.Exists("__probe__")
+    Err.Clear
+    IsDictionaryLikeObject = True
+    Exit Function
+
+Fail:
+    Err.Clear
+    IsDictionaryLikeObject = False
 End Function
 
 Private Function ParseV4ToolCalls(ByVal jsonString As String, ByRef toolCalls As Collection, ByRef validationErrors As String) As Boolean
@@ -6804,6 +7857,8 @@ Private Function ParseV4ToolCalls(ByVal jsonString As String, ByRef toolCalls As
     validationErrors = ""
 
     Dim parsed As Object
+    Dim registry As Object
+
     Set parsed = LLM_ParseJson(PreProcessJson(jsonString))
     If parsed Is Nothing Then
         validationErrors = "JSON parse failed."
@@ -6820,11 +7875,18 @@ Private Function ParseV4ToolCalls(ByVal jsonString As String, ByRef toolCalls As
         Exit Function
     End If
 
+    Set registry = GetToolRegistry()
+
     Dim callObj As Object
     Dim idx As Long
     idx = 0
     For Each callObj In parsed("tool_calls")
         idx = idx + 1
+
+        If Not IsDictionaryLikeObject(callObj) Then
+            validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": each tool_call must be an object."
+            GoTo ContinueLoop
+        End If
 
         If HasDictionaryKey(callObj, "context") Or HasDictionaryKey(callObj, "actions") Or HasDictionaryKey(callObj, "action") Then
             validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": legacy V3 keys detected."
@@ -6845,13 +7907,15 @@ Private Function ParseV4ToolCalls(ByVal jsonString As String, ByRef toolCalls As
         End If
 
         Dim toolName As String
+        Dim toolDef As Object
         toolName = LCase$(Trim$(GetSuggestionText(callObj, "tool", "")))
-        If Not IsAllowedToolName(toolName) Then
+        If Not registry.Exists(toolName) Then
             validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": unsupported tool '" & toolName & "'."
             GoTo ContinueLoop
         End If
+        Set toolDef = registry(toolName)
 
-        If TypeName(callObj("args")) = "Collection" Then
+        If Not IsDictionaryLikeObject(callObj("args")) Then
             validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": 'args' must be an object."
             GoTo ContinueLoop
         End If
@@ -6859,33 +7923,21 @@ Private Function ParseV4ToolCalls(ByVal jsonString As String, ByRef toolCalls As
         Dim argsObj As Object
         Set argsObj = callObj("args")
 
-        Select Case toolName
-            Case "replace_text"
-                If Not HasDictionaryKey(argsObj, "find") Or Not HasDictionaryKey(argsObj, "replace") Then
-                    validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": replace_text requires args.find and args.replace."
-                    GoTo ContinueLoop
-                End If
-            Case "apply_style"
-                If Not HasDictionaryKey(argsObj, "style") Then
-                    validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": apply_style requires args.style."
-                    GoTo ContinueLoop
-                End If
-            Case "add_comment"
-                If Not HasDictionaryKey(argsObj, "text") And Len(GetSuggestionText(callObj, "explanation", "")) = 0 Then
-                    validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": add_comment requires args.text or explanation."
-                    GoTo ContinueLoop
-                End If
-            Case "replace_table"
-                If Not HasDictionaryKey(argsObj, "markdown") Then
-                    validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": replace_table requires args.markdown."
-                    GoTo ContinueLoop
-                End If
-            Case "insert_table_row"
-                If Not HasDictionaryKey(argsObj, "data") Then
-                    validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & "Item " & idx & ": insert_table_row requires args.data."
-                    GoTo ContinueLoop
-                End If
-        End Select
+        Dim missingArgs As String
+        missingArgs = GetMissingArgsList(argsObj, toolDef("required_args"))
+        If Len(missingArgs) > 0 Then
+            validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & _
+                "Item " & idx & ": " & toolName & " requires args: " & missingArgs & "."
+            GoTo ContinueLoop
+        End If
+
+        If toolName = "add_comment" Then
+            If Not HasDictionaryKey(argsObj, "text") And Len(GetSuggestionText(callObj, "explanation", "")) = 0 Then
+                validationErrors = validationErrors & IIf(Len(validationErrors) > 0, vbCrLf, "") & _
+                    "Item " & idx & ": add_comment requires args.text or explanation."
+                GoTo ContinueLoop
+            End If
+        End If
 
         toolCalls.Add callObj
 
@@ -6906,34 +7958,37 @@ Private Function ConvertToolCallToSuggestion(ByVal callObj As Object) As Object
     Dim toolName As String
     toolName = LCase$(Trim$(GetSuggestionText(callObj, "tool", "")))
     Dim argsObj As Object
-    Set argsObj = callObj("args")
+    If HasDictionaryKey(callObj, "args") And IsDictionaryLikeObject(callObj("args")) Then
+        Set argsObj = callObj("args")
+    Else
+        Set argsObj = CreateObject("Scripting.Dictionary")
+    End If
+    Dim toolDef As Object
+    Set toolDef = GetToolDefinition(toolName)
 
     suggestion("target") = GetSuggestionText(callObj, "target", "")
     suggestion("explanation") = GetSuggestionText(callObj, "explanation", "")
+    suggestion("tool_name") = toolName
+    If Not toolDef Is Nothing Then
+        suggestion("action") = toolDef("action")
+    End If
 
     Select Case toolName
         Case "replace_text"
-            suggestion("action") = "replace"
             suggestion("find") = GetSuggestionText(argsObj, "find", "")
             suggestion("replace") = GetSuggestionText(argsObj, "replace", "")
             If HasDictionaryKey(argsObj, "match_case") Then suggestion("match_case") = CBool(argsObj("match_case"))
         Case "apply_style"
-            suggestion("action") = "apply_style"
             suggestion("style") = GetSuggestionText(argsObj, "style", "")
         Case "add_comment"
-            suggestion("action") = "comment"
             If HasDictionaryKey(argsObj, "text") Then suggestion("explanation") = GetSuggestionText(argsObj, "text", "")
         Case "delete_range"
-            suggestion("action") = "delete"
         Case "replace_table"
-            suggestion("action") = "replace_table"
             suggestion("replace") = GetSuggestionText(argsObj, "markdown", "")
         Case "insert_table_row"
-            suggestion("action") = "insert_row"
             If HasDictionaryKey(argsObj, "after_row") Then suggestion("after_row") = CLng(Val(CStr(argsObj("after_row"))))
             If HasDictionaryKey(argsObj, "data") Then suggestion("data") = argsObj("data")
         Case "delete_table_row"
-            suggestion("action") = "delete_row"
     End Select
 
     Set ConvertToolCallToSuggestion = suggestion
@@ -6968,30 +8023,167 @@ CleanFail:
     IsToolCallNoOp = False
 End Function
 
-Private Function RunToolCallsInternal(ByVal jsonString As String, ByVal interactive As Boolean) As Boolean
+Private Function DescribeToolFailure(ByVal suggestion As Object) As String
+    Dim toolName As String
+    Dim target As String
+    Dim note As String
+
+    toolName = GetSuggestionText(suggestion, "tool_name", "<tool>")
+    target = GetSuggestionText(suggestion, "target", "<target>")
+    note = GetSuggestionText(suggestion, "explanation", "")
+
+    If Len(note) > 0 Then
+        DescribeToolFailure = toolName & " @ " & target & " - " & note
+    Else
+        DescribeToolFailure = toolName & " @ " & target
+    End If
+End Function
+
+Private Function GenerateRunId() As String
+    Randomize
+    GenerateRunId = Format(Now, "yyyymmdd_hhnnss") & "_" & CStr(Int((9999 - 1000 + 1) * Rnd + 1000))
+End Function
+
+Private Function ElapsedMilliseconds(ByVal startTimer As Single) As Long
+    Dim delta As Single
+    delta = Timer - startTimer
+    If delta < 0 Then delta = delta + 86400 ' Timer resets at midnight.
+    ElapsedMilliseconds = CLng(delta * 1000)
+End Function
+
+Private Function BuildOutcomeJson(ByVal index As Long, ByVal toolName As String, ByVal targetRef As String, _
+    ByVal status As String, ByVal errorCode As String, ByVal message As String) As String
+
+    BuildOutcomeJson = "{""index"":" & index & ",""tool"":""" & JsonEscape(toolName) & """,""target"":""" & _
+        JsonEscape(targetRef) & """,""status"":""" & JsonEscape(status) & """,""error_code"":""" & _
+        JsonEscape(errorCode) & """,""message"":""" & JsonEscape(message) & """}"
+End Function
+
+Private Sub AddOutcome(ByRef outcomes As Collection, ByVal index As Long, ByVal suggestion As Object, _
+    ByVal status As String, ByVal errorCode As String, ByVal message As String)
+
+    Dim toolName As String
+    Dim targetRef As String
+    toolName = GetSuggestionText(suggestion, "tool_name", "<tool>")
+    targetRef = GetSuggestionText(suggestion, "target", "<target>")
+    outcomes.Add BuildOutcomeJson(index, toolName, targetRef, status, errorCode, message)
+End Sub
+
+Private Function BuildOutcomesArrayJson(ByVal outcomes As Collection) As String
+    Dim i As Long
+    Dim output As String
+
+    output = "["
+    For i = 1 To outcomes.Count
+        If i > 1 Then output = output & ","
+        output = output & CStr(outcomes(i))
+    Next i
+    output = output & "]"
+    BuildOutcomesArrayJson = output
+End Function
+
+Private Function BuildRunResultJson(ByVal runId As String, ByVal ok As Boolean, ByVal mode As String, _
+    ByVal total As Long, ByVal applied As Long, ByVal skipped As Long, ByVal failed As Long, _
+    ByVal validationErrors As String, ByVal outcomes As Collection, ByVal startedAt As Date, _
+    ByVal durationMs As Long, ByVal reportPath As String) As String
+
+    BuildRunResultJson = "{""schema"":""v1"",""ok"":" & LCase$(CStr(ok)) & ",""run_id"":""" & JsonEscape(runId) & """," & _
+        """mode"":""" & JsonEscape(mode) & """,""counts"":{""total"":" & total & ",""applied"":" & applied & _
+        ",""skipped"":" & skipped & ",""failed"":" & failed & "},""validation_errors"":""" & _
+        JsonEscape(validationErrors) & """,""outcomes"":" & BuildOutcomesArrayJson(outcomes) & _
+        ",""timing"":{""started_at"":""" & Format(startedAt, "yyyy-mm-dd\Thh:nn:ss") & """,""duration_ms"":" & durationMs & "}," & _
+        """artifacts"":{""run_report_path"":""" & JsonEscape(reportPath) & """}}"
+End Function
+
+Private Function WriteRunResultReport(ByVal runId As String, ByVal resultJson As String) As String
+    On Error GoTo Fail
+
+    Dim filePath As String
+    Dim fileNum As Integer
+    Dim stem As String
+
+    If ActiveDocument Is Nothing Then
+        stem = "document"
+    Else
+        stem = GetDocStem()
+    End If
+
+    filePath = GetClaudeReviewFolder() & stem & "_run_" & runId & ".json"
+
+    fileNum = FreeFile
+    Open filePath For Output As #fileNum
+    Print #fileNum, resultJson
+    Close #fileNum
+
+    WriteRunResultReport = filePath
+    Exit Function
+
+Fail:
+    On Error Resume Next
+    If fileNum > 0 Then Close #fileNum
+    WriteRunResultReport = ""
+End Function
+
+Private Sub StoreLastRunResult(ByVal runId As String, ByVal resultJson As String, ByVal reportPath As String)
+    g_LastRunId = runId
+    g_LastRunResultJson = resultJson
+    g_LastRunReportPath = reportPath
+End Sub
+
+Private Function RunToolCallsInternal(ByVal jsonString As String, ByVal interactive As Boolean, _
+    Optional ByVal automationMode As Boolean = False, Optional ByVal runId As String = "") As Boolean
     On Error GoTo ErrorHandler
 
     Dim toolCalls As Collection
     Dim errors As String
     Dim s As Object
+    Dim startedAt As Date
+    Dim startTimer As Single
+    Dim mode As String
+    Dim outcomes As New Collection
+    Dim totalCount As Long
+    Dim appliedCount As Long
+    Dim skippedCount As Long
+    Dim failedCount As Long
+    Dim resultJson As String
+    Dim reportPath As String
+    Dim nonInteractiveReport As String
+    Dim restoreScreenUpdating As Boolean
+    Dim performanceMode As Boolean
+
+    startedAt = Now
+    startTimer = Timer
+    mode = IIf(interactive, "interactive", "apply_all")
+    If Len(Trim$(runId)) = 0 Then runId = GenerateRunId()
+
     If Not ParseV4ToolCalls(jsonString, toolCalls, errors) Then
-        MsgBox "V4 validation failed:" & vbCrLf & errors, vbCritical, "Invalid V4 Tool Calls"
+        reportPath = ""
+        resultJson = BuildRunResultJson(runId, False, mode, 0, 0, 0, 0, errors, outcomes, startedAt, ElapsedMilliseconds(startTimer), reportPath)
+        reportPath = WriteRunResultReport(runId, resultJson)
+        resultJson = BuildRunResultJson(runId, False, mode, 0, 0, 0, 0, errors, outcomes, startedAt, ElapsedMilliseconds(startTimer), reportPath)
+        Call StoreLastRunResult(runId, resultJson, reportPath)
+        If Not automationMode Then
+            MsgBox "V4 validation failed:" & vbCrLf & errors, vbCritical, "Invalid V4 Tool Calls"
+        End If
+        RunToolCallsInternal = False
         Exit Function
     End If
 
     ClearDocumentStructureMap
-    BuildDocumentStructureMap ActiveDocument
+    If Not interactive Then
+        restoreScreenUpdating = Application.ScreenUpdating
+        Application.ScreenUpdating = False
+        performanceMode = True
+    End If
 
     Dim suggestions As New Collection
     Dim callObj As Object
     For Each callObj In toolCalls
         suggestions.Add ConvertToolCallToSuggestion(callObj)
     Next callObj
+    totalCount = suggestions.Count
 
     If interactive Then
-        Dim accepted As Long
-        Dim skipped As Long
-        Dim failed As Long
         Dim idx As Long
         Dim action As String
         idx = 1
@@ -7002,7 +8194,8 @@ Private Function RunToolCallsInternal(ByVal jsonString As String, ByVal interact
             Set tRange = ResolveTargetToRange(GetSuggestionText(s, "target", ""))
             If Not tRange Is Nothing Then
                 If IsToolCallNoOp(toolCalls(idx), tRange) Then
-                    skipped = skipped + 1
+                    skippedCount = skippedCount + 1
+                    AddOutcome outcomes, idx, s, "skipped", "NO_OP", "No change required; formatting/text already matches."
                     idx = idx + 1
                     GoTo NextLoop
                 End If
@@ -7011,50 +8204,164 @@ Private Function RunToolCallsInternal(ByVal jsonString As String, ByVal interact
             action = ShowSuggestionPreviewV4(s, idx, suggestions.Count)
             Select Case UCase$(action)
                 Case "ACCEPT"
-                    If ProcessSuggestionV4(s) Then accepted = accepted + 1 Else failed = failed + 1
+                    If ProcessSuggestionV4(s) Then
+                        appliedCount = appliedCount + 1
+                        AddOutcome outcomes, idx, s, "applied", "", ""
+                    Else
+                        failedCount = failedCount + 1
+                        AddOutcome outcomes, idx, s, "failed", g_LastActionErrorCode, g_LastActionErrorMessage
+                    End If
                 Case "REJECT", "SKIP"
-                    skipped = skipped + 1
+                    skippedCount = skippedCount + 1
+                    AddOutcome outcomes, idx, s, "skipped", "USER_SKIPPED", "Skipped during interactive review."
                 Case "ACCEPT_ALL"
                     Dim j As Long
                     For j = idx To suggestions.Count
-                        If ProcessSuggestionV4(suggestions(j)) Then accepted = accepted + 1 Else failed = failed + 1
+                        If ProcessSuggestionV4(suggestions(j)) Then
+                            appliedCount = appliedCount + 1
+                            AddOutcome outcomes, j, suggestions(j), "applied", "", ""
+                        Else
+                            failedCount = failedCount + 1
+                            AddOutcome outcomes, j, suggestions(j), "failed", g_LastActionErrorCode, g_LastActionErrorMessage
+                        End If
                     Next j
                     idx = suggestions.Count + 1
                     GoTo NextLoop
                 Case "STOP"
-                    skipped = skipped + (suggestions.Count - idx + 1)
+                    Dim k As Long
+                    For k = idx To suggestions.Count
+                        skippedCount = skippedCount + 1
+                        AddOutcome outcomes, k, suggestions(k), "skipped", "USER_STOPPED", "Stopped interactive review."
+                    Next k
                     Exit Do
                 Case Else
-                    skipped = skipped + 1
+                    skippedCount = skippedCount + 1
+                    AddOutcome outcomes, idx, s, "skipped", "USER_SKIPPED", "Skipped during interactive review."
             End Select
             idx = idx + 1
 NextLoop:
         Loop
-
-        MsgBox "V4 Interactive Review Complete" & vbCrLf & vbCrLf & _
-               "Applied: " & accepted & vbCrLf & _
-               "Skipped: " & skipped & vbCrLf & _
-               "Failed: " & failed, vbInformation, "V4 Complete"
     Else
-        Dim okCount As Long
-        Dim failCount As Long
+        Dim failureDetails As String
+        Dim failureLimit As Long
+        Dim loggedFailures As Long
+        Dim callIndex As Long
+
+        failureLimit = 10
+        loggedFailures = 0
+        failureDetails = ""
+        callIndex = 0
+
+        ' --- NEW: PRE-FLIGHT RESOLUTION PASS ---
+        ' Resolve all targets to Word Range objects BEFORE making any edits.
+        ' This prevents the "Shifting Sand" problem where early edits misalign later targets.
+        Dim preflightRange As Range
+        Dim targetRefStr As String
+        Dim preflightIndex As Long
+        
+        TraceLog "--- STARTING PRE-FLIGHT TARGET RESOLUTION ---"
+        preflightIndex = 0
         For Each s In suggestions
-            If ProcessSuggestionV4(s) Then
-                okCount = okCount + 1
+            preflightIndex = preflightIndex + 1
+            targetRefStr = GetSuggestionText(s, "target", "")
+            Set preflightRange = ResolveTargetToRange(targetRefStr)
+            
+            If Not preflightRange Is Nothing Then
+                ' Store the successfully anchored Range object into the JSON dictionary
+                ' so ProcessSuggestionV4 can use it directly later.
+                s.Add "pre_resolved_range", preflightRange
+                TraceLog "  -> Pre-resolved: " & targetRefStr
             Else
-                failCount = failCount + 1
+                TraceLog "  -> FAILED to pre-resolve: " & targetRefStr
+            End If
+            If preflightIndex Mod APPLY_PREFLIGHT_PROGRESS_INTERVAL = 0 Then DoEvents
+        Next s
+        TraceLog "--- PRE-FLIGHT COMPLETE ---"
+
+        ' --- ORIGINAL APPLY PASS ---
+        For Each s In suggestions
+            callIndex = callIndex + 1
+            If ProcessSuggestionV4(s) Then
+                appliedCount = appliedCount + 1
+                AddOutcome outcomes, callIndex, s, "applied", "", ""
+            Else
+                failedCount = failedCount + 1
+                If loggedFailures < failureLimit Then
+                    failureDetails = failureDetails & "  - " & DescribeToolFailure(s) & vbCrLf
+                End If
+                loggedFailures = loggedFailures + 1
+                AddOutcome outcomes, callIndex, s, "failed", g_LastActionErrorCode, g_LastActionErrorMessage
             End If
         Next s
-        MsgBox "V4 Apply Complete" & vbCrLf & vbCrLf & _
-               "Applied: " & okCount & vbCrLf & _
-               "Failed: " & failCount, vbInformation, "V4 Complete"
+
+        nonInteractiveReport = "V4 Apply Complete" & vbCrLf & vbCrLf & _
+                               "Applied: " & appliedCount & vbCrLf & _
+                               "Failed: " & failedCount
+        If failedCount > 0 Then
+            If Len(failureDetails) > 0 Then
+                nonInteractiveReport = nonInteractiveReport & vbCrLf & vbCrLf & "Failed entries:" & vbCrLf & failureDetails
+            End If
+            If loggedFailures > failureLimit Then
+                nonInteractiveReport = nonInteractiveReport & "  ... and " & (loggedFailures - failureLimit) & " more failures." & vbCrLf
+            End If
+            nonInteractiveReport = nonInteractiveReport & vbCrLf & vbCrLf & _
+                "Manual follow-up required:" & vbCrLf & _
+                "- Review the failed tool_calls in your JSON input." & vbCrLf & _
+                "- Use the DSM target IDs plus the tooling.manual_fallback guidance to locate each paragraph/table." & vbCrLf & _
+                "- Apply the fixes manually in Word or adjust the JSON and rerun V4_ApplyToolCalls."
+        End If
     End If
 
-    RunToolCallsInternal = True
+    RunToolCallsInternal = (failedCount = 0)
+
+    reportPath = ""
+    resultJson = BuildRunResultJson(runId, RunToolCallsInternal, mode, totalCount, appliedCount, skippedCount, failedCount, "", outcomes, startedAt, ElapsedMilliseconds(startTimer), reportPath)
+    reportPath = WriteRunResultReport(runId, resultJson)
+    resultJson = BuildRunResultJson(runId, RunToolCallsInternal, mode, totalCount, appliedCount, skippedCount, failedCount, "", outcomes, startedAt, ElapsedMilliseconds(startTimer), reportPath)
+    Call StoreLastRunResult(runId, resultJson, reportPath)
+
+    If Not automationMode Then
+        If interactive Then
+            MsgBox "V4 Interactive Review Complete" & vbCrLf & vbCrLf & _
+                   "Applied: " & appliedCount & vbCrLf & _
+                   "Skipped: " & skippedCount & vbCrLf & _
+                   "Failed: " & failedCount, vbInformation, "V4 Complete"
+        Else
+            MsgBox nonInteractiveReport, vbInformation, "V4 Complete"
+        End If
+    End If
+
+    If performanceMode Then
+        On Error Resume Next
+        Application.ScreenUpdating = restoreScreenUpdating
+        Err.Clear
+        On Error GoTo 0
+    End If
+
     Exit Function
 
 ErrorHandler:
-    MsgBox "Error in V4 processing: " & Err.Description, vbCritical, "V4 Error"
+    Dim errSuggestion As Object
+    Dim runtimeErr As String
+    runtimeErr = Err.Description
+    If performanceMode Then
+        On Error Resume Next
+        Application.ScreenUpdating = restoreScreenUpdating
+        Err.Clear
+    End If
+    On Error Resume Next
+    Set errSuggestion = CreateObject("Scripting.Dictionary")
+    errSuggestion("tool_name") = "<runtime>"
+    errSuggestion("target") = "<runtime>"
+    AddOutcome outcomes, 0, errSuggestion, "failed", "EXECUTION_ERROR", runtimeErr
+    reportPath = ""
+    resultJson = BuildRunResultJson(runId, False, mode, totalCount, appliedCount, skippedCount, failedCount + 1, runtimeErr, outcomes, startedAt, ElapsedMilliseconds(startTimer), reportPath)
+    reportPath = WriteRunResultReport(runId, resultJson)
+    resultJson = BuildRunResultJson(runId, False, mode, totalCount, appliedCount, skippedCount, failedCount + 1, runtimeErr, outcomes, startedAt, ElapsedMilliseconds(startTimer), reportPath)
+    Call StoreLastRunResult(runId, resultJson, reportPath)
+    If Not automationMode Then
+        MsgBox "Error in V4 processing: " & runtimeErr, vbCritical, "V4 Error"
+    End If
     RunToolCallsInternal = False
 End Function
 
@@ -7073,7 +8380,7 @@ Public Sub V4_GenerateDocumentMap()
     End If
 
     Dim mapJson As String
-    mapJson = ExportStructureMapAsJsonV41()
+    mapJson = ExportStructureMapAsJsonV42()
 
     Dim dataObj As Object
     Set dataObj = CreateObject("new:{1C3B4210-F441-11CE-B9EA-00AA006B1A69}")
@@ -7113,7 +8420,20 @@ Public Function V4_ValidateToolCallsJsonText(ByVal jsonString As String, Optiona
 End Function
 
 Public Function V4_ProcessToolCallsJson(ByVal jsonString As String, ByVal interactive As Boolean) As Boolean
-    V4_ProcessToolCallsJson = RunToolCallsInternal(jsonString, interactive)
+    V4_ProcessToolCallsJson = RunToolCallsInternal(jsonString, interactive, True)
+End Function
+
+Public Function V4_ProcessToolCallsJsonEx(ByVal jsonString As String, Optional ByVal interactive As Boolean = False, Optional ByVal runId As String = "") As String
+    Call RunToolCallsInternal(jsonString, interactive, True, runId)
+    V4_ProcessToolCallsJsonEx = g_LastRunResultJson
+End Function
+
+Public Function V4_GetLastRunResultJson() As String
+    V4_GetLastRunResultJson = g_LastRunResultJson
+End Function
+
+Public Function V4_GetLastRunReportPath() As String
+    V4_GetLastRunReportPath = g_LastRunReportPath
 End Function
 
 Public Sub V4_ApplyToolCalls()
@@ -7146,9 +8466,9 @@ End Sub
 ' enabling automated review via Claude Code's report-checking skill.
 '
 ' Exchange folder: %TEMP%\claude_review\
-' Export file:     {doc_stem}_dsm.json        (document structure map)
+' Export files:    {doc_stem}_dsm.md / {doc_stem}_dsm.json
 ' Import file:     {doc_stem}_toolcalls.json  (LLM-generated tool calls)
-' Backup file:     {doc_stem}_backup.docx     (pre-review safety copy)
+' Backup file:     {doc_stem}_backup_YYYYMMDD_HHMMSS.docx (pre-review safety copy)
 
 Private Function GetClaudeReviewFolder() As String
     ' Returns the temp exchange folder path, creating it if needed.
@@ -7172,78 +8492,111 @@ Private Function GetDocStem() As String
     End If
 End Function
 
-Public Sub V4_ExportDocumentMapToFile()
-    ' Exports the DSM as JSON to %TEMP%\claude_review\{stem}_dsm.json
-    ' Also copies to clipboard for convenience.
+Private Function GetTimestampSlug() As String
+    GetTimestampSlug = Format(Now, "yyyymmdd_hhnnss")
+End Function
+
+Public Function V4_ExportDocumentMapToFileEx(Optional ByVal copyToClipboard As Boolean = True, Optional ByVal showMessages As Boolean = False) As String
+    ' Exports DSM markdown + JSON to %TEMP%\claude_review\ and returns the markdown path.
     On Error GoTo ErrorHandler
 
-    ' Verify we have a saved document (not a new unsaved doc)
     If ActiveDocument.Path = "" Then
-        MsgBox "Please save the document first.", vbExclamation, "V4 Export"
-        Exit Sub
+        If showMessages Then MsgBox "Please save the document first.", vbExclamation, "V4 Export"
+        V4_ExportDocumentMapToFileEx = ""
+        Exit Function
     End If
 
     ClearDocumentStructureMap
     BuildDocumentStructureMap ActiveDocument
     If g_DocumentMapCount = 0 Then
-        MsgBox "Document is empty or map generation failed.", vbExclamation, "V4 Export"
-        Exit Sub
+        If showMessages Then MsgBox "Document is empty or map generation failed.", vbExclamation, "V4 Export"
+        V4_ExportDocumentMapToFileEx = ""
+        Exit Function
     End If
 
+    Dim markdown As String
     Dim mapJson As String
-    mapJson = ExportStructureMapAsJsonV41()
+    markdown = ExportStructureMapAsMarkdown()
+    mapJson = ExportStructureMapAsJsonV42()
 
-    ' Write to file
-    Dim filePath As String
-    filePath = GetClaudeReviewFolder() & GetDocStem() & "_dsm.json"
+    Dim markdownPath As String
+    Dim jsonPath As String
+    markdownPath = GetClaudeReviewFolder() & GetDocStem() & "_dsm.md"
+    jsonPath = GetClaudeReviewFolder() & GetDocStem() & "_dsm.json"
 
     Dim fileNum As Integer
+
     fileNum = FreeFile
-    Open filePath For Output As #fileNum
+    Open markdownPath For Output As #fileNum
+    Print #fileNum, markdown
+    Close #fileNum
+
+    fileNum = FreeFile
+    Open jsonPath For Output As #fileNum
     Print #fileNum, mapJson
     Close #fileNum
 
-    ' Also copy to clipboard
-    Dim dataObj As Object
-    Set dataObj = CreateObject("new:{1C3B4210-F441-11CE-B9EA-00AA006B1A69}")
-    dataObj.SetText mapJson
-    dataObj.PutInClipboard
+    If copyToClipboard Then
+        Dim dataObj As Object
+        Set dataObj = CreateObject("new:{1C3B4210-F441-11CE-B9EA-00AA006B1A69}")
+        dataObj.SetText markdown
+        dataObj.PutInClipboard
+    End If
 
-    MsgBox "V4 document map exported." & vbCrLf & _
-           "File: " & filePath & vbCrLf & _
-           "Elements: " & g_DocumentMapCount & vbCrLf & _
-           "(Also copied to clipboard)", vbInformation, "V4 Export Ready"
-    Exit Sub
+    V4_ExportDocumentMapToFileEx = markdownPath
+
+    If showMessages Then
+        MsgBox "V4 document map exported." & vbCrLf & _
+               "Markdown: " & markdownPath & vbCrLf & _
+               "JSON: " & jsonPath & vbCrLf & _
+               "Elements: " & g_DocumentMapCount & vbCrLf & _
+               IIf(copyToClipboard, "(Also copied to clipboard)", ""), vbInformation, "V4 Export Ready"
+    End If
+    Exit Function
 
 ErrorHandler:
-    MsgBox "Error exporting V4 document map: " & Err.Description, vbCritical, "V4 Export Error"
+    If showMessages Then MsgBox "Error exporting V4 document map: " & Err.Description, vbCritical, "V4 Export Error"
+    V4_ExportDocumentMapToFileEx = ""
+End Function
+
+Public Sub V4_ExportDocumentMapToFile()
+    Call V4_ExportDocumentMapToFileEx(True, True)
 End Sub
 
-Public Sub V4_ImportAndApplyToolCalls()
-    ' Reads tool_calls JSON from %TEMP%\claude_review\{stem}_toolcalls.json
-    ' Creates a backup of the document, enables tracked changes, then applies.
+Public Function V4_ImportAndApplyToolCallsEx(Optional ByVal interactive As Boolean = False, _
+    Optional ByVal runId As String = "", Optional ByVal showMessages As Boolean = False) As String
+    ' Reads tool_calls JSON from %TEMP%\claude_review\{stem}_toolcalls.json and returns run result JSON.
     On Error GoTo ErrorHandler
 
     If ActiveDocument.Path = "" Then
-        MsgBox "Please save the document first.", vbExclamation, "V4 Import"
-        Exit Sub
+        If showMessages Then MsgBox "Please save the document first.", vbExclamation, "V4 Import"
+        V4_ImportAndApplyToolCallsEx = ""
+        Exit Function
     End If
 
-    ' Check tool_calls file exists
     Dim toolCallsPath As String
     toolCallsPath = GetClaudeReviewFolder() & GetDocStem() & "_toolcalls.json"
     If Dir(toolCallsPath) = "" Then
-        MsgBox "Tool calls file not found:" & vbCrLf & toolCallsPath, vbExclamation, "V4 Import"
-        Exit Sub
+        If showMessages Then MsgBox "Tool calls file not found:" & vbCrLf & toolCallsPath, vbExclamation, "V4 Import"
+        V4_ImportAndApplyToolCallsEx = ""
+        Exit Function
     End If
 
-    ' Create backup before applying any changes
     Dim backupPath As String
-    backupPath = GetClaudeReviewFolder() & GetDocStem() & "_backup.docx"
-    ActiveDocument.SaveAs2 FileName:=ActiveDocument.FullName  ' Save current state first
-    FileCopy ActiveDocument.FullName, backupPath
+    backupPath = GetClaudeReviewFolder() & GetDocStem() & "_backup_" & GetTimestampSlug() & ".docx"
+    ActiveDocument.Save ' Save current state first
+    
+    ' Safely copy the file using FileSystemObject to avoid Word/Cloud sync locks (Error 70)
+    On Error Resume Next
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    fso.CopyFile ActiveDocument.FullName, backupPath, True
+    If Err.Number <> 0 Then
+        Debug.Print "Warning: Could not create backup file. " & Err.Description
+        Err.Clear ' Clear the error so it doesn't stop the import
+    End If
+    On Error GoTo ErrorHandler ' Restore standard error handling
 
-    ' Read tool_calls JSON from file
     Dim fileNum As Integer
     Dim jsonString As String
     Dim fileLine As String
@@ -7255,35 +8608,41 @@ Public Sub V4_ImportAndApplyToolCalls()
     Loop
     Close #fileNum
 
-    ' Enable tracked changes
     Dim previousTrackState As Boolean
     previousTrackState = ActiveDocument.TrackRevisions
     ActiveDocument.TrackRevisions = True
 
-    ' Confirm with user
-    Dim msg As String
-    msg = "Ready to apply tool calls from:" & vbCrLf & toolCallsPath & vbCrLf & vbCrLf & _
-          "Backup saved to:" & vbCrLf & backupPath & vbCrLf & vbCrLf & _
-          "Tracked changes: ON" & vbCrLf & vbCrLf & _
-          "Run interactive review (Yes) or apply all (No)?"
-    Dim result As VbMsgBoxResult
-    result = MsgBox(msg, vbYesNoCancel + vbQuestion, "V4 Import & Apply")
+    If showMessages Then
+        Dim msg As String
+        msg = "Ready to apply tool calls from:" & vbCrLf & toolCallsPath & vbCrLf & vbCrLf & _
+              "Backup saved to:" & vbCrLf & backupPath & vbCrLf & vbCrLf & _
+              "Tracked changes: ON" & vbCrLf & vbCrLf & _
+              "Run interactive review (Yes) or apply all (No)?"
+        Dim result As VbMsgBoxResult
+        result = MsgBox(msg, vbYesNoCancel + vbQuestion, "V4 Import & Apply")
 
-    If result = vbCancel Then
-        ActiveDocument.TrackRevisions = previousTrackState
-        Exit Sub
+        If result = vbCancel Then
+            ActiveDocument.TrackRevisions = previousTrackState
+            V4_ImportAndApplyToolCallsEx = ""
+            Exit Function
+        End If
+        interactive = (result = vbYes)
     End If
 
-    ' Apply: Yes = interactive, No = apply all
-    Dim interactive As Boolean
-    interactive = (result = vbYes)
-    Call RunToolCallsInternal(jsonString, interactive)
+    Call RunToolCallsInternal(jsonString, interactive, (Not showMessages), runId)
+    V4_ImportAndApplyToolCallsEx = g_LastRunResultJson
 
-    ' Note: tracked changes left ON deliberately so user can review
-    MsgBox "Review complete. Tracked changes are ON." & vbCrLf & _
-           "Backup at: " & backupPath, vbInformation, "V4 Import Done"
-    Exit Sub
+    If showMessages Then
+        MsgBox "Review complete. Tracked changes are ON." & vbCrLf & _
+               "Backup at: " & backupPath, vbInformation, "V4 Import Done"
+    End If
+    Exit Function
 
 ErrorHandler:
-    MsgBox "Error importing tool calls: " & Err.Description, vbCritical, "V4 Import Error"
+    If showMessages Then MsgBox "Error importing tool calls: " & Err.Description, vbCritical, "V4 Import Error"
+    V4_ImportAndApplyToolCallsEx = ""
+End Function
+
+Public Sub V4_ImportAndApplyToolCalls()
+    Call V4_ImportAndApplyToolCallsEx(False, "", True)
 End Sub

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nAdd V5 reviewer agent and update VBA/DSM components\n\nIntroduces reviewer_agent.py orchestrator for SEARCH/REPLACE workflow,\nupdates extract_dsm.py, prompt.txt, and VBA macro/docs for V4.1+ tool calls.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")"
+    ]
+  }
+}
