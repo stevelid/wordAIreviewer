@@ -90,6 +90,7 @@ ID_TAG_PATTERN = re.compile(
     re.IGNORECASE,
 )
 COMMENT_PATTERN = re.compile(r"\[COMMENT:\s*(.*?)\s*\]", re.IGNORECASE | re.DOTALL)
+COMMENT_WITH_SPACER_PATTERN = re.compile(r"[ \t]?\[COMMENT:\s*(.*?)\s*\]", re.IGNORECASE | re.DOTALL)
 
 
 def normalize_newlines(text):
@@ -276,7 +277,7 @@ def convert_row_block(search_row, replace_row, block_index, warnings):
             comment_text = comment_match.group(1).strip()
             if comment_text:
                 tool_calls.append(make_add_comment_call(left_id, comment_text))
-            replace_text = COMMENT_PATTERN.sub("", replace_text)
+            replace_text = COMMENT_WITH_SPACER_PATTERN.sub("", replace_text)
 
         if find_text != replace_text:
             tool_calls.append(make_replace_text_call(left_id, find_text, replace_text, block_index))
@@ -304,7 +305,7 @@ def convert_generic_block(search_text, replace_text, block_index, warnings):
         comment_text = comment_match.group(1).strip()
         if comment_text:
             tool_calls.append(make_add_comment_call(target, comment_text))
-        replace_value = COMMENT_PATTERN.sub("", replace_value)
+        replace_value = COMMENT_WITH_SPACER_PATTERN.sub("", replace_value)
 
     if find_text != replace_value and find_text.strip():
         tool_calls.append(make_replace_text_call(target, find_text, replace_value, block_index))
