@@ -165,7 +165,7 @@ def extract_targets(text):
 
 def strip_id_tags(text):
     cleaned = ID_TAG_PATTERN.sub("", text)
-    return cleaned.strip()
+    return cleaned
 
 
 def is_markdown_separator_line(line):
@@ -268,15 +268,15 @@ def convert_row_block(search_row, replace_row, block_index, warnings):
         if not is_cell_target(left_id):
             continue
 
-        find_text = left.get("text", "").strip()
-        replace_text = right.get("text", "").strip()
+        find_text = left.get("text", "")
+        replace_text = right.get("text", "")
 
         comment_match = COMMENT_PATTERN.search(replace_text)
         if comment_match:
             comment_text = comment_match.group(1).strip()
             if comment_text:
                 tool_calls.append(make_add_comment_call(left_id, comment_text))
-            replace_text = COMMENT_PATTERN.sub("", replace_text).strip()
+            replace_text = COMMENT_PATTERN.sub("", replace_text)
 
         if find_text != replace_text:
             tool_calls.append(make_replace_text_call(left_id, find_text, replace_text, block_index))
@@ -304,9 +304,9 @@ def convert_generic_block(search_text, replace_text, block_index, warnings):
         comment_text = comment_match.group(1).strip()
         if comment_text:
             tool_calls.append(make_add_comment_call(target, comment_text))
-        replace_value = COMMENT_PATTERN.sub("", replace_value).strip()
+        replace_value = COMMENT_PATTERN.sub("", replace_value)
 
-    if find_text != replace_value and find_text:
+    if find_text != replace_value and find_text.strip():
         tool_calls.append(make_replace_text_call(target, find_text, replace_value, block_index))
     elif not find_text and not tool_calls:
         warnings.append(f"Block {block_index}: empty find text after stripping IDs; skipped.")
