@@ -8286,6 +8286,29 @@ NextLoop:
                 AddOutcome outcomes, callIndex, s, "applied", "", ""
             Else
                 failedCount = failedCount + 1
+
+                ' Insert a comment at the target so the failed edit is visible in-document
+                If HasDictionaryKey(s, "pre_resolved_range") Then
+                    Dim failRange As Range
+                    Set failRange = s("pre_resolved_range")
+                    If Not failRange Is Nothing Then
+                        Dim failNote As String
+                        failNote = "[AI Review - Edit Not Applied]" & vbCrLf & _
+                                   "Reason: " & g_LastActionErrorMessage & vbCrLf & _
+                                   "Intended: " & Left$(GetSuggestionText(s, "replace", "(no replacement text)"), 500)
+
+                        Dim failExplanation As String
+                        failExplanation = GetSuggestionText(s, "explanation", "")
+                        If Len(failExplanation) > 0 Then
+                            failNote = failNote & vbCrLf & "Note: " & failExplanation
+                        End If
+
+                        On Error Resume Next
+                        ExecuteCommentActionV4 failRange, failNote
+                        On Error GoTo ErrorHandler
+                    End If
+                End If
+
                 If loggedFailures < failureLimit Then
                     failureDetails = failureDetails & "  - " & DescribeToolFailure(s) & vbCrLf
                 End If
@@ -8646,3 +8669,13 @@ End Function
 Public Sub V4_ImportAndApplyToolCalls()
     Call V4_ImportAndApplyToolCallsEx(False, "", True)
 End Sub
+
+Public Function V4_ExportDocumentMapSilent() As String
+    ' COM-safe export: no message boxes, no clipboard, returns markdown path or empty string.
+    V4_ExportDocumentMapSilent = V4_ExportDocumentMapToFileEx(copyToClipboard:=False, showMessages:=False)
+End Function
+
+Public Function V4_ImportAndApplyToolCallsSilent(Optional ByVal runId As String = "") As String
+    ' COM-safe import+apply: no message boxes, non-interactive, returns run result JSON or empty string.
+    V4_ImportAndApplyToolCallsSilent = V4_ImportAndApplyToolCallsEx(interactive:=False, runId:=runId, showMessages:=False)
+End Function

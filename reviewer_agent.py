@@ -7,76 +7,98 @@ import subprocess
 import sys
 import tempfile
 import threading
+from datetime import datetime
 from pathlib import Path
 
 
-DEFAULT_SYSTEM_PROMPT = """You are an expert Acoustic Engineering Reviewer. Your task is to review the provided acoustic report draft (formatted as Annotated Markdown) and make corrections for technical accuracy, clarity, standards compliance, and professional tone.
+DEFAULT_SYSTEM_PROMPT = """You are operating inside the Venta Acoustics V5 markdown-diff review pipeline.
 
-# EDITING FORMAT: SEARCH/REPLACE BLOCKS
-You must output ALL your proposed changes using strict SEARCH/REPLACE blocks.
+GOAL
+Review the provided DSM markdown acoustic report and propose only concrete, high-value edits for technical accuracy, compliance, clarity, consistency, and professional wording.
 
-To change text, you must output a block formatted exactly like this:
+APPROACH
+First, read the entire document to understand its scope, methodology, and conclusions.
+Then, identify only the issues that meet the QUALITY BAR below.
+Finally, output SEARCH/REPLACE blocks for those issues only.
+Do not edit content you are uncertain about — use [COMMENT: ...] to flag queries instead.
+
+REVIEW PRIORITIES (in order)
+1. Technical accuracy: incorrect values, wrong standards references, calculation errors, misapplied criteria.
+2. Regulatory compliance: BS4142/BS8233 methodology, correct terminology, appropriate assessment language.
+3. Internal consistency: values in text matching values in tables, cross-references, repeated information agreeing.
+4. Measured language: replace definitive claims with appropriately cautious professional wording (e.g. "is expected to" rather than "will").
+5. Clarity and grammar: only where meaning is affected or professionalism is undermined.
+Do NOT make changes that are purely stylistic preference. Every edit must have a clear technical or professional justification.
+
+INPUT FORMAT
+- Paragraphs are tagged like `[P12]`.
+- Table cells are tagged like `[T2.H.C1]` or `[T2.R3.C2]`.
+- These IDs are the deterministic coordinates used by the importer.
+
+OUTPUT FORMAT (STRICT)
+- Output ONLY SEARCH/REPLACE blocks, or `NO_CHANGES` if there are no edits.
+- Do not output JSON.
+- Do not output bullets, commentary, headings, fences, or explanations outside blocks.
+
+Canonical block format:
 <<<<<<< SEARCH
-[Exact original text to be replaced, including any [ID] tags]
+[exact original text with ID tags]
 =======
-[New modified text, keeping the [ID] tags intact]
+[revised text with the same ID tags]
 >>>>>>> REPLACE
 
-## CRITICAL RULES FOR SEARCH/REPLACE BLOCKS:
-1. THE SEARCH BLOCK MUST BE EXACT: The text inside the `<<<<<<< SEARCH` section must be a literal, character-for-character copy of the original text from the document. Do not omit punctuation or spacing.
-2. ALWAYS INCLUDE ID TAGS: You must include the `[P#]` or `[T#.R#.C#]` coordinate tags in BOTH the SEARCH and REPLACE blocks. The system relies on these tags to locate the edits.
-3. NO LAZY EDITS: Never use placeholders like "..." or "/* rest of paragraph */". You must write out the entire modified paragraph or row in the REPLACE block.
-4. KEEP EDITS ATOMIC: Do not bundle multiple distant paragraphs into a single block. Use a separate SEARCH/REPLACE block for each specific paragraph or table row you are editing.
+MANDATORY RULES
+1. Exact SEARCH match: SEARCH content must be copied character-for-character from the source markdown.
+2. Keep IDs intact: include valid IDs in both SEARCH and REPLACE blocks.
+3. Atomic edits: one local change per block; do not bundle distant content.
+4. No placeholders: never use ellipses or abbreviated snippets.
+5. Preserve scope: edit only the minimum text needed to resolve the issue.
+6. No fabricated targets: never invent IDs or edit content that is not present.
+7. Table safety: do not replace entire tables; edit only the specific row/cell content.
+8. Formatting tags allowed only when needed: `<b>`, `<i>`, `<sub>`, `<sup>`.
+9. Comments (optional): for clarification queries, append `[COMMENT: ...]` in REPLACE.
+10. If nothing needs changing, output exactly `NO_CHANGES`.
 
-## HANDLING TABLES
-You will see tables annotated with cell coordinates, like `| [T2.R1.C2] 55 |`.
-- NEVER attempt to redraw, reformat, or replace an entire table.
-- To edit table data, you must target the specific row or specific cell using a SEARCH/REPLACE block.
-
-Example of a correct table edit:
+TABLE EDIT EXAMPLE
 <<<<<<< SEARCH
 | [T2.R3.C1] Pos 3 | [T2.R3.C2] 61 | [T2.R3.C3] High wind |
 =======
 | [T2.R3.C1] Pos 3 | [T2.R3.C2] 58 | [T2.R3.C3] High wind |
 >>>>>>> REPLACE
 
-## INLINE FORMATTING
-You may use basic HTML tags `<b>`, `<i>`, `<sub>`, and `<sup>` in your REPLACE blocks to apply formatting.
-Example: `[T1.R1.C1] 55 dB L<sub>Aeq, T</sub>`
-
-## ADDING COMMENTS
-If you need to ask the author a question, request clarification, or explain a complex change, you can attach a comment to a paragraph or cell.
-Do this by appending `[COMMENT: Your message]` inside the REPLACE block.
-
-For paragraphs, put it at the end of the text:
+PARAGRAPH + COMMENT EXAMPLE
 <<<<<<< SEARCH
 [P15] The measurments was taken at 2:00 AM.
 =======
 [P15] The acoustic measurements were taken at 02:00. [COMMENT: Please confirm this was 02:00 and not 14:00.]
 >>>>>>> REPLACE
 
-For tables, put the comment INSIDE the specific cell's pipe delimiters:
-<<<<<<< SEARCH
-| [T1.R2.C2] 85 |
-=======
-| [T1.R2.C2] 85 [COMMENT: This exceeds the threshold.] |
->>>>>>> REPLACE
+QUALITY BAR
+- Every edit must serve one of the REVIEW PRIORITIES above.
+- Prioritise issues that materially affect technical validity, compliance, or interpretation.
+- Avoid stylistic churn and unnecessary rewrites.
+- When correcting tone, prefer measured language: "is expected to", "is predicted to", "may be considered" over definitive claims.
+- If unsure whether a value or statement is correct, use [COMMENT: ...] to query rather than changing it.
+- Maintain neutral, factual, professional tone throughout."""
 
-Review the document below and output your recommended SEARCH/REPLACE blocks."""
 
-
-def load_system_prompt():
-    """Loads prompt.txt from this script directory; falls back to default prompt."""
-    prompt_path = Path(__file__).resolve().parent / "prompt.txt"
+def load_prompt(prompt_name: str) -> str:
+    """Load a named prompt from prompt_{name}.txt with legacy fallback."""
+    prompt_path = Path(__file__).resolve().parent / f"prompt_{prompt_name}.txt"
     if prompt_path.exists():
         prompt_text = read_text_file(prompt_path).strip()
         if prompt_text:
             return prompt_text
+    legacy_path = Path(__file__).resolve().parent / "prompt.txt"
+    if legacy_path.exists():
+        legacy_text = read_text_file(legacy_path).strip()
+        if legacy_text:
+            return legacy_text
     return DEFAULT_SYSTEM_PROMPT
 
 
 BLOCK_PATTERN = re.compile(
-    r"<<<<<<< SEARCH\s*\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE",
+    r"<{5,7}\s*SEARCH\s*\n(.*?)\n={5,7}\s*\n(.*?)\n>{5,7}\s*REPLACE",
     re.DOTALL,
 )
 BRACKET_PATTERN = re.compile(r"\[([^\]]+)\]")
@@ -91,10 +113,19 @@ ID_TAG_PATTERN = re.compile(
 )
 COMMENT_PATTERN = re.compile(r"\[COMMENT:\s*(.*?)\s*\]", re.IGNORECASE | re.DOTALL)
 COMMENT_WITH_SPACER_PATTERN = re.compile(r"[ \t]?\[COMMENT:\s*(.*?)\s*\]", re.IGNORECASE | re.DOTALL)
+PLAN_LINE_PATTERN = re.compile(
+    r"^\d+\.\s*\[([^\]]+)\]\s*(ACCURACY|COMPLIANCE|CONSISTENCY|LANGUAGE|CLARITY)\s*[—–-]\s*(.+)$",
+    re.IGNORECASE,
+)
 
 
 def normalize_newlines(text):
     return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def normalize_whitespace(text: str) -> str:
+    """Collapse runs of whitespace for comparison purposes."""
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def get_temp_dir(custom_temp_dir):
@@ -279,7 +310,7 @@ def convert_row_block(search_row, replace_row, block_index, warnings):
                 tool_calls.append(make_add_comment_call(left_id, comment_text))
             replace_text = COMMENT_WITH_SPACER_PATTERN.sub("", replace_text)
 
-        if find_text != replace_text:
+        if normalize_whitespace(find_text) != normalize_whitespace(replace_text):
             tool_calls.append(make_replace_text_call(left_id, find_text, replace_text, block_index))
 
     return tool_calls
@@ -307,8 +338,10 @@ def convert_generic_block(search_text, replace_text, block_index, warnings):
             tool_calls.append(make_add_comment_call(target, comment_text))
         replace_value = COMMENT_WITH_SPACER_PATTERN.sub("", replace_value)
 
-    if find_text != replace_value and find_text.strip():
+    if normalize_whitespace(find_text) != normalize_whitespace(replace_value) and find_text.strip():
         tool_calls.append(make_replace_text_call(target, find_text, replace_value, block_index))
+    elif find_text.strip() and normalize_whitespace(find_text) == normalize_whitespace(replace_value):
+        warnings.append(f"Block {block_index}: only whitespace differences after stripping IDs; skipped.")
     elif not find_text and not tool_calls:
         warnings.append(f"Block {block_index}: empty find text after stripping IDs; skipped.")
 
@@ -320,8 +353,40 @@ def parse_search_replace_blocks(llm_output):
     return list(BLOCK_PATTERN.finditer(text))
 
 
+def parse_plan(plan_text):
+    """Parse pass-1 PLAN output into structured items.
+
+    Returns None for NO_ISSUES or unparseable/empty plans.
+    """
+    cleaned = plan_text.strip()
+    if cleaned.upper() == "NO_ISSUES":
+        return None
+
+    lines = normalize_newlines(cleaned).split("\n")
+    items = []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.upper() == "PLAN":
+            continue
+        match = PLAN_LINE_PATTERN.match(line)
+        if match:
+            items.append(
+                {
+                    "target": match.group(1).strip(),
+                    "category": match.group(2).upper(),
+                    "description": match.group(3).strip(),
+                }
+            )
+    return items if items else None
+
+
 def build_tool_calls_from_response(llm_output):
-    matches = parse_search_replace_blocks(llm_output)
+    # Strip code fences that models sometimes wrap around the entire response
+    cleaned = normalize_newlines(llm_output.strip())
+    cleaned = re.sub(r"^```\w*\s*\n", "", cleaned)
+    cleaned = re.sub(r"\n```\s*$", "", cleaned)
+
+    matches = parse_search_replace_blocks(cleaned)
     warnings = []
     tool_calls = []
 
@@ -399,16 +464,11 @@ def run_cmd(cmd, input_text, cwd, stream_output=False):
     return returncode, "".join(stdout_chunks), "".join(stderr_chunks)
 
 
-def run_codex(markdown_text, model, cwd):
+def run_codex(input_text, model, cwd, system_prompt):
     if shutil.which("codex") is None:
         raise RuntimeError("codex CLI not found on PATH.")
 
-    system_prompt = load_system_prompt()
-    prompt = (
-        f"{system_prompt}\n\n"
-        "The document to review is below. Output only SEARCH/REPLACE blocks.\n\n"
-        f"{markdown_text}"
-    )
+    prompt = f"{system_prompt}\n\n{input_text}"
 
     with tempfile.NamedTemporaryFile(prefix="codex_last_", suffix=".txt", delete=False) as tmp:
         last_message_path = Path(tmp.name)
@@ -434,11 +494,10 @@ def run_codex(markdown_text, model, cwd):
             last_message_path.unlink()
 
 
-def run_claude(markdown_text, model, cwd):
+def run_claude(input_text, model, cwd, system_prompt):
     if shutil.which("claude") is None:
         raise RuntimeError("claude CLI not found on PATH.")
 
-    system_prompt = load_system_prompt()
     cmd = [
         "claude",
         "-p",
@@ -450,7 +509,7 @@ def run_claude(markdown_text, model, cwd):
     if model:
         cmd.extend(["--model", model])
 
-    code, stdout, stderr = run_cmd(cmd, markdown_text, cwd, stream_output=True)
+    code, stdout, stderr = run_cmd(cmd, input_text, cwd, stream_output=True)
     if code != 0:
         raise RuntimeError(f"claude -p failed ({code}): {stderr.strip() or stdout.strip()}")
     if stdout.strip():
@@ -458,13 +517,13 @@ def run_claude(markdown_text, model, cwd):
     raise RuntimeError("claude returned no output.")
 
 
-def run_llm(markdown_text, runner, model, cwd):
+def call_runner(input_text, runner, model, cwd, system_prompt):
     runner = runner.lower()
     errors = []
 
     if runner in ("auto", "codex"):
         try:
-            return run_codex(markdown_text, model, cwd), "codex"
+            return run_codex(input_text, model, cwd, system_prompt), "codex"
         except Exception as exc:
             errors.append(f"codex: {exc}")
             if runner == "codex":
@@ -472,7 +531,7 @@ def run_llm(markdown_text, runner, model, cwd):
 
     if runner in ("auto", "claude"):
         try:
-            return run_claude(markdown_text, model, cwd), "claude"
+            return run_claude(input_text, model, cwd, system_prompt), "claude"
         except Exception as exc:
             errors.append(f"claude: {exc}")
             if runner == "claude":
@@ -481,6 +540,35 @@ def run_llm(markdown_text, runner, model, cwd):
     if errors:
         raise RuntimeError(" ; ".join(errors))
     raise RuntimeError(f"Unsupported runner: {runner}")
+
+
+def run_llm_two_pass(markdown_text, runner, model, cwd, temp_dir, stem):
+    """Run the two-pass LLM review: plan first, execute second."""
+    plan_prompt = load_prompt("plan")
+    print("  Pass 1/2: Generating review plan...")
+    plan_output, used_runner = call_runner(markdown_text, runner, model, cwd, plan_prompt)
+
+    plan_path = temp_dir / f"{stem}_plan.txt"
+    write_text_file(plan_path, plan_output)
+    print(f"  Plan saved: {plan_path}")
+
+    plan_items = parse_plan(plan_output)
+    if plan_items is None:
+        print("  Plan result: NO_ISSUES (skipping pass 2)")
+        return "NO_CHANGES", used_runner
+
+    print(f"  Plan result: {len(plan_items)} issues identified")
+
+    execute_prompt = load_prompt("execute")
+    plan_section = "\n\n---\nPLAN (address these issues only):\n"
+    for item in plan_items:
+        plan_section += f"- [{item['target']}] {item['category']} — {item['description']}\n"
+
+    execute_input = markdown_text + plan_section
+
+    print("  Pass 2/2: Generating SEARCH/REPLACE blocks...")
+    execute_output, used_runner = call_runner(execute_input, runner, model, cwd, execute_prompt)
+    return execute_output, used_runner
 
 
 def parse_args():
@@ -501,6 +589,11 @@ def parse_args():
         "--manual-paste",
         action="store_true",
         help="Read LLM output from stdin until EOF and parse it (manual mode).",
+    )
+    parser.add_argument(
+        "--single-pass",
+        action="store_true",
+        help="Use single-pass combined prompt instead of two-pass plan/execute flow (auto mode only).",
     )
     parser.add_argument("--raw-output", default="", help="Optional path for raw LLM response output.")
     parser.add_argument("--toolcalls-out", default="", help="Optional path for output toolcalls JSON.")
@@ -547,8 +640,17 @@ def main():
             if not llm_output.strip():
                 raise RuntimeError("No input received on stdin for --manual-paste.")
         else:
-            print(f"[2/4] Running local LLM via runner='{args.runner}'...")
-            llm_output, used_runner = run_llm(markdown_text, args.runner, args.model.strip(), dsm_path.parent)
+            if args.single_pass:
+                print(f"[2/4] Running single-pass LLM review via runner='{args.runner}'...")
+                manual_prompt = load_prompt("manual")
+                llm_output, used_runner = call_runner(
+                    markdown_text, args.runner, args.model.strip(), dsm_path.parent, manual_prompt
+                )
+            else:
+                print(f"[2/4] Running two-pass LLM review via runner='{args.runner}'...")
+                llm_output, used_runner = run_llm_two_pass(
+                    markdown_text, args.runner, args.model.strip(), dsm_path.parent, temp_dir, stem
+                )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -570,6 +672,26 @@ def main():
         print(f"ERROR: failed writing tool calls file: {exc}", file=sys.stderr)
         return 1
 
+    # Write failure report if there were any warnings
+    failures_path = temp_dir / f"{stem}_failures.txt"
+    if warnings:
+        failure_lines = [
+            f"V5 Parse Failures for: {stem}",
+            f"Generated: {datetime.now().isoformat()}",
+            f"Blocks parsed: {block_count}",
+            f"Tool calls generated: {len(tool_calls)}",
+            f"Warnings: {len(warnings)}",
+            "",
+        ]
+        for i, warning in enumerate(warnings, start=1):
+            failure_lines.append(f"{i}. {warning}")
+        failure_lines.append("")
+        write_text_file(failures_path, "\n".join(failure_lines))
+        print(f"Failure report: {failures_path}")
+    elif failures_path.exists():
+        # Clean up old failure report if this run had no warnings
+        failures_path.unlink()
+
     mode_label = "manual" if manual_mode else f"runner:{used_runner}"
     print(f"Mode: {mode_label}")
     print(f"DSM markdown: {dsm_path}")
@@ -577,6 +699,7 @@ def main():
     print(f"Tool calls generated: {len(tool_calls)}")
     print(f"Raw output: {raw_output_path}")
     print(f"Tool calls JSON: {toolcalls_path}")
+    print(f"Failure report: {failures_path if warnings else '(none)'}")
 
     if warnings:
         print("Warnings:")
