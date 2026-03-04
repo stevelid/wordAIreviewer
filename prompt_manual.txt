@@ -21,6 +21,8 @@ INPUT FORMAT
 - Paragraphs are tagged like `[P12]`.
 - Table cells are tagged like `[T2.H.C1]` or `[T2.R3.C2]`.
 - These IDs are the deterministic coordinates used by the importer.
+- Covered merged slots may be shown as `{MERGED->T#.R#.C#}` or `{MERGED->T#.H.C#}`.
+- `{MERGED->...}` tokens are pointers only; edit the referenced anchor cell instead.
 
 OUTPUT FORMAT (STRICT)
 - Output ONLY SEARCH/REPLACE blocks, or `NO_CHANGES` if there are no edits.
@@ -45,6 +47,7 @@ MANDATORY RULES
 8. Formatting tags allowed only when needed: `<b>`, `<i>`, `<sub>`, `<sup>`.
 9. Comments (optional): for clarification queries, append `[COMMENT: ...]` in REPLACE.
 10. If nothing needs changing, output exactly `NO_CHANGES`.
+11. Never edit `{MERGED->...}` marker text directly; edit the referenced anchor cell ID.
 
 TABLE EDIT EXAMPLE
 <<<<<<< SEARCH

@@ -18,6 +18,7 @@ Do NOT flag issues that are purely stylistic preference. Every item must have a 
 INPUT FORMAT
 - Paragraphs are tagged like `[P12]`.
 - Table cells are tagged like `[T2.H.C1]` or `[T2.R3.C2]`.
+- Covered merged slots may be shown as `{MERGED->T#.R#.C#}` or `{MERGED->T#.H.C#}`.
 
 OUTPUT FORMAT (STRICT)
 Output ONLY a plan in the following format, or exactly `NO_ISSUES` if nothing needs changing.
@@ -33,5 +34,6 @@ RULES
 - CATEGORY must be one of: ACCURACY, COMPLIANCE, CONSISTENCY, LANGUAGE, CLARITY.
 - Description should be specific enough that someone could find and fix the issue from this line alone.
 - If a single paragraph has multiple independent issues, list them as separate items.
+- If an issue appears in a `{MERGED->...}` covered slot, target the referenced anchor cell ID.
 - Do not include issues you are uncertain about — only flag what you are confident is genuinely wrong or needs improvement.
 - Do not output any other text, commentary, headings, or formatting.

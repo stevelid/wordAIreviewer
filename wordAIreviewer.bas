@@ -53,6 +53,8 @@
     Private Const DSM_TABLE_CELL_PREVIEW_MAX_CHARS As Long = 99999
     Private Const DSM_INCLUDE_TABLE_CELL_TAGGED_TEXT As Boolean = False
     Private Const DSM_INCLUDE_TABLE_CELL_FORMAT_SPANS As Boolean = False
+    Private Const DSM_MERGED_SLOT_PREFIX As String = "{MERGED->"
+    Private Const DSM_MERGED_SLOT_SUFFIX As String = "}"
     ' Performance tuning for long-running loops/logging.
     Private Const VERBOSE_TRACE_LOGGING As Boolean = False
     Private Const DSM_PARAGRAPH_PROGRESS_INTERVAL As Long = 100
@@ -954,6 +956,7 @@ Private Sub BuildDocumentStructureMap(ByVal doc As Document)
     Dim styleStr As String
     Dim textPrev As String
     Dim paraIdx As Long
+    Dim dsmParaIdx As Long
     Dim tblIdx As Long
     Dim inTable As Boolean
     Dim totalParagraphs As Long
@@ -977,6 +980,7 @@ Private Sub BuildDocumentStructureMap(ByVal doc As Document)
     
     ' Map paragraphs
     paraIdx = 0
+    dsmParaIdx = 0
     For Each para In doc.Paragraphs
         paraIdx = paraIdx + 1
 
@@ -990,12 +994,16 @@ Private Sub BuildDocumentStructureMap(ByVal doc As Document)
         If (Not INCLUDE_TABLE_PARAGRAPHS_IN_DSM) And inTable Then
             GoTo ContinueParagraphLoop
         End If
+        If IsRangeInTOC(paraRange) Then
+            GoTo ContinueParagraphLoop
+        End If
 
         idx = idx + 1
+        dsmParaIdx = dsmParaIdx + 1
         EnsureDocumentMapCapacity idx
         
         With g_DocumentMap(idx)
-            .ElementID = "P" & paraIdx
+            .ElementID = "P" & dsmParaIdx
             .ElementType = "paragraph"
             
             ' Get style name
@@ -1090,7 +1098,7 @@ ContinueParagraphLoop:
     SortDocumentMapByStartPos
     g_DocumentMapBuilt = True
     
-    Debug.Print "  -> Structure map built: " & paraIdx & " paragraphs, " & tblIdx & " tables"
+    Debug.Print "  -> Structure map built: " & dsmParaIdx & " paragraphs, " & tblIdx & " tables"
     Exit Sub
     
 ErrorHandler:
@@ -1203,16 +1211,33 @@ Private Function ResolveBodyParagraphRange(ByVal paragraphNum As Long) As Range
     On Error GoTo Fail
 
     Dim para As Paragraph
+    Dim paraRange As Range
+    Dim eligibleParagraphNum As Long
 
     If paragraphNum <= 0 Then GoTo Fail
-    If paragraphNum > ActiveDocument.Paragraphs.Count Then GoTo Fail
 
-    Set para = ActiveDocument.Paragraphs(paragraphNum)
-    If para Is Nothing Then GoTo Fail
+    eligibleParagraphNum = 0
+    For Each para In ActiveDocument.Paragraphs
+        Set paraRange = para.Range
 
-    If (Not INCLUDE_TABLE_PARAGRAPHS_IN_DSM) And para.Range.Information(wdWithinTable) Then GoTo Fail
+        If (Not INCLUDE_TABLE_PARAGRAPHS_IN_DSM) And paraRange.Information(wdWithinTable) Then
+            GoTo ContinueLoop
+        End If
 
-    Set ResolveBodyParagraphRange = para.Range.Duplicate
+        If IsRangeInTOC(paraRange) Then
+            GoTo ContinueLoop
+        End If
+
+        eligibleParagraphNum = eligibleParagraphNum + 1
+        If eligibleParagraphNum = paragraphNum Then
+            Set ResolveBodyParagraphRange = paraRange.Duplicate
+            Exit Function
+        End If
+
+ContinueLoop:
+    Next para
+
+    GoTo Fail
     Exit Function
 
 Fail:
@@ -1377,6 +1402,215 @@ Private Function EscapeMarkdownCellPreview(ByVal cellValue As String) As String
     EscapeMarkdownCellPreview = normalized
 End Function
 
+Private Function BuildTableRowColKey(ByVal rowNum As Long, ByVal colNum As Long) As String
+    BuildTableRowColKey = CStr(rowNum) & ":" & CStr(colNum)
+End Function
+
+Private Sub ParseTableRowColKey(ByVal key As String, ByRef rowNum As Long, ByRef colNum As Long)
+    On Error GoTo Fail
+
+    Dim parts() As String
+    rowNum = 0
+    colNum = 0
+    parts = Split(key, ":")
+    If UBound(parts) >= 1 Then
+        rowNum = CLng(Val(parts(0)))
+        colNum = CLng(Val(parts(1)))
+    End If
+    Exit Sub
+
+Fail:
+    rowNum = 0
+    colNum = 0
+End Sub
+
+Private Function BuildTableCellTargetID(ByVal tableID As String, ByVal rowNum As Long, ByVal colNum As Long, Optional ByVal forceRowToken As Boolean = False) As String
+    If rowNum = 1 And (Not forceRowToken) Then
+        BuildTableCellTargetID = tableID & ".H.C" & colNum
+    Else
+        BuildTableCellTargetID = tableID & ".R" & rowNum & ".C" & colNum
+    End If
+End Function
+
+Private Function BuildMergedSlotMarker(ByVal anchorTarget As String) As String
+    BuildMergedSlotMarker = DSM_MERGED_SLOT_PREFIX & anchorTarget & DSM_MERGED_SLOT_SUFFIX
+End Function
+
+Private Function IsMergedSlotMarker(ByVal value As String) As Boolean
+    Dim trimmedValue As String
+
+    trimmedValue = Trim$(value)
+    IsMergedSlotMarker = (Left$(trimmedValue, Len(DSM_MERGED_SLOT_PREFIX)) = DSM_MERGED_SLOT_PREFIX And _
+        Right$(trimmedValue, Len(DSM_MERGED_SLOT_SUFFIX)) = DSM_MERGED_SLOT_SUFFIX)
+End Function
+
+Private Function BuildTableSlotAnchorMap(ByVal tbl As Table, ByRef slotAnchorLookup As Object, ByRef anchorSpanLookup As Object, ByRef actualRows As Long, ByRef actualCols As Long) As Boolean
+    On Error GoTo Fail
+
+    Set slotAnchorLookup = NewDictionary()
+    Set anchorSpanLookup = NewDictionary()
+
+    actualRows = GetSafeTableRowCount(tbl)
+    actualCols = GetSafeTableColCount(tbl)
+
+    If actualRows <= 0 Or actualCols <= 0 Then
+        BuildTableSlotAnchorMap = False
+        Exit Function
+    End If
+
+    Dim minRowByAnchor As Object
+    Dim maxRowByAnchor As Object
+    Dim minColByAnchor As Object
+    Dim maxColByAnchor As Object
+    Set minRowByAnchor = NewDictionary()
+    Set maxRowByAnchor = NewDictionary()
+    Set minColByAnchor = NewDictionary()
+    Set maxColByAnchor = NewDictionary()
+
+    Dim r As Long
+    Dim c As Long
+    For r = 1 To actualRows
+        For c = 1 To actualCols
+            Dim resolvedCell As Cell
+            If TryGetTableCell(tbl, r, c, resolvedCell) Then
+                Dim slotKey As String
+                Dim anchorKey As String
+                slotKey = BuildTableRowColKey(r, c)
+                anchorKey = BuildTableRowColKey(resolvedCell.RowIndex, resolvedCell.ColumnIndex)
+
+                If slotAnchorLookup.Exists(slotKey) Then
+                    slotAnchorLookup(slotKey) = anchorKey
+                Else
+                    slotAnchorLookup.Add slotKey, anchorKey
+                End If
+
+                If Not minRowByAnchor.Exists(anchorKey) Then
+                    minRowByAnchor.Add anchorKey, r
+                    maxRowByAnchor.Add anchorKey, r
+                    minColByAnchor.Add anchorKey, c
+                    maxColByAnchor.Add anchorKey, c
+                Else
+                    If CLng(minRowByAnchor(anchorKey)) > r Then minRowByAnchor(anchorKey) = r
+                    If CLng(maxRowByAnchor(anchorKey)) < r Then maxRowByAnchor(anchorKey) = r
+                    If CLng(minColByAnchor(anchorKey)) > c Then minColByAnchor(anchorKey) = c
+                    If CLng(maxColByAnchor(anchorKey)) < c Then maxColByAnchor(anchorKey) = c
+                End If
+            End If
+        Next c
+
+        If r Mod 20 = 0 Then DoEvents
+    Next r
+
+    Dim anchorKeyVar As Variant
+    For Each anchorKeyVar In minRowByAnchor.Keys
+        Dim rowSpan As Long
+        Dim colSpan As Long
+        rowSpan = CLng(maxRowByAnchor(anchorKeyVar)) - CLng(minRowByAnchor(anchorKeyVar)) + 1
+        colSpan = CLng(maxColByAnchor(anchorKeyVar)) - CLng(minColByAnchor(anchorKeyVar)) + 1
+        anchorSpanLookup.Add CStr(anchorKeyVar), CStr(rowSpan) & "x" & CStr(colSpan)
+    Next anchorKeyVar
+
+    BuildTableSlotAnchorMap = True
+    Exit Function
+
+Fail:
+    Set slotAnchorLookup = Nothing
+    Set anchorSpanLookup = Nothing
+    actualRows = 0
+    actualCols = 0
+    BuildTableSlotAnchorMap = False
+End Function
+
+Private Function GetAnchorSpanForKey(ByVal anchorSpanLookup As Object, ByVal anchorKey As String) As String
+    On Error GoTo Fail
+
+    If Not anchorSpanLookup Is Nothing Then
+        If anchorSpanLookup.Exists(anchorKey) Then
+            GetAnchorSpanForKey = CStr(anchorSpanLookup(anchorKey))
+            Exit Function
+        End If
+    End If
+
+Fail:
+    GetAnchorSpanForKey = "1x1"
+End Function
+
+Private Sub ParseTableSpanToken(ByVal spanToken As String, ByRef rowSpan As Long, ByRef colSpan As Long)
+    On Error GoTo Fail
+
+    Dim parts() As String
+    rowSpan = 1
+    colSpan = 1
+
+    parts = Split(LCase$(Trim$(spanToken)), "x")
+    If UBound(parts) >= 1 Then
+        rowSpan = CLng(Val(parts(0)))
+        colSpan = CLng(Val(parts(1)))
+    End If
+
+    If rowSpan <= 0 Then rowSpan = 1
+    If colSpan <= 0 Then colSpan = 1
+    Exit Sub
+
+Fail:
+    rowSpan = 1
+    colSpan = 1
+End Sub
+
+Private Function BuildTableSlotPreviewValue(ByVal tableID As String, ByVal rowNum As Long, ByVal colNum As Long, ByVal anchorTextLookup As Object, ByVal slotAnchorLookup As Object) As String
+    On Error GoTo Fail
+
+    Dim slotKey As String
+    slotKey = BuildTableRowColKey(rowNum, colNum)
+
+    If slotAnchorLookup Is Nothing Then
+        BuildTableSlotPreviewValue = ""
+        Exit Function
+    End If
+
+    If Not slotAnchorLookup.Exists(slotKey) Then
+        If Not anchorTextLookup Is Nothing Then
+            If anchorTextLookup.Exists(slotKey) Then
+                BuildTableSlotPreviewValue = CStr(anchorTextLookup(slotKey))
+            Else
+                BuildTableSlotPreviewValue = ""
+            End If
+        Else
+            BuildTableSlotPreviewValue = ""
+        End If
+        Exit Function
+    End If
+
+    Dim anchorKey As String
+    anchorKey = CStr(slotAnchorLookup(slotKey))
+
+    If StrComp(anchorKey, slotKey, vbBinaryCompare) = 0 Then
+        If Not anchorTextLookup Is Nothing Then
+            If anchorTextLookup.Exists(anchorKey) Then
+                BuildTableSlotPreviewValue = CStr(anchorTextLookup(anchorKey))
+            Else
+                BuildTableSlotPreviewValue = ""
+            End If
+        Else
+            BuildTableSlotPreviewValue = ""
+        End If
+        Exit Function
+    End If
+
+    Dim anchorRow As Long
+    Dim anchorCol As Long
+    ParseTableRowColKey anchorKey, anchorRow, anchorCol
+    If anchorRow > 0 And anchorCol > 0 Then
+        BuildTableSlotPreviewValue = BuildMergedSlotMarker(BuildTableCellTargetID(tableID, anchorRow, anchorCol))
+    Else
+        BuildTableSlotPreviewValue = ""
+    End If
+    Exit Function
+
+Fail:
+    BuildTableSlotPreviewValue = ""
+End Function
+
 Private Function ExportTableContentPreview(ByVal tableID As String) As String
     ' Exports table content in markdown format for preview
     ' Uses bounded previews to keep DSM generation responsive on large tables.
@@ -1392,10 +1626,16 @@ Private Function ExportTableContentPreview(ByVal tableID As String) As String
     Dim maxCols As Long
     Dim actualRows As Long
     Dim actualCols As Long
-    Dim cellLookup As Object
+    Dim anchorTextLookup As Object
+    Dim slotAnchorLookup As Object
+    Dim anchorSpanLookup As Object
     Dim tblCell As Cell
-    Dim lookupKey As String
+    Dim anchorKey As String
     Dim cellCounter As Long
+    Dim slotMapBuilt As Boolean
+    Dim cellTarget As String
+    Dim mergedSlotCount As Long
+    Dim tableKey As Variant
     
     ' Find the table
     Set tbl = ResolveTableByID(tableID)
@@ -1404,19 +1644,26 @@ Private Function ExportTableContentPreview(ByVal tableID As String) As String
         Exit Function
     End If
     
-    Set cellLookup = NewDictionary()
+    Set anchorTextLookup = NewDictionary()
     cellCounter = 0
     For Each tblCell In tbl.Range.Cells
-        lookupKey = CStr(tblCell.RowIndex) & ":" & CStr(tblCell.ColumnIndex)
-        If Not cellLookup.Exists(lookupKey) Then
-            cellLookup.Add lookupKey, EscapeMarkdownCellPreview(LimitPreviewText(GetCellTextFinalView(tblCell), DSM_TABLE_CELL_PREVIEW_MAX_CHARS))
+        anchorKey = BuildTableRowColKey(tblCell.RowIndex, tblCell.ColumnIndex)
+        If Not anchorTextLookup.Exists(anchorKey) Then
+            anchorTextLookup.Add anchorKey, EscapeMarkdownCellPreview(LimitPreviewText(GetCellTextFinalView(tblCell), DSM_TABLE_CELL_PREVIEW_MAX_CHARS))
         End If
         cellCounter = cellCounter + 1
         If cellCounter Mod 100 = 0 Then DoEvents
     Next tblCell
 
-    actualRows = GetSafeTableRowCount(tbl)
-    actualCols = GetSafeTableColCount(tbl)
+    slotMapBuilt = BuildTableSlotAnchorMap(tbl, slotAnchorLookup, anchorSpanLookup, actualRows, actualCols)
+    If Not slotMapBuilt Then
+        actualRows = GetSafeTableRowCount(tbl)
+        actualCols = GetSafeTableColCount(tbl)
+        Set slotAnchorLookup = NewDictionary()
+        For Each tableKey In anchorTextLookup.Keys
+            slotAnchorLookup.Add CStr(tableKey), CStr(tableKey)
+        Next tableKey
+    End If
 
     maxRows = actualRows
     If maxRows > DSM_TABLE_PREVIEW_MAX_ROWS Then maxRows = DSM_TABLE_PREVIEW_MAX_ROWS
@@ -1429,15 +1676,13 @@ Private Function ExportTableContentPreview(ByVal tableID As String) As String
         Exit Function
     End If
 
+    mergedSlotCount = 0
     output = "|"
     For c = 1 To maxCols
-        lookupKey = "1:" & CStr(c)
-        If cellLookup.Exists(lookupKey) Then
-            cellText = CStr(cellLookup(lookupKey))
-        Else
-            cellText = ""
-        End If
-        output = output & " [" & tableID & ".H.C" & c & "] " & cellText & " |"
+        cellTarget = BuildTableCellTargetID(tableID, 1, c)
+        cellText = BuildTableSlotPreviewValue(tableID, 1, c, anchorTextLookup, slotAnchorLookup)
+        If IsMergedSlotMarker(cellText) Then mergedSlotCount = mergedSlotCount + 1
+        output = output & " [" & cellTarget & "] " & cellText & " |"
     Next c
     output = output & vbCrLf & "|"
     For c = 1 To maxCols
@@ -1448,13 +1693,10 @@ Private Function ExportTableContentPreview(ByVal tableID As String) As String
     For r = 2 To maxRows
         output = output & "|"
         For c = 1 To maxCols
-            lookupKey = CStr(r) & ":" & CStr(c)
-            If cellLookup.Exists(lookupKey) Then
-                cellText = CStr(cellLookup(lookupKey))
-            Else
-                cellText = ""
-            End If
-            output = output & " [" & tableID & ".R" & r & ".C" & c & "] " & cellText & " |"
+            cellTarget = BuildTableCellTargetID(tableID, r, c)
+            cellText = BuildTableSlotPreviewValue(tableID, r, c, anchorTextLookup, slotAnchorLookup)
+            If IsMergedSlotMarker(cellText) Then mergedSlotCount = mergedSlotCount + 1
+            output = output & " [" & cellTarget & "] " & cellText & " |"
         Next c
         output = output & vbCrLf
         If r Mod 10 = 0 Then DoEvents
@@ -1462,6 +1704,9 @@ Private Function ExportTableContentPreview(ByVal tableID As String) As String
     
     If actualRows > maxRows Or actualCols > maxCols Then
         output = output & "(Preview truncated to " & maxRows & " rows x " & maxCols & " columns)" & vbCrLf
+    End If
+    If mergedSlotCount > 0 Then
+        output = output & "(Merged slots are shown as {MERGED->target}; edit the anchor target only.)" & vbCrLf
     End If
     
     ExportTableContentPreview = output
@@ -1660,6 +1905,9 @@ Private Function ResolveTargetToRange(ByVal targetRef As String) As Range
                     If ref.ColNum > 0 And ref.ColNum <= colCount Then
                         Dim targetCell As Cell
                         If TryGetTableCell(tbl, ref.RowNum, ref.ColNum, targetCell) Then
+                            If targetCell.RowIndex <> ref.RowNum Or targetCell.ColumnIndex <> ref.ColNum Then
+                                TraceLog "Resolved merged slot " & targetRef & " to anchor T" & ref.TableNum & ".R" & targetCell.RowIndex & ".C" & targetCell.ColumnIndex
+                            End If
                             Dim cellRange As Range
                             Set cellRange = GetCellContentRange(targetCell)
                             If Not cellRange Is Nothing Then
@@ -2424,9 +2672,26 @@ Private Function ShowSuggestionPreviewV4(ByVal suggestion As Object, ByVal index
         targetRange.HighlightColorIndex = wdYellow
     End If
     
-    ' Show form and wait for user action
-    previewForm.Show vbModal
-    
+    ' Show form modeless so the user can keep editing the document.
+    previewForm.Show vbModeless
+
+    ' Wait for user action while yielding control to Word.
+    Dim waitCounter As Long
+    waitCounter = 0
+    Do While previewForm.UserAction = ""
+        DoEvents
+        waitCounter = waitCounter + 1
+        If waitCounter Mod 100 = 0 Then Sleep 10
+        If waitCounter > WAIT_LOOP_SAFETY_LIMIT Then
+            Debug.Print "    -> SAFETY EXIT: Wait loop timeout in ShowSuggestionPreviewV4"
+            ShowSuggestionPreviewV4 = "SKIP"
+            On Error Resume Next
+            Unload previewForm
+            On Error GoTo ErrorHandler
+            Exit Function
+        End If
+    Loop
+
     ' Get user action
     ShowSuggestionPreviewV4 = previewForm.UserAction
     
@@ -7654,6 +7919,7 @@ Private Function BuildToolingDocumentationJson() As String
         "Always anchor targets using DSM IDs from the elements array; never rely on searching raw text.", _
         "Confine replacements to the resolved paragraph or cell to avoid accidental edits elsewhere.", _
         "Paragraph IDs refer to body paragraphs; table cell text should be targeted with T#.R#.C# references.", _
+        "Merged-table covered slots may appear as {MERGED->T#.R#.C#}; treat these as pointers and edit the anchor cell target.", _
         "Favour table-specific tools (replace_table, insert_table_row, delete_table_row) for structured data changes.", _
         "Add comments when recommending manual review steps or when data is missing.", _
         "Keep tool calls atomic—one logical change per entry." _
@@ -7730,6 +7996,7 @@ Private Function ExportStructureMapAsJsonV42() As String
             Dim tbl As Table
             Set tbl = ResolveTableByID(elem.ElementID)
             Dim cellsJson As String
+            Dim mergeSlotsJson As String
             Dim cellFinalText As String
             Dim tableCell As Cell
             Dim cellRange As Range
@@ -7738,9 +8005,24 @@ Private Function ExportStructureMapAsJsonV42() As String
             Dim cellSpans As String
             Dim cellTaggedAll As String
             Dim cellSpansAll As String
+            Dim slotAnchorLookup As Object
+            Dim anchorSpanLookup As Object
+            Dim mapRows As Long
+            Dim mapCols As Long
+            Dim spanToken As String
+            Dim spanRow As Long
+            Dim spanCol As Long
+            Dim slotRow As Long
+            Dim slotCol As Long
+            Dim slotKey As String
+            Dim mappedAnchorKey As String
+            Dim mappedAnchorRow As Long
+            Dim mappedAnchorCol As Long
 
             cellsJson = ""
+            mergeSlotsJson = ""
             If Not tbl Is Nothing Then
+                Call BuildTableSlotAnchorMap(tbl, slotAnchorLookup, anchorSpanLookup, mapRows, mapCols)
                 TraceLog "  -> Exporting " & elem.ElementID & " cells..."
                 exportedCellCount = 0
                 For Each tableCell In tbl.Range.Cells
@@ -7762,20 +8044,45 @@ Private Function ExportStructureMapAsJsonV42() As String
                             If DSM_INCLUDE_TABLE_CELL_TAGGED_TEXT Then cellTagged = cellTaggedAll
                             If DSM_INCLUDE_TABLE_CELL_FORMAT_SPANS Then cellSpans = cellSpansAll
                         End If
+
+                        spanToken = GetAnchorSpanForKey(anchorSpanLookup, BuildTableRowColKey(tableCell.RowIndex, tableCell.ColumnIndex))
+                        ParseTableSpanToken spanToken, spanRow, spanCol
+
                         cellsJson = cellsJson & IIf(Len(cellsJson) > 0, ",", "") & _
                             "{""id"":""" & elem.ElementID & ".R" & tableCell.RowIndex & ".C" & tableCell.ColumnIndex & """,""text_plain"":""" & JsonEscape(cellFinalText) & _
-                            """,""text_tagged"":""" & JsonEscape(cellTagged) & """,""format_spans"":" & cellSpans & "}"
+                            """,""text_tagged"":""" & JsonEscape(cellTagged) & """,""format_spans"":" & cellSpans & ",""rowspan"":" & spanRow & ",""colspan"":" & spanCol & "}"
                     End If
 
                     exportedCellCount = exportedCellCount + 1
                     If exportedCellCount Mod DSM_CELL_PROGRESS_INTERVAL = 0 Then DoEvents
                 Next tableCell
+
+                If Not slotAnchorLookup Is Nothing Then
+                    For slotRow = 1 To mapRows
+                        For slotCol = 1 To mapCols
+                            slotKey = BuildTableRowColKey(slotRow, slotCol)
+                            If slotAnchorLookup.Exists(slotKey) Then
+                                mappedAnchorKey = CStr(slotAnchorLookup(slotKey))
+                                If StrComp(slotKey, mappedAnchorKey, vbBinaryCompare) <> 0 Then
+                                    ParseTableRowColKey mappedAnchorKey, mappedAnchorRow, mappedAnchorCol
+                                    If mappedAnchorRow > 0 And mappedAnchorCol > 0 Then
+                                        mergeSlotsJson = mergeSlotsJson & IIf(Len(mergeSlotsJson) > 0, ",", "") & _
+                                            "{""slot_id"":""" & JsonEscape(BuildTableCellTargetID(elem.ElementID, slotRow, slotCol)) & _
+                                            """,""anchor_id"":""" & JsonEscape(BuildTableCellTargetID(elem.ElementID, mappedAnchorRow, mappedAnchorCol)) & """}"
+                                    End If
+                                End If
+                            End If
+                        Next slotCol
+
+                        If slotRow Mod 20 = 0 Then DoEvents
+                    Next slotRow
+                End If
             End If
 
             elementJson = "{""id"":""" & elem.ElementID & """,""kind"":""table"",""rows"":" & elem.TableRowCount & ",""cols"":" & elem.TableColCount & _
                           ",""range"":{""start"":" & elem.StartPos & ",""end"":" & elem.EndPos & "},""section_number"":" & elem.SectionNumber & _
                           ",""page_number"":" & elem.PageNumber & ",""title_text"":""" & JsonEscape(elem.TableTitle) & """,""caption_text"":""" & _
-                          JsonEscape(elem.TableCaption) & """,""within_table"":false,""cells"":[" & cellsJson & "]}"
+                          JsonEscape(elem.TableCaption) & """,""within_table"":false,""cells"":[" & cellsJson & "],""merge_slots"":[" & mergeSlotsJson & "]}"
         End If
 
         elementParts(i) = elementJson
@@ -8587,7 +8894,8 @@ Public Sub V4_ExportDocumentMapToFile()
 End Sub
 
 Public Function V4_ImportAndApplyToolCallsEx(Optional ByVal interactive As Boolean = False, _
-    Optional ByVal runId As String = "", Optional ByVal showMessages As Boolean = False) As String
+    Optional ByVal runId As String = "", Optional ByVal showMessages As Boolean = False, _
+    Optional ByVal saveAfterApply As Boolean = False) As String
     ' Reads tool_calls JSON from %TEMP%\claude_review\{stem}_toolcalls.json and returns run result JSON.
     On Error GoTo ErrorHandler
 
@@ -8620,16 +8928,17 @@ Public Function V4_ImportAndApplyToolCallsEx(Optional ByVal interactive As Boole
     End If
     On Error GoTo ErrorHandler ' Restore standard error handling
 
-    Dim fileNum As Integer
+    ' Read JSON as UTF-8 using ADODB.Stream to avoid ANSI corruption of non-ASCII characters.
+    Dim adStream As Object
     Dim jsonString As String
-    Dim fileLine As String
-    fileNum = FreeFile
-    Open toolCallsPath For Input As #fileNum
-    Do Until EOF(fileNum)
-        Line Input #fileNum, fileLine
-        jsonString = jsonString & fileLine & vbCrLf
-    Loop
-    Close #fileNum
+    Set adStream = CreateObject("ADODB.Stream")
+    adStream.Type = 2          ' adTypeText
+    adStream.Charset = "utf-8"
+    adStream.Open
+    adStream.LoadFromFile toolCallsPath
+    jsonString = adStream.ReadText
+    adStream.Close
+    Set adStream = Nothing
 
     Dim previousTrackState As Boolean
     previousTrackState = ActiveDocument.TrackRevisions
@@ -8653,6 +8962,17 @@ Public Function V4_ImportAndApplyToolCallsEx(Optional ByVal interactive As Boole
     End If
 
     Call RunToolCallsInternal(jsonString, interactive, (Not showMessages), runId)
+
+    If saveAfterApply Then
+        On Error Resume Next
+        ActiveDocument.Save
+        If Err.Number <> 0 Then
+            Debug.Print "Warning: Could not save document after apply. " & Err.Description
+            Err.Clear
+        End If
+        On Error GoTo ErrorHandler
+    End If
+
     V4_ImportAndApplyToolCallsEx = g_LastRunResultJson
 
     If showMessages Then
@@ -8667,8 +8987,13 @@ ErrorHandler:
 End Function
 
 Public Sub V4_ImportAndApplyToolCalls()
-    Call V4_ImportAndApplyToolCallsEx(False, "", True)
+    Call V4_ImportAndApplyToolCallsEx(interactive:=True, runId:="", showMessages:=True, saveAfterApply:=False)
 End Sub
+
+Public Sub V4_ExportDocumentMap()
+    Call V4_ExportDocumentMapToFileEx(copyToClipboard:=True, showMessages:=True)
+End Sub
+
 
 Public Function V4_ExportDocumentMapSilent() As String
     ' COM-safe export: no message boxes, no clipboard, returns markdown path or empty string.
@@ -8677,5 +9002,6 @@ End Function
 
 Public Function V4_ImportAndApplyToolCallsSilent(Optional ByVal runId As String = "") As String
     ' COM-safe import+apply: no message boxes, non-interactive, returns run result JSON or empty string.
-    V4_ImportAndApplyToolCallsSilent = V4_ImportAndApplyToolCallsEx(interactive:=False, runId:=runId, showMessages:=False)
+    V4_ImportAndApplyToolCallsSilent = V4_ImportAndApplyToolCallsEx( _
+        interactive:=False, runId:=runId, showMessages:=False, saveAfterApply:=True)
 End Function

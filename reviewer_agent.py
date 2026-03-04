@@ -34,6 +34,8 @@ INPUT FORMAT
 - Paragraphs are tagged like `[P12]`.
 - Table cells are tagged like `[T2.H.C1]` or `[T2.R3.C2]`.
 - These IDs are the deterministic coordinates used by the importer.
+- Covered merged slots may be shown as `{MERGED->T#.R#.C#}` or `{MERGED->T#.H.C#}`.
+- `{MERGED->...}` tokens are pointers only; edit the referenced anchor cell, not the covered slot.
 
 OUTPUT FORMAT (STRICT)
 - Output ONLY SEARCH/REPLACE blocks, or `NO_CHANGES` if there are no edits.
@@ -58,6 +60,7 @@ MANDATORY RULES
 8. Formatting tags allowed only when needed: `<b>`, `<i>`, `<sub>`, `<sup>`.
 9. Comments (optional): for clarification queries, append `[COMMENT: ...]` in REPLACE.
 10. If nothing needs changing, output exactly `NO_CHANGES`.
+11. Never edit `{MERGED->...}` marker text directly; edit the referenced anchor cell ID instead.
 
 TABLE EDIT EXAMPLE
 <<<<<<< SEARCH
@@ -113,6 +116,7 @@ ID_TAG_PATTERN = re.compile(
 )
 COMMENT_PATTERN = re.compile(r"\[COMMENT:\s*(.*?)\s*\]", re.IGNORECASE | re.DOTALL)
 COMMENT_WITH_SPACER_PATTERN = re.compile(r"[ \t]?\[COMMENT:\s*(.*?)\s*\]", re.IGNORECASE | re.DOTALL)
+MERGED_MARKER_PATTERN = re.compile(r"^\{MERGED->\s*([^\}]+?)\s*\}$", re.IGNORECASE)
 PLAN_LINE_PATTERN = re.compile(
     r"^\d+\.\s*\[([^\]]+)\]\s*(ACCURACY|COMPLIANCE|CONSISTENCY|LANGUAGE|CLARITY)\s*[—–-]\s*(.+)$",
     re.IGNORECASE,
@@ -209,7 +213,6 @@ def is_markdown_separator_line(line):
         return False
     return all(ch in "-:" for ch in body)
 
-
 def split_unescaped_pipes(row_body):
     return re.split(r"(?<!\\)\|", row_body)
 
@@ -231,6 +234,16 @@ def parse_markdown_row(line):
         else:
             parsed.append({"id": None, "text": cell_text.replace("\\|", "|")})
     return parsed
+
+
+def parse_merged_marker_target(text):
+    match = MERGED_MARKER_PATTERN.match(text.strip())
+    if not match:
+        return None
+    candidate = normalize_target(match.group(1))
+    if is_cell_target(candidate):
+        return candidate
+    return None
 
 
 def extract_single_data_row(block_text):
@@ -275,7 +288,6 @@ def make_add_comment_call(target, comment_text):
         "args": {"text": comment_text},
     }
 
-
 def convert_row_block(search_row, replace_row, block_index, warnings):
     search_cells = parse_markdown_row(search_row)
     replace_cells = parse_markdown_row(replace_row)
@@ -303,6 +315,14 @@ def convert_row_block(search_row, replace_row, block_index, warnings):
         find_text = left.get("text", "")
         replace_text = right.get("text", "")
 
+        merged_target = parse_merged_marker_target(find_text)
+        if merged_target:
+            if normalize_whitespace(find_text) != normalize_whitespace(replace_text):
+                warnings.append(
+                    f"Block {block_index}: row cell {idx} is a merged-slot pointer ({left_id} -> {merged_target}); edit {merged_target} instead. Change skipped."
+                )
+            continue
+
         comment_match = COMMENT_PATTERN.search(replace_text)
         if comment_match:
             comment_text = comment_match.group(1).strip()
@@ -314,7 +334,6 @@ def convert_row_block(search_row, replace_row, block_index, warnings):
             tool_calls.append(make_replace_text_call(left_id, find_text, replace_text, block_index))
 
     return tool_calls
-
 
 def convert_generic_block(search_text, replace_text, block_index, warnings):
     targets = extract_targets(search_text)
@@ -330,6 +349,14 @@ def convert_generic_block(search_text, replace_text, block_index, warnings):
     find_text = strip_id_tags(search_text)
     replace_value = strip_id_tags(replace_text)
     tool_calls = []
+
+    merged_target = parse_merged_marker_target(find_text)
+    if merged_target:
+        if normalize_whitespace(find_text) != normalize_whitespace(replace_value):
+            warnings.append(
+                f"Block {block_index}: merged-slot pointer target {target} resolves to {merged_target}; edit {merged_target} instead. Change skipped."
+            )
+        return tool_calls
 
     comment_match = COMMENT_PATTERN.search(replace_value)
     if comment_match:
@@ -401,7 +428,7 @@ def build_tool_calls_from_response(llm_output):
             row_calls = convert_row_block(search_row, replace_row, idx, warnings)
             if row_calls:
                 tool_calls.extend(row_calls)
-                continue
+            continue
 
         generic_calls = convert_generic_block(search_text, replace_text, idx, warnings)
         tool_calls.extend(generic_calls)
