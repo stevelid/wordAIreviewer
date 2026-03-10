@@ -6834,9 +6834,13 @@ Private Sub ApplyDiffOperations(ByVal targetRange As Range, _
                                 ByVal formatSegments As Collection)
     TraceLog "    [ApplyDiffOperations] Applying " & diffOps.Count & " diff operations..."
 
-    ' Track position as we modify the document
-    Dim currentPos As Long
-    currentPos = targetRange.Start
+    ' Build edits against the ORIGINAL text coordinates, then apply them from the end
+    ' back toward the start so earlier offsets do not drift while Word is tracking changes.
+    Dim plannedEdits As New Collection
+    Dim sourceOffset As Long
+    Dim finalVisibleLen As Long
+    sourceOffset = 0
+    finalVisibleLen = 0
 
     Dim op As Object
     Dim opIndex As Long
@@ -6855,28 +6859,33 @@ Private Sub ApplyDiffOperations(ByVal targetRange As Range, _
 
         Select Case opType
             Case DIFF_EQUAL
-                ' Skip over unchanged text
-                currentPos = currentPos + opLen
-                TraceLog "    [ApplyDiffOperations] EQUAL: Skipping " & opLen & " chars, now at " & currentPos
+                sourceOffset = sourceOffset + opLen
+                finalVisibleLen = finalVisibleLen + opLen
+                TraceLog "    [ApplyDiffOperations] EQUAL: Advancing source offset to " & sourceOffset
 
             Case DIFF_DELETE
-                ' Delete this text (will show as tracked deletion)
                 If opLen > 0 Then
-                    Dim delRange As Range
-                    Set delRange = ActiveDocument.Range(currentPos, currentPos + opLen)
-                    TraceLog "    [ApplyDiffOperations] DELETE: Deleting range " & currentPos & " to " & (currentPos + opLen) & " ('" & Left$(opText, 20) & "')"
-                    delRange.Delete
-                    ' Note: currentPos stays same after deletion
+                    Dim delOp As Object
+                    Set delOp = NewDictionary()
+                    delOp("Operation") = opType
+                    delOp("Start") = sourceOffset
+                    delOp("End") = sourceOffset + opLen
+                    delOp("Text") = opText
+                    plannedEdits.Add delOp
+                    TraceLog "    [ApplyDiffOperations] DELETE: Planning range " & sourceOffset & " to " & (sourceOffset + opLen) & " ('" & Left$(opText, 20) & "')"
+                    sourceOffset = sourceOffset + opLen
                 End If
 
             Case DIFF_INSERT
-                ' Insert new text (will show as tracked insertion)
                 If opLen > 0 Then
-                    Dim insRange As Range
-                    Set insRange = ActiveDocument.Range(currentPos, currentPos)
-                    TraceLog "    [ApplyDiffOperations] INSERT: Inserting at " & currentPos & " ('" & Left$(opText, 20) & "')"
-                    insRange.Text = opText
-                    currentPos = currentPos + opLen
+                    Dim insOp As Object
+                    Set insOp = NewDictionary()
+                    insOp("Operation") = opType
+                    insOp("Start") = sourceOffset
+                    insOp("Text") = opText
+                    plannedEdits.Add insOp
+                    finalVisibleLen = finalVisibleLen + opLen
+                    TraceLog "    [ApplyDiffOperations] INSERT: Planning insert at " & sourceOffset & " ('" & Left$(opText, 20) & "')"
                 End If
 
             Case Else
@@ -6884,12 +6893,31 @@ Private Sub ApplyDiffOperations(ByVal targetRange As Range, _
         End Select
     Next op
 
-    ' Apply formatting after text changes are complete
-    TraceLog "    [ApplyDiffOperations] Text changes complete. Final position: " & currentPos
+    Dim editIndex As Long
+    For editIndex = plannedEdits.Count To 1 Step -1
+        Dim editOp As Object
+        Set editOp = plannedEdits(editIndex)
+
+        Select Case CStr(editOp("Operation"))
+            Case DIFF_DELETE
+                Dim delRange As Range
+                Set delRange = ActiveDocument.Range(targetRange.Start + CLng(editOp("Start")), targetRange.Start + CLng(editOp("End")))
+                TraceLog "    [ApplyDiffOperations] DELETE: Applying range " & delRange.Start & " to " & delRange.End
+                delRange.Delete
+
+            Case DIFF_INSERT
+                Dim insRange As Range
+                Set insRange = ActiveDocument.Range(targetRange.Start + CLng(editOp("Start")), targetRange.Start + CLng(editOp("Start")))
+                TraceLog "    [ApplyDiffOperations] INSERT: Applying at " & insRange.Start & " ('" & Left$(CStr(editOp("Text")), 20) & "')"
+                insRange.Text = CStr(editOp("Text"))
+        End Select
+    Next editIndex
+
+    TraceLog "    [ApplyDiffOperations] Text changes complete. Final visible length: " & finalVisibleLen
 
     ' Determine the new range after all modifications
     Dim finalRange As Range
-    Set finalRange = ActiveDocument.Range(targetRange.Start, currentPos)
+    Set finalRange = ActiveDocument.Range(targetRange.Start, targetRange.Start + finalVisibleLen)
 
     ' Only reset font and apply formatting when explicit formatting segments exist.
     ' For plain text replacements (no segments), preserve existing document formatting.
