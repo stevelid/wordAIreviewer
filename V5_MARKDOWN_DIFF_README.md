@@ -12,15 +12,16 @@ This avoids large JSON generation directly from the model while preserving deter
 
 ## What Is Already Implemented
 - `wordAIreviewer.bas` now exports both:
-  - `%TEMP%\claude_review\{doc_stem}_dsm.md`
-  - `%TEMP%\claude_review\{doc_stem}_dsm.json`
+  - `G:\My Drive\ai-skills\projects\{job folder}\{doc_stem}_dsm.md` when job context is available
+  - `G:\My Drive\ai-skills\projects\{job folder}\{doc_stem}_dsm.json` when job context is available
+  - `%TEMP%\claude_review\...` as the legacy fallback when no project folder can be resolved
 - Paragraph lines in markdown are annotated as `[P#] ...`.
 - Table cells in markdown are annotated as `[T#.H.C#]` and `[T#.R#.C#]`.
 - Covered merged slots are annotated with pointer tokens such as `{MERGED->T2.R3.C2}` so the reviewer can edit the anchor cell deterministically.
 - `reviewer_agent.py` supports:
   - Automatic runner mode (`codex` or `claude`)
   - Manual parse mode from file or stdin paste
-  - Output to `%TEMP%\claude_review\{doc_stem}_toolcalls.json`
+  - Output beside the resolved DSM by default, or to an overridden exchange directory
   - Prompt loading from `prompt.txt` (single source of truth for LLM instructions)
 
 ## Prerequisites
@@ -31,7 +32,8 @@ This avoids large JSON generation directly from the model while preserving deter
 
 ## File Locations
 Default exchange folder:
-- `%TEMP%\claude_review\`
+- The active project folder beside the DSM, if the DSM was exported there
+- `%TEMP%\claude_review\` as legacy/default fallback for ad hoc runs
 
 Files:
 - Exported markdown DSM: `{doc_stem}_dsm.md`
@@ -46,7 +48,7 @@ In Word, run:
 - Ribbon button: `Export to AI` (if wired), or
 - Macro: `V4_ExportDocumentMapToFile`
 
-This writes `_dsm.md` and `_dsm.json` to `%TEMP%\claude_review\`.
+This writes `_dsm.md` and `_dsm.json` to the resolved LLM review exchange folder.
 
 ### 2A. Run Automatic LLM Mode
 From terminal in this repo:
@@ -66,6 +68,8 @@ python reviewer_agent.py --file 6246.260211.NIA --runner claude --model sonnet
 `--file` accepts either:
 - document stem (`6246.260211.NIA`) or
 - full path to a `_dsm.md` file.
+
+If the stem starts with a 4-digit job number, `reviewer_agent.py` now also searches `G:\My Drive\ai-skills\projects\{job}*\` before falling back to `%TEMP%\claude_review\`.
 
 ### 2B. Run Manual Mode (No API/No Auto CLI Run)
 Use this when you already have model output text from another interface.
@@ -89,7 +93,7 @@ In Word, run:
 - Ribbon button: `Import AI Review` (if wired), or
 - Macro: `V4_ImportAndApplyToolCalls`
 
-Word reads `%TEMP%\claude_review\{doc_stem}_toolcalls.json` and applies edits with tracked changes.
+Word reads `{doc_stem}_toolcalls.json` from the resolved LLM review exchange folder and applies edits with tracked changes.
 
 ## LLM Output Requirements
 The parser expects blocks like:
@@ -159,13 +163,14 @@ Key arguments:
 - `--model <name>` optional runner model override
 - `--manual-output-file <path>` manual parse from file
 - `--manual-paste` manual parse from stdin
-- `--temp-dir <path>` override exchange directory
+- `--exchange-dir <path>` override exchange directory
+- `--temp-dir <path>` legacy alias for `--exchange-dir`
 - `--raw-output <path>` override raw response output path
 - `--toolcalls-out <path>` override tool calls JSON path
 
 ## Troubleshooting
 - `DSM markdown not found`
-  - Ensure export macro ran successfully and `_dsm.md` exists in `%TEMP%\claude_review\`.
+  - Ensure export macro ran successfully and `_dsm.md` exists in the resolved exchange folder.
 - `codex CLI not found` / `claude CLI not found`
   - Install the CLI or use manual mode.
 - `Blocks parsed: 0`
@@ -173,9 +178,9 @@ Key arguments:
 - `Tool calls generated: 0`
   - Either no diffs were found, IDs were invalid/missing, or blocks were unchanged.
 - Word import says file missing
-  - Confirm `{doc_stem}_toolcalls.json` exists in `%TEMP%\claude_review\` and stem matches active doc name.
+  - Confirm `{doc_stem}_toolcalls.json` exists beside the exported DSM, or in the overridden exchange directory, and stem matches active doc name.
 
 ## Safety / Behavior Notes
 - Existing VBA apply core is unchanged (`ProcessSuggestionV4`, `ResolveTargetToRange`, granular diff).
-- Import step creates backup before apply in the same temp folder.
+- Import step creates backup before apply in the same exchange folder.
 - Keep the document saved before running export/import macros.

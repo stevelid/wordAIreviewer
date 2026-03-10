@@ -16,9 +16,11 @@ V4.2 vs V4.1 changes:
 
 Usage:
     python extract_dsm.py "path/to/report.docx"
+    python extract_dsm.py "path/to/report.docx" --output-dir "G:\\My Drive\\ai-skills\\projects\\6246 Example"
 
 Output:
-    Writes {stem}_dsm.json to %TEMP%/claude_review/
+    Writes {stem}_dsm.json to the chosen exchange directory.
+    Default remains %TEMP%/claude_review/ for backwards compatibility.
 
 Element IDs:
     P1, P2, P3... — body paragraphs only (table cell paragraphs not counted)
@@ -26,6 +28,7 @@ Element IDs:
     T1.R1.C1 etc — table cells (1-based row/col indices)
 """
 
+import argparse
 import sys
 import os
 import json
@@ -448,24 +451,33 @@ def extract_dsm(docx_path: str) -> dict:
     return dsm
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python extract_dsm.py <path_to_docx>")
-        sys.exit(1)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Extract DSM JSON from a Word document.")
+    parser.add_argument("docx_path", help="Path to the source Word document.")
+    parser.add_argument("--output-dir", default="", help="Directory to receive {stem}_dsm.json.")
+    parser.add_argument("--output", default="", help="Exact output file path for the DSM JSON.")
+    return parser.parse_args()
 
-    docx_path = sys.argv[1]
+
+def main():
+    args = parse_args()
+    docx_path = args.docx_path
     if not os.path.exists(docx_path):
         print(f"ERROR: File not found: {docx_path}")
         sys.exit(1)
-
-    output_dir = os.path.join(os.environ.get("TEMP", "/tmp"), "claude_review")
-    os.makedirs(output_dir, exist_ok=True)
 
     print(f"Extracting DSM from: {docx_path}")
     dsm = extract_dsm(docx_path)
 
     stem = Path(docx_path).stem
-    output_path = os.path.join(output_dir, f"{stem}_dsm.json")
+    if args.output:
+        output_path = Path(args.output).expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else Path(os.environ.get("TEMP", "/tmp")) / "claude_review"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{stem}_dsm.json"
+
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(dsm, f, indent=2, ensure_ascii=False)
 

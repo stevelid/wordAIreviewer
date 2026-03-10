@@ -1,13 +1,15 @@
-    ' JSON parsing constants
-    Private Const PARSE_SUCCESS As Long = 0
-    Private Const PARSE_UNEXPECTED_END_OF_INPUT As Long = 1
-    Private Const PARSE_INVALID_CHARACTER As Long = 2
-    Private Const PARSE_INVALID_JSON_TYPE As Long = 3
-    Private Const PARSE_INVALID_NUMBER As Long = 4
-    Private Const PARSE_INVALID_KEY As Long = 5
-    Private Const PARSE_INVALID_ESCAPE_CHARACTER As Long = 6
+Option Explicit
 
-    ' Feature flags
+' JSON parsing constants
+Private Const PARSE_SUCCESS As Long = 0
+Private Const PARSE_UNEXPECTED_END_OF_INPUT As Long = 1
+Private Const PARSE_INVALID_CHARACTER As Long = 2
+Private Const PARSE_INVALID_JSON_TYPE As Long = 3
+Private Const PARSE_INVALID_NUMBER As Long = 4
+Private Const PARSE_INVALID_KEY As Long = 5
+Private Const PARSE_INVALID_ESCAPE_CHARACTER As Long = 6
+
+' Feature flags
     '
     ' FEATURE FLAGS GUIDE (what they do + tradeoffs when disabling)
     '
@@ -61,6 +63,7 @@
     Private Const DSM_TABLE_PROGRESS_INTERVAL As Long = 10
     Private Const DSM_CELL_PROGRESS_INTERVAL As Long = 100
     Private Const APPLY_PREFLIGHT_PROGRESS_INTERVAL As Long = 50
+    Private Const GRANULAR_DIFF_MAX_TOKEN_MATRIX_CELLS As Long = 40000
 
     ' Diff operation type constants
 Private Const DIFF_EQUAL As String = "equal"
@@ -78,9 +81,11 @@ Private Const DIFF_DELETE As String = "delete"
         Private Declare Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
     #End If
 
-    Private p_Json As String
-    Private p_Index As Long
-    Private p_ParseError As Long
+' Customized JSON parser state. This started from VBA-JSON but is no longer a drop-in copy;
+' parser behavior here is coupled to the module's validation/import workflow.
+Private p_Json As String
+Private p_Index As Long
+Private p_ParseError As Long
 
 ' Table index for deterministic table identification
 Private Type TableIndexEntry
@@ -148,8 +153,6 @@ Private Type TargetReference
     ColNum As Long              ' For T2.R3.C2
     IsHeaderRow As Boolean      ' For T2.H.C2
 End Type
-
-Option Explicit
 
 ' VBA Module to Apply LLM Review Suggestions (Version 3 - Production)
 '
@@ -2624,6 +2627,29 @@ ErrorHandler:
     MsgBox "Error in RunInteractiveReview_V4: " & Err.Description, vbCritical, "Error"
 End Sub
 
+Private Function WaitForPreviewFormAction(ByVal previewForm As frmSuggestionPreview, ByVal contextLabel As String, Optional ByVal logProgress As Boolean = False) As String
+    Dim waitCounter As Long
+    waitCounter = 0
+
+    Do While previewForm.UserAction = ""
+        DoEvents
+        waitCounter = waitCounter + 1
+        If waitCounter Mod 100 = 0 Then Sleep 10
+        If waitCounter > WAIT_LOOP_SAFETY_LIMIT Then
+            Debug.Print "    -> SAFETY EXIT: Wait loop timeout in " & contextLabel
+            WaitForPreviewFormAction = "SKIP"
+            Exit Function
+        End If
+        If logProgress Then
+            If waitCounter Mod 10000 = 0 Then
+                Debug.Print "    -> " & contextLabel & ": Still waiting for user action (" & waitCounter & " iterations)"
+            End If
+        End If
+    Loop
+
+    WaitForPreviewFormAction = previewForm.UserAction
+End Function
+
 Private Function ShowSuggestionPreviewV4(ByVal suggestion As Object, ByVal index As Long, ByVal total As Long) As String
     ' V4 Preview function - shows target reference and resolved range
     
@@ -2675,25 +2701,7 @@ Private Function ShowSuggestionPreviewV4(ByVal suggestion As Object, ByVal index
     ' Show form modeless so the user can keep editing the document.
     previewForm.Show vbModeless
 
-    ' Wait for user action while yielding control to Word.
-    Dim waitCounter As Long
-    waitCounter = 0
-    Do While previewForm.UserAction = ""
-        DoEvents
-        waitCounter = waitCounter + 1
-        If waitCounter Mod 100 = 0 Then Sleep 10
-        If waitCounter > WAIT_LOOP_SAFETY_LIMIT Then
-            Debug.Print "    -> SAFETY EXIT: Wait loop timeout in ShowSuggestionPreviewV4"
-            ShowSuggestionPreviewV4 = "SKIP"
-            On Error Resume Next
-            Unload previewForm
-            On Error GoTo ErrorHandler
-            Exit Function
-        End If
-    Loop
-
-    ' Get user action
-    ShowSuggestionPreviewV4 = previewForm.UserAction
+    ShowSuggestionPreviewV4 = WaitForPreviewFormAction(previewForm, "ShowSuggestionPreviewV4")
     
     ' Clear highlighting
     If Not targetRange Is Nothing Then
@@ -3476,27 +3484,7 @@ Private Function ShowSuggestionPreview(ByVal suggestion As Object, ByVal index A
         previewForm.LoadSuggestion suggestion, index, total, Nothing, Nothing
         previewForm.Show vbModeless
 
-        ' Wait for user action (modeless form requires a wait loop)
-        Dim waitCounter1 As Long
-        waitCounter1 = 0
-        Do While previewForm.UserAction = ""
-            DoEvents
-            waitCounter1 = waitCounter1 + 1
-            If waitCounter1 Mod 100 = 0 Then Sleep 10  ' Yield CPU every 100 iterations
-            If waitCounter1 > WAIT_LOOP_SAFETY_LIMIT Then
-                Debug.Print "    -> SAFETY EXIT: Wait loop timeout in ShowSuggestionPreview (context not found)"
-                ShowSuggestionPreview = "SKIP"
-                On Error Resume Next
-                Unload previewForm
-                On Error GoTo ErrorHandler
-                Exit Function
-            End If
-            If waitCounter1 Mod 10000 = 0 Then
-                Debug.Print "    -> ShowSuggestionPreview: Still waiting for user action (" & waitCounter1 & " iterations)"
-            End If
-        Loop
-
-        ShowSuggestionPreview = previewForm.UserAction
+        ShowSuggestionPreview = WaitForPreviewFormAction(previewForm, "ShowSuggestionPreview (context not found)", True)
         Unload previewForm
         Exit Function
     Else
@@ -3525,27 +3513,7 @@ Private Function ShowSuggestionPreview(ByVal suggestion As Object, ByVal index A
     previewForm.LoadSuggestion suggestion, index, total, contextRange, actionRange
     previewForm.Show vbModeless
 
-    ' Wait for user action (modeless form requires a wait loop)
-    Dim waitCounter2 As Long
-    waitCounter2 = 0
-    Do While previewForm.UserAction = ""
-        DoEvents
-        waitCounter2 = waitCounter2 + 1
-        If waitCounter2 Mod 100 = 0 Then Sleep 10  ' Yield CPU every 100 iterations
-        If waitCounter2 > WAIT_LOOP_SAFETY_LIMIT Then
-            Debug.Print "    -> SAFETY EXIT: Wait loop timeout in ShowSuggestionPreview (main path)"
-            ShowSuggestionPreview = "SKIP"
-            On Error Resume Next
-            Unload previewForm
-            On Error GoTo ErrorHandler
-            Exit Function
-        End If
-        If waitCounter2 Mod 10000 = 0 Then
-            Debug.Print "    -> ShowSuggestionPreview: Still waiting for user action (" & waitCounter2 & " iterations)"
-        End If
-    Loop
-
-    ShowSuggestionPreview = previewForm.UserAction
+    ShowSuggestionPreview = WaitForPreviewFormAction(previewForm, "ShowSuggestionPreview (main path)", True)
     Unload previewForm
     Exit Function
 
@@ -6396,72 +6364,136 @@ Private Function ComputeCommonSuffix(ByVal oldText As String, ByVal newText As S
     ComputeCommonSuffix = minLen
 End Function
 
-' Computes a collection of diff operations between oldText and newText
-' Returns a Collection of Dictionary objects, each with:
-'   - "Operation": DIFF_EQUAL, DIFF_INSERT, or DIFF_DELETE
-'   - "Text": The text segment for this operation
-Private Function ComputeDiff(ByVal oldText As String, ByVal newText As String) As Collection
+Private Sub AddDiffOperation(ByVal result As Collection, ByVal opType As String, ByVal opText As String)
+    If Len(opText) = 0 Then Exit Sub
+
+    Dim op As Object
+    If result.Count > 0 Then
+        Set op = result(result.Count)
+        If op("Operation") = opType Then
+            op("Text") = op("Text") & opText
+            Exit Sub
+        End If
+    End If
+
+    Set op = NewDictionary()
+    op("Operation") = opType
+    op("Text") = opText
+    result.Add op
+End Sub
+
+Private Sub AppendDiffCollection(ByVal result As Collection, ByVal extraOps As Collection)
+    Dim op As Object
+    For Each op In extraOps
+        AddDiffOperation result, CStr(op("Operation")), CStr(op("Text"))
+    Next op
+End Sub
+
+Private Function IsDiffWordChar(ByVal ch As String) As Boolean
+    If Len(ch) = 0 Then Exit Function
+    IsDiffWordChar = (ch Like "[A-Za-z0-9]")
+End Function
+
+Private Function IsDiffWordJoiner(ByVal text As String, ByVal index As Long) As Boolean
+    Dim ch As String
+    ch = Mid$(text, index, 1)
+
+    Select Case ch
+        Case "'", "-", ChrW$(&H2019)
+            If index > 1 And index < Len(text) Then
+                IsDiffWordJoiner = IsDiffWordChar(Mid$(text, index - 1, 1)) And IsDiffWordChar(Mid$(text, index + 1, 1))
+            End If
+    End Select
+End Function
+
+Private Sub AppendToken(ByRef tokens() As String, ByRef tokenCount As Long, ByVal tokenText As String)
+    If Len(tokenText) = 0 Then Exit Sub
+
+    tokenCount = tokenCount + 1
+    ReDim Preserve tokens(1 To tokenCount)
+    tokens(tokenCount) = tokenText
+End Sub
+
+Private Sub TokenizeDiffText(ByVal text As String, ByRef tokens() As String, ByRef tokenCount As Long)
+    Dim i As Long
+    Dim startPos As Long
+    Dim currentChar As String
+
+    tokenCount = 0
+    If Len(text) = 0 Then Exit Sub
+
+    i = 1
+    Do While i <= Len(text)
+        currentChar = Mid$(text, i, 1)
+
+        If currentChar = " " Or currentChar = vbTab Or currentChar = vbCr Or currentChar = vbLf Then
+            startPos = i
+            Do While i <= Len(text)
+                currentChar = Mid$(text, i, 1)
+                If currentChar <> " " And currentChar <> vbTab And currentChar <> vbCr And currentChar <> vbLf Then Exit Do
+                i = i + 1
+            Loop
+            AppendToken tokens, tokenCount, Mid$(text, startPos, i - startPos)
+        ElseIf IsDiffWordChar(currentChar) Then
+            startPos = i
+            i = i + 1
+            Do While i <= Len(text)
+                currentChar = Mid$(text, i, 1)
+                If IsDiffWordChar(currentChar) Or IsDiffWordJoiner(text, i) Then
+                    i = i + 1
+                Else
+                    Exit Do
+                End If
+            Loop
+            AppendToken tokens, tokenCount, Mid$(text, startPos, i - startPos)
+        Else
+            AppendToken tokens, tokenCount, currentChar
+            i = i + 1
+        End If
+    Loop
+End Sub
+
+' Simple prefix/suffix diff used as a refinement step inside token-aware diff spans.
+Private Function ComputeBoundaryDiff(ByVal oldText As String, ByVal newText As String) As Collection
     Dim result As Collection
     Set result = New Collection
-    Dim equalOp As Object
-    Dim deleteOp As Object
-    Dim insertOp As Object
 
-    TraceLog "    [ComputeDiff] oldText length: " & Len(oldText) & ", newText length: " & Len(newText)
+    TraceLog "    [ComputeBoundaryDiff] oldText length: " & Len(oldText) & ", newText length: " & Len(newText)
 
-    ' Handle edge cases
     If oldText = newText Then
-        ' Identical - single EQUAL operation
-        Set equalOp = NewDictionary()
-        equalOp("Operation") = DIFF_EQUAL
-        equalOp("Text") = oldText
-        result.Add equalOp
-        TraceLog "    [ComputeDiff] Texts are identical."
-        Set ComputeDiff = result
+        AddDiffOperation result, DIFF_EQUAL, oldText
+        TraceLog "    [ComputeBoundaryDiff] Texts are identical."
+        Set ComputeBoundaryDiff = result
         Exit Function
     End If
 
     If Len(oldText) = 0 Then
-        ' Only insertion
-        Set insertOp = NewDictionary()
-        insertOp("Operation") = DIFF_INSERT
-        insertOp("Text") = newText
-        result.Add insertOp
-        TraceLog "    [ComputeDiff] Old text empty, full insert."
-        Set ComputeDiff = result
+        AddDiffOperation result, DIFF_INSERT, newText
+        TraceLog "    [ComputeBoundaryDiff] Old text empty, full insert."
+        Set ComputeBoundaryDiff = result
         Exit Function
     End If
 
     If Len(newText) = 0 Then
-        ' Only deletion
-        Set deleteOp = NewDictionary()
-        deleteOp("Operation") = DIFF_DELETE
-        deleteOp("Text") = oldText
-        result.Add deleteOp
-        TraceLog "    [ComputeDiff] New text empty, full delete."
-        Set ComputeDiff = result
+        AddDiffOperation result, DIFF_DELETE, oldText
+        TraceLog "    [ComputeBoundaryDiff] New text empty, full delete."
+        Set ComputeBoundaryDiff = result
         Exit Function
     End If
 
-    ' Find common prefix
     Dim prefixLen As Long
     prefixLen = ComputeCommonPrefix(oldText, newText)
 
     If prefixLen > 0 Then
-        Set equalOp = NewDictionary()
-        equalOp("Operation") = DIFF_EQUAL
-        equalOp("Text") = Left$(oldText, prefixLen)
-        result.Add equalOp
-        TraceLog "    [ComputeDiff] Common prefix length: " & prefixLen
+        AddDiffOperation result, DIFF_EQUAL, Left$(oldText, prefixLen)
+        TraceLog "    [ComputeBoundaryDiff] Common prefix length: " & prefixLen
     End If
 
-    ' Work on middle section (after prefix, before suffix)
     Dim oldMiddle As String
     Dim newMiddle As String
     oldMiddle = Mid$(oldText, prefixLen + 1)
     newMiddle = Mid$(newText, prefixLen + 1)
 
-    ' Find common suffix
     Dim suffixLen As Long
     suffixLen = ComputeCommonSuffix(oldMiddle, newMiddle)
 
@@ -6470,32 +6502,118 @@ Private Function ComputeDiff(ByVal oldText As String, ByVal newText As String) A
         suffixText = Right$(oldMiddle, suffixLen)
         oldMiddle = Left$(oldMiddle, Len(oldMiddle) - suffixLen)
         newMiddle = Left$(newMiddle, Len(newMiddle) - suffixLen)
-        TraceLog "    [ComputeDiff] Common suffix length: " & suffixLen
+        TraceLog "    [ComputeBoundaryDiff] Common suffix length: " & suffixLen
     End If
 
-    ' Process the differing middle section
     If Len(oldMiddle) > 0 Then
-        Set deleteOp = NewDictionary()
-        deleteOp("Operation") = DIFF_DELETE
-        deleteOp("Text") = oldMiddle
-        result.Add deleteOp
-        TraceLog "    [ComputeDiff] Delete: '" & oldMiddle & "'"
+        AddDiffOperation result, DIFF_DELETE, oldMiddle
+        TraceLog "    [ComputeBoundaryDiff] Delete: '" & oldMiddle & "'"
     End If
 
     If Len(newMiddle) > 0 Then
-        Set insertOp = NewDictionary()
-        insertOp("Operation") = DIFF_INSERT
-        insertOp("Text") = newMiddle
-        result.Add insertOp
-        TraceLog "    [ComputeDiff] Insert: '" & newMiddle & "'"
+        AddDiffOperation result, DIFF_INSERT, newMiddle
+        TraceLog "    [ComputeBoundaryDiff] Insert: '" & newMiddle & "'"
     End If
 
-    ' Add common suffix
     If suffixLen > 0 Then
-        Set equalOp = NewDictionary()
-        equalOp("Operation") = DIFF_EQUAL
-        equalOp("Text") = suffixText
-        result.Add equalOp
+        AddDiffOperation result, DIFF_EQUAL, suffixText
+    End If
+
+    Set ComputeBoundaryDiff = result
+    TraceLog "    [ComputeBoundaryDiff] Total operations: " & result.Count
+End Function
+
+Private Sub AppendRefinedDiffSpan(ByVal result As Collection, ByVal oldSpan As String, ByVal newSpan As String)
+    Dim refinedOps As Collection
+    Set refinedOps = ComputeBoundaryDiff(oldSpan, newSpan)
+    AppendDiffCollection result, refinedOps
+End Sub
+
+' Computes a collection of diff operations between oldText and newText.
+' This uses token-aware LCS to preserve multiple small edits, then refines each
+' changed span with the simpler boundary diff for tighter tracked changes.
+Private Function ComputeDiff(ByVal oldText As String, ByVal newText As String) As Collection
+    Dim result As Collection
+    Set result = New Collection
+
+    TraceLog "    [ComputeDiff] oldText length: " & Len(oldText) & ", newText length: " & Len(newText)
+
+    If oldText = newText Or Len(oldText) = 0 Or Len(newText) = 0 Then
+        Set ComputeDiff = ComputeBoundaryDiff(oldText, newText)
+        Exit Function
+    End If
+
+    Dim oldTokens() As String
+    Dim newTokens() As String
+    Dim oldCount As Long
+    Dim newCount As Long
+    TokenizeDiffText oldText, oldTokens, oldCount
+    TokenizeDiffText newText, newTokens, newCount
+
+    If oldCount = 0 Or newCount = 0 Then
+        Set ComputeDiff = ComputeBoundaryDiff(oldText, newText)
+        Exit Function
+    End If
+
+    If CLng(oldCount) * CLng(newCount) > GRANULAR_DIFF_MAX_TOKEN_MATRIX_CELLS Then
+        TraceLog "    [ComputeDiff] Token matrix too large, using boundary diff fallback."
+        Set ComputeDiff = ComputeBoundaryDiff(oldText, newText)
+        Exit Function
+    End If
+
+    Dim lcs() As Long
+    ReDim lcs(0 To oldCount, 0 To newCount)
+
+    Dim i As Long
+    Dim j As Long
+    For i = oldCount - 1 To 0 Step -1
+        For j = newCount - 1 To 0 Step -1
+            If oldTokens(i + 1) = newTokens(j + 1) Then
+                lcs(i, j) = lcs(i + 1, j + 1) + 1
+            ElseIf lcs(i + 1, j) >= lcs(i, j + 1) Then
+                lcs(i, j) = lcs(i + 1, j)
+            Else
+                lcs(i, j) = lcs(i, j + 1)
+            End If
+        Next j
+    Next i
+
+    Dim oldPending As String
+    Dim newPending As String
+    i = 1
+    j = 1
+
+    Do While i <= oldCount And j <= newCount
+        If oldTokens(i) = newTokens(j) Then
+            If Len(oldPending) > 0 Or Len(newPending) > 0 Then
+                AppendRefinedDiffSpan result, oldPending, newPending
+                oldPending = ""
+                newPending = ""
+            End If
+            AddDiffOperation result, DIFF_EQUAL, oldTokens(i)
+            i = i + 1
+            j = j + 1
+        ElseIf lcs(i - 1, j) >= lcs(i, j - 1) Then
+            newPending = newPending & newTokens(j)
+            j = j + 1
+        Else
+            oldPending = oldPending & oldTokens(i)
+            i = i + 1
+        End If
+    Loop
+
+    Do While i <= oldCount
+        oldPending = oldPending & oldTokens(i)
+        i = i + 1
+    Loop
+
+    Do While j <= newCount
+        newPending = newPending & newTokens(j)
+        j = j + 1
+    Loop
+
+    If Len(oldPending) > 0 Or Len(newPending) > 0 Then
+        AppendRefinedDiffSpan result, oldPending, newPending
     End If
 
     Set ComputeDiff = result
@@ -8258,6 +8376,9 @@ Fail:
     validationErrors = "Unexpected validator error: " & Err.Description
 End Function
 
+' V4 normalization boundary: translate tool-call JSON into the internal suggestion
+' shape used by the existing apply engine. Keep schema translation here so the
+' downstream processing code can stay focused on Word operations.
 Private Function ConvertToolCallToSuggestion(ByVal callObj As Object) As Object
     Dim suggestion As Object
     Set suggestion = NewDictionary()
@@ -8321,7 +8442,12 @@ Private Function IsToolCallNoOp(ByVal callObj As Object, ByVal targetRange As Ra
 
     Dim foundRange As Range
     Set foundRange = FindLongString(NormalizeForDocument(findText), targetRange, matchCase)
-    If foundRange Is Nothing Then Exit Function
+    If foundRange Is Nothing Then
+        ' Safe rerun path: if the replacement text is already present in the target,
+        ' treat this as a no-op rather than a failure on subsequent apply_all passes.
+        Set foundRange = FindLongString(NormalizeForDocument(replaceText), targetRange, matchCase)
+        If foundRange Is Nothing Then Exit Function
+    End If
 
     IsToolCallNoOp = IsFormattingAlreadyApplied(foundRange, replaceText)
     Exit Function
@@ -8346,6 +8472,44 @@ Private Function DescribeToolFailure(ByVal suggestion As Object) As String
     End If
 End Function
 
+Private Function BuildOutcomeDetail(ByVal suggestion As Object, ByVal errorCode As String, ByVal message As String) As String
+    Dim detail As String
+    detail = DescribeToolFailure(suggestion)
+
+    If Len(errorCode) > 0 Then
+        detail = detail & " | code: " & errorCode
+    End If
+    If Len(message) > 0 Then
+        detail = detail & " | reason: " & message
+    End If
+
+    Dim findText As String
+    Dim replaceText As String
+    findText = GetSuggestionText(suggestion, "find", "")
+    replaceText = GetSuggestionText(suggestion, "replace", "")
+    If Len(findText) > 0 Then detail = detail & " | find: " & Left$(findText, 120)
+    If Len(replaceText) > 0 Then detail = detail & " | replace: " & Left$(replaceText, 120)
+
+    BuildOutcomeDetail = detail
+End Function
+
+Private Function BuildOutcomeFollowUp(ByVal errorCode As String) As String
+    Select Case UCase$(Trim$(errorCode))
+        Case "TEXT_NOT_FOUND"
+            BuildOutcomeFollowUp = "Check the Word comment on the failed target, correct the SEARCH text or edit manually, then rerun the importer. Already-applied replace_text calls should now skip as NO_OP."
+        Case "TARGET_NOT_FOUND"
+            BuildOutcomeFollowUp = "Re-export the DSM from the current document, regenerate tool calls if the structure changed, then rerun the importer."
+        Case "TABLE_STRUCTURE_UNSUPPORTED", "TABLE_REPLACE_FAILED"
+            BuildOutcomeFollowUp = "Review the failed table target/comment in Word and apply manually or simplify the table-specific tool call before rerunning."
+        Case "STYLE_NOT_FOUND"
+            BuildOutcomeFollowUp = "Confirm the style token exists in the current template/add-in, then rerun the importer or apply the style manually."
+        Case "EXECUTION_ERROR"
+            BuildOutcomeFollowUp = "Review the failed target/comment in Word, correct the tool call or document state, then rerun the importer."
+        Case Else
+            BuildOutcomeFollowUp = ""
+    End Select
+End Function
+
 Private Function GenerateRunId() As String
     Randomize
     GenerateRunId = Format(Now, "yyyymmdd_hhnnss") & "_" & CStr(Int((9999 - 1000 + 1) * Rnd + 1000))
@@ -8359,11 +8523,13 @@ Private Function ElapsedMilliseconds(ByVal startTimer As Single) As Long
 End Function
 
 Private Function BuildOutcomeJson(ByVal index As Long, ByVal toolName As String, ByVal targetRef As String, _
-    ByVal status As String, ByVal errorCode As String, ByVal message As String) As String
+    ByVal status As String, ByVal errorCode As String, ByVal message As String, _
+    ByVal detail As String, ByVal followUp As String) As String
 
     BuildOutcomeJson = "{""index"":" & index & ",""tool"":""" & JsonEscape(toolName) & """,""target"":""" & _
         JsonEscape(targetRef) & """,""status"":""" & JsonEscape(status) & """,""error_code"":""" & _
-        JsonEscape(errorCode) & """,""message"":""" & JsonEscape(message) & """}"
+        JsonEscape(errorCode) & """,""message"":""" & JsonEscape(message) & """,""detail"":""" & _
+        JsonEscape(detail) & """,""follow_up"":""" & JsonEscape(followUp) & """}"
 End Function
 
 Private Sub AddOutcome(ByRef outcomes As Collection, ByVal index As Long, ByVal suggestion As Object, _
@@ -8371,9 +8537,13 @@ Private Sub AddOutcome(ByRef outcomes As Collection, ByVal index As Long, ByVal 
 
     Dim toolName As String
     Dim targetRef As String
+    Dim detail As String
+    Dim followUp As String
     toolName = GetSuggestionText(suggestion, "tool_name", "<tool>")
     targetRef = GetSuggestionText(suggestion, "target", "<target>")
-    outcomes.Add BuildOutcomeJson(index, toolName, targetRef, status, errorCode, message)
+    detail = BuildOutcomeDetail(suggestion, errorCode, message)
+    followUp = BuildOutcomeFollowUp(errorCode)
+    outcomes.Add BuildOutcomeJson(index, toolName, targetRef, status, errorCode, message, detail, followUp)
 End Sub
 
 Private Function BuildOutcomesArrayJson(ByVal outcomes As Collection) As String
@@ -8415,7 +8585,7 @@ Private Function WriteRunResultReport(ByVal runId As String, ByVal resultJson As
         stem = GetDocStem()
     End If
 
-    filePath = GetClaudeReviewFolder() & stem & "_run_" & runId & ".json"
+    filePath = GetLlmReviewFolder() & stem & "_run_" & runId & ".json"
 
     fileNum = FreeFile
     Open filePath For Output As #fileNum
@@ -8437,23 +8607,270 @@ Private Sub StoreLastRunResult(ByVal runId As String, ByVal resultJson As String
     g_LastRunReportPath = reportPath
 End Sub
 
+' =========================================================================================
+' === V4 TOOL-CALL EXECUTION PIPELINE =====================================================
+' =========================================================================================
+
+Private Function BuildSuggestionsFromToolCalls(ByVal toolCalls As Collection) As Collection
+    Dim suggestions As New Collection
+    Dim callObj As Object
+
+    For Each callObj In toolCalls
+        suggestions.Add ConvertToolCallToSuggestion(callObj)
+    Next callObj
+
+    Set BuildSuggestionsFromToolCalls = suggestions
+End Function
+
+Private Sub SetApplyPerformanceMode(ByVal enableMode As Boolean, ByRef previousScreenUpdating As Boolean, ByRef performanceMode As Boolean)
+    If enableMode Then
+        previousScreenUpdating = Application.ScreenUpdating
+        Application.ScreenUpdating = False
+        performanceMode = True
+    Else
+        performanceMode = False
+    End If
+End Sub
+
+Private Sub RestoreApplyPerformanceMode(ByVal performanceMode As Boolean, ByVal previousScreenUpdating As Boolean)
+    If performanceMode Then
+        On Error Resume Next
+        Application.ScreenUpdating = previousScreenUpdating
+        Err.Clear
+        On Error GoTo 0
+    End If
+End Sub
+
+Private Sub FinalizeRunToolCallsResult(ByVal runId As String, ByVal ok As Boolean, ByVal mode As String, _
+    ByVal totalCount As Long, ByVal appliedCount As Long, ByVal skippedCount As Long, ByVal failedCount As Long, _
+    ByVal validationErrors As String, ByVal outcomes As Collection, ByVal startedAt As Date, ByVal startTimer As Single)
+
+    Dim reportPath As String
+    Dim resultJson As String
+
+    reportPath = ""
+    resultJson = BuildRunResultJson(runId, ok, mode, totalCount, appliedCount, skippedCount, failedCount, _
+        validationErrors, outcomes, startedAt, ElapsedMilliseconds(startTimer), reportPath)
+    reportPath = WriteRunResultReport(runId, resultJson)
+    resultJson = BuildRunResultJson(runId, ok, mode, totalCount, appliedCount, skippedCount, failedCount, _
+        validationErrors, outcomes, startedAt, ElapsedMilliseconds(startTimer), reportPath)
+    Call StoreLastRunResult(runId, resultJson, reportPath)
+End Sub
+
+Private Sub AddFailedSuggestionComment(ByVal suggestion As Object)
+    If Not HasDictionaryKey(suggestion, "pre_resolved_range") Then Exit Sub
+
+    Dim failRange As Range
+    Set failRange = suggestion("pre_resolved_range")
+    If failRange Is Nothing Then Exit Sub
+
+    Dim failNote As String
+    failNote = "[AI Review - Edit Not Applied]" & vbCrLf & _
+               "Reason: " & g_LastActionErrorMessage & vbCrLf & _
+               "Intended: " & Left$(GetSuggestionText(suggestion, "replace", "(no replacement text)"), 500)
+
+    Dim failExplanation As String
+    failExplanation = GetSuggestionText(suggestion, "explanation", "")
+    If Len(failExplanation) > 0 Then
+        failNote = failNote & vbCrLf & "Note: " & failExplanation
+    End If
+
+    On Error Resume Next
+    ExecuteCommentActionV4 failRange, failNote
+    On Error GoTo 0
+End Sub
+
+Private Sub PreResolveSuggestionTargets(ByVal suggestions As Collection)
+    Dim suggestion As Object
+    Dim preflightRange As Range
+    Dim targetRefStr As String
+    Dim preflightIndex As Long
+
+    TraceLog "--- STARTING PRE-FLIGHT TARGET RESOLUTION ---"
+    preflightIndex = 0
+
+    For Each suggestion In suggestions
+        preflightIndex = preflightIndex + 1
+        targetRefStr = GetSuggestionText(suggestion, "target", "")
+        Set preflightRange = ResolveTargetToRange(targetRefStr)
+
+        If Not preflightRange Is Nothing Then
+            suggestion.Add "pre_resolved_range", preflightRange
+            TraceLog "  -> Pre-resolved: " & targetRefStr
+        Else
+            TraceLog "  -> FAILED to pre-resolve: " & targetRefStr
+        End If
+
+        If preflightIndex Mod APPLY_PREFLIGHT_PROGRESS_INTERVAL = 0 Then DoEvents
+    Next suggestion
+
+    TraceLog "--- PRE-FLIGHT COMPLETE ---"
+End Sub
+
+Private Function BuildNonInteractiveReport(ByVal appliedCount As Long, ByVal failedCount As Long, _
+    ByVal failureDetails As String, ByVal loggedFailures As Long, ByVal failureLimit As Long) As String
+
+    Dim reportText As String
+    reportText = "V4 Apply Complete" & vbCrLf & vbCrLf & _
+                 "Applied: " & appliedCount & vbCrLf & _
+                 "Failed: " & failedCount
+
+    If failedCount > 0 Then
+        If Len(failureDetails) > 0 Then
+            reportText = reportText & vbCrLf & vbCrLf & "Failed entries:" & vbCrLf & failureDetails
+        End If
+        If loggedFailures > failureLimit Then
+            reportText = reportText & "  ... and " & (loggedFailures - failureLimit) & " more failures." & vbCrLf
+        End If
+        reportText = reportText & vbCrLf & vbCrLf & _
+            "Manual follow-up required:" & vbCrLf & _
+            "- Review the failed tool_calls in your JSON input." & vbCrLf & _
+            "- Use the DSM target IDs plus the tooling.manual_fallback guidance to locate each paragraph/table." & vbCrLf & _
+            "- Review the run report JSON for per-target reason/follow-up details." & vbCrLf & _
+            "- Apply the fixes manually in Word or adjust the JSON and rerun V4_ApplyToolCalls."
+    End If
+
+    BuildNonInteractiveReport = reportText
+End Function
+
+Private Sub RunToolCallsInteractivePass(ByVal toolCalls As Collection, ByVal suggestions As Collection, _
+    ByRef outcomes As Collection, ByRef appliedCount As Long, ByRef skippedCount As Long, ByRef failedCount As Long)
+
+    Dim idx As Long
+    Dim action As String
+    Dim tRange As Range
+    Dim j As Long
+    Dim k As Long
+    Dim suggestion As Object
+
+    idx = 1
+    Do While idx <= suggestions.Count
+        Set suggestion = suggestions(idx)
+        Set tRange = ResolveTargetToRange(GetSuggestionText(suggestion, "target", ""))
+
+        If Not tRange Is Nothing Then
+            If IsToolCallNoOp(toolCalls(idx), tRange) Then
+                skippedCount = skippedCount + 1
+                AddOutcome outcomes, idx, suggestion, "skipped", "NO_OP", "No change required; formatting/text already matches."
+                idx = idx + 1
+                GoTo NextInteractiveItem
+            End If
+        End If
+
+        action = ShowSuggestionPreviewV4(suggestion, idx, suggestions.Count)
+        Select Case UCase$(action)
+            Case "ACCEPT"
+                If ProcessSuggestionV4(suggestion) Then
+                    appliedCount = appliedCount + 1
+                    AddOutcome outcomes, idx, suggestion, "applied", "", ""
+                Else
+                    failedCount = failedCount + 1
+                    AddOutcome outcomes, idx, suggestion, "failed", g_LastActionErrorCode, g_LastActionErrorMessage
+                End If
+
+            Case "REJECT", "SKIP"
+                skippedCount = skippedCount + 1
+                AddOutcome outcomes, idx, suggestion, "skipped", "USER_SKIPPED", "Skipped during interactive review."
+
+            Case "ACCEPT_ALL"
+                For j = idx To suggestions.Count
+                    If ProcessSuggestionV4(suggestions(j)) Then
+                        appliedCount = appliedCount + 1
+                        AddOutcome outcomes, j, suggestions(j), "applied", "", ""
+                    Else
+                        failedCount = failedCount + 1
+                        AddOutcome outcomes, j, suggestions(j), "failed", g_LastActionErrorCode, g_LastActionErrorMessage
+                    End If
+                Next j
+                Exit Do
+
+            Case "STOP"
+                For k = idx To suggestions.Count
+                    skippedCount = skippedCount + 1
+                    AddOutcome outcomes, k, suggestions(k), "skipped", "USER_STOPPED", "Stopped interactive review."
+                Next k
+                Exit Do
+
+            Case Else
+                skippedCount = skippedCount + 1
+                AddOutcome outcomes, idx, suggestion, "skipped", "USER_SKIPPED", "Skipped during interactive review."
+        End Select
+
+        idx = idx + 1
+NextInteractiveItem:
+    Loop
+End Sub
+
+Private Function RunToolCallsApplyAllPass(ByVal toolCalls As Collection, ByVal suggestions As Collection, ByRef outcomes As Collection, _
+    ByRef appliedCount As Long, ByRef skippedCount As Long, ByRef failedCount As Long) As String
+
+    Dim failureDetails As String
+    Dim failureLimit As Long
+    Dim loggedFailures As Long
+    Dim callIndex As Long
+    Dim suggestion As Object
+
+    failureLimit = 10
+    loggedFailures = 0
+    failureDetails = ""
+    callIndex = 0
+
+    Call PreResolveSuggestionTargets(suggestions)
+
+    For Each suggestion In suggestions
+        callIndex = callIndex + 1
+        Dim preResolvedRange As Range
+        Set preResolvedRange = Nothing
+        If HasDictionaryKey(suggestion, "pre_resolved_range") Then
+            Set preResolvedRange = suggestion("pre_resolved_range")
+        End If
+
+        If Not preResolvedRange Is Nothing Then
+            If IsToolCallNoOp(toolCalls(callIndex), preResolvedRange) Then
+                skippedCount = skippedCount + 1
+                AddOutcome outcomes, callIndex, suggestion, "skipped", "NO_OP", "No change required; formatting/text already matches."
+                GoTo NextApplyAllItem
+            End If
+        End If
+
+        If ProcessSuggestionV4(suggestion) Then
+            appliedCount = appliedCount + 1
+            AddOutcome outcomes, callIndex, suggestion, "applied", "", ""
+        Else
+            Dim failureCode As String
+            Dim failureMessage As String
+            failureCode = g_LastActionErrorCode
+            failureMessage = g_LastActionErrorMessage
+            failedCount = failedCount + 1
+            Call AddFailedSuggestionComment(suggestion)
+
+            If loggedFailures < failureLimit Then
+                failureDetails = failureDetails & "  - " & BuildOutcomeDetail(suggestion, failureCode, failureMessage) & vbCrLf
+            End If
+            loggedFailures = loggedFailures + 1
+            AddOutcome outcomes, callIndex, suggestion, "failed", failureCode, failureMessage
+        End If
+NextApplyAllItem:
+    Next suggestion
+
+    RunToolCallsApplyAllPass = BuildNonInteractiveReport(appliedCount, failedCount, failureDetails, loggedFailures, failureLimit)
+End Function
+
 Private Function RunToolCallsInternal(ByVal jsonString As String, ByVal interactive As Boolean, _
     Optional ByVal automationMode As Boolean = False, Optional ByVal runId As String = "") As Boolean
     On Error GoTo ErrorHandler
 
     Dim toolCalls As Collection
     Dim errors As String
-    Dim s As Object
     Dim startedAt As Date
     Dim startTimer As Single
     Dim mode As String
     Dim outcomes As New Collection
+    Dim suggestions As Collection
     Dim totalCount As Long
     Dim appliedCount As Long
     Dim skippedCount As Long
     Dim failedCount As Long
-    Dim resultJson As String
-    Dim reportPath As String
     Dim nonInteractiveReport As String
     Dim restoreScreenUpdating As Boolean
     Dim performanceMode As Boolean
@@ -8464,11 +8881,7 @@ Private Function RunToolCallsInternal(ByVal jsonString As String, ByVal interact
     If Len(Trim$(runId)) = 0 Then runId = GenerateRunId()
 
     If Not ParseV4ToolCalls(jsonString, toolCalls, errors) Then
-        reportPath = ""
-        resultJson = BuildRunResultJson(runId, False, mode, 0, 0, 0, 0, errors, outcomes, startedAt, ElapsedMilliseconds(startTimer), reportPath)
-        reportPath = WriteRunResultReport(runId, resultJson)
-        resultJson = BuildRunResultJson(runId, False, mode, 0, 0, 0, 0, errors, outcomes, startedAt, ElapsedMilliseconds(startTimer), reportPath)
-        Call StoreLastRunResult(runId, resultJson, reportPath)
+        Call FinalizeRunToolCallsResult(runId, False, mode, 0, 0, 0, 0, errors, outcomes, startedAt, startTimer)
         If Not automationMode Then
             MsgBox "V4 validation failed:" & vbCrLf & errors, vbCritical, "Invalid V4 Tool Calls"
         End If
@@ -8477,178 +8890,19 @@ Private Function RunToolCallsInternal(ByVal jsonString As String, ByVal interact
     End If
 
     ClearDocumentStructureMap
-    If Not interactive Then
-        restoreScreenUpdating = Application.ScreenUpdating
-        Application.ScreenUpdating = False
-        performanceMode = True
-    End If
+    Call SetApplyPerformanceMode(Not interactive, restoreScreenUpdating, performanceMode)
 
-    Dim suggestions As New Collection
-    Dim callObj As Object
-    For Each callObj In toolCalls
-        suggestions.Add ConvertToolCallToSuggestion(callObj)
-    Next callObj
+    Set suggestions = BuildSuggestionsFromToolCalls(toolCalls)
     totalCount = suggestions.Count
 
     If interactive Then
-        Dim idx As Long
-        Dim action As String
-        idx = 1
-
-        Do While idx <= suggestions.Count
-            Set s = suggestions(idx)
-            Dim tRange As Range
-            Set tRange = ResolveTargetToRange(GetSuggestionText(s, "target", ""))
-            If Not tRange Is Nothing Then
-                If IsToolCallNoOp(toolCalls(idx), tRange) Then
-                    skippedCount = skippedCount + 1
-                    AddOutcome outcomes, idx, s, "skipped", "NO_OP", "No change required; formatting/text already matches."
-                    idx = idx + 1
-                    GoTo NextLoop
-                End If
-            End If
-
-            action = ShowSuggestionPreviewV4(s, idx, suggestions.Count)
-            Select Case UCase$(action)
-                Case "ACCEPT"
-                    If ProcessSuggestionV4(s) Then
-                        appliedCount = appliedCount + 1
-                        AddOutcome outcomes, idx, s, "applied", "", ""
-                    Else
-                        failedCount = failedCount + 1
-                        AddOutcome outcomes, idx, s, "failed", g_LastActionErrorCode, g_LastActionErrorMessage
-                    End If
-                Case "REJECT", "SKIP"
-                    skippedCount = skippedCount + 1
-                    AddOutcome outcomes, idx, s, "skipped", "USER_SKIPPED", "Skipped during interactive review."
-                Case "ACCEPT_ALL"
-                    Dim j As Long
-                    For j = idx To suggestions.Count
-                        If ProcessSuggestionV4(suggestions(j)) Then
-                            appliedCount = appliedCount + 1
-                            AddOutcome outcomes, j, suggestions(j), "applied", "", ""
-                        Else
-                            failedCount = failedCount + 1
-                            AddOutcome outcomes, j, suggestions(j), "failed", g_LastActionErrorCode, g_LastActionErrorMessage
-                        End If
-                    Next j
-                    idx = suggestions.Count + 1
-                    GoTo NextLoop
-                Case "STOP"
-                    Dim k As Long
-                    For k = idx To suggestions.Count
-                        skippedCount = skippedCount + 1
-                        AddOutcome outcomes, k, suggestions(k), "skipped", "USER_STOPPED", "Stopped interactive review."
-                    Next k
-                    Exit Do
-                Case Else
-                    skippedCount = skippedCount + 1
-                    AddOutcome outcomes, idx, s, "skipped", "USER_SKIPPED", "Skipped during interactive review."
-            End Select
-            idx = idx + 1
-NextLoop:
-        Loop
+        Call RunToolCallsInteractivePass(toolCalls, suggestions, outcomes, appliedCount, skippedCount, failedCount)
     Else
-        Dim failureDetails As String
-        Dim failureLimit As Long
-        Dim loggedFailures As Long
-        Dim callIndex As Long
-
-        failureLimit = 10
-        loggedFailures = 0
-        failureDetails = ""
-        callIndex = 0
-
-        ' --- NEW: PRE-FLIGHT RESOLUTION PASS ---
-        ' Resolve all targets to Word Range objects BEFORE making any edits.
-        ' This prevents the "Shifting Sand" problem where early edits misalign later targets.
-        Dim preflightRange As Range
-        Dim targetRefStr As String
-        Dim preflightIndex As Long
-        
-        TraceLog "--- STARTING PRE-FLIGHT TARGET RESOLUTION ---"
-        preflightIndex = 0
-        For Each s In suggestions
-            preflightIndex = preflightIndex + 1
-            targetRefStr = GetSuggestionText(s, "target", "")
-            Set preflightRange = ResolveTargetToRange(targetRefStr)
-            
-            If Not preflightRange Is Nothing Then
-                ' Store the successfully anchored Range object into the JSON dictionary
-                ' so ProcessSuggestionV4 can use it directly later.
-                s.Add "pre_resolved_range", preflightRange
-                TraceLog "  -> Pre-resolved: " & targetRefStr
-            Else
-                TraceLog "  -> FAILED to pre-resolve: " & targetRefStr
-            End If
-            If preflightIndex Mod APPLY_PREFLIGHT_PROGRESS_INTERVAL = 0 Then DoEvents
-        Next s
-        TraceLog "--- PRE-FLIGHT COMPLETE ---"
-
-        ' --- ORIGINAL APPLY PASS ---
-        For Each s In suggestions
-            callIndex = callIndex + 1
-            If ProcessSuggestionV4(s) Then
-                appliedCount = appliedCount + 1
-                AddOutcome outcomes, callIndex, s, "applied", "", ""
-            Else
-                failedCount = failedCount + 1
-
-                ' Insert a comment at the target so the failed edit is visible in-document
-                If HasDictionaryKey(s, "pre_resolved_range") Then
-                    Dim failRange As Range
-                    Set failRange = s("pre_resolved_range")
-                    If Not failRange Is Nothing Then
-                        Dim failNote As String
-                        failNote = "[AI Review - Edit Not Applied]" & vbCrLf & _
-                                   "Reason: " & g_LastActionErrorMessage & vbCrLf & _
-                                   "Intended: " & Left$(GetSuggestionText(s, "replace", "(no replacement text)"), 500)
-
-                        Dim failExplanation As String
-                        failExplanation = GetSuggestionText(s, "explanation", "")
-                        If Len(failExplanation) > 0 Then
-                            failNote = failNote & vbCrLf & "Note: " & failExplanation
-                        End If
-
-                        On Error Resume Next
-                        ExecuteCommentActionV4 failRange, failNote
-                        On Error GoTo ErrorHandler
-                    End If
-                End If
-
-                If loggedFailures < failureLimit Then
-                    failureDetails = failureDetails & "  - " & DescribeToolFailure(s) & vbCrLf
-                End If
-                loggedFailures = loggedFailures + 1
-                AddOutcome outcomes, callIndex, s, "failed", g_LastActionErrorCode, g_LastActionErrorMessage
-            End If
-        Next s
-
-        nonInteractiveReport = "V4 Apply Complete" & vbCrLf & vbCrLf & _
-                               "Applied: " & appliedCount & vbCrLf & _
-                               "Failed: " & failedCount
-        If failedCount > 0 Then
-            If Len(failureDetails) > 0 Then
-                nonInteractiveReport = nonInteractiveReport & vbCrLf & vbCrLf & "Failed entries:" & vbCrLf & failureDetails
-            End If
-            If loggedFailures > failureLimit Then
-                nonInteractiveReport = nonInteractiveReport & "  ... and " & (loggedFailures - failureLimit) & " more failures." & vbCrLf
-            End If
-            nonInteractiveReport = nonInteractiveReport & vbCrLf & vbCrLf & _
-                "Manual follow-up required:" & vbCrLf & _
-                "- Review the failed tool_calls in your JSON input." & vbCrLf & _
-                "- Use the DSM target IDs plus the tooling.manual_fallback guidance to locate each paragraph/table." & vbCrLf & _
-                "- Apply the fixes manually in Word or adjust the JSON and rerun V4_ApplyToolCalls."
-        End If
+        nonInteractiveReport = RunToolCallsApplyAllPass(toolCalls, suggestions, outcomes, appliedCount, skippedCount, failedCount)
     End If
 
     RunToolCallsInternal = (failedCount = 0)
-
-    reportPath = ""
-    resultJson = BuildRunResultJson(runId, RunToolCallsInternal, mode, totalCount, appliedCount, skippedCount, failedCount, "", outcomes, startedAt, ElapsedMilliseconds(startTimer), reportPath)
-    reportPath = WriteRunResultReport(runId, resultJson)
-    resultJson = BuildRunResultJson(runId, RunToolCallsInternal, mode, totalCount, appliedCount, skippedCount, failedCount, "", outcomes, startedAt, ElapsedMilliseconds(startTimer), reportPath)
-    Call StoreLastRunResult(runId, resultJson, reportPath)
+    Call FinalizeRunToolCallsResult(runId, RunToolCallsInternal, mode, totalCount, appliedCount, skippedCount, failedCount, "", outcomes, startedAt, startTimer)
 
     If Not automationMode Then
         If interactive Then
@@ -8661,12 +8915,7 @@ NextLoop:
         End If
     End If
 
-    If performanceMode Then
-        On Error Resume Next
-        Application.ScreenUpdating = restoreScreenUpdating
-        Err.Clear
-        On Error GoTo 0
-    End If
+    Call RestoreApplyPerformanceMode(performanceMode, restoreScreenUpdating)
 
     Exit Function
 
@@ -8674,21 +8923,13 @@ ErrorHandler:
     Dim errSuggestion As Object
     Dim runtimeErr As String
     runtimeErr = Err.Description
-    If performanceMode Then
-        On Error Resume Next
-        Application.ScreenUpdating = restoreScreenUpdating
-        Err.Clear
-    End If
+    Call RestoreApplyPerformanceMode(performanceMode, restoreScreenUpdating)
     On Error Resume Next
     Set errSuggestion = CreateObject("Scripting.Dictionary")
     errSuggestion("tool_name") = "<runtime>"
     errSuggestion("target") = "<runtime>"
     AddOutcome outcomes, 0, errSuggestion, "failed", "EXECUTION_ERROR", runtimeErr
-    reportPath = ""
-    resultJson = BuildRunResultJson(runId, False, mode, totalCount, appliedCount, skippedCount, failedCount + 1, runtimeErr, outcomes, startedAt, ElapsedMilliseconds(startTimer), reportPath)
-    reportPath = WriteRunResultReport(runId, resultJson)
-    resultJson = BuildRunResultJson(runId, False, mode, totalCount, appliedCount, skippedCount, failedCount + 1, runtimeErr, outcomes, startedAt, ElapsedMilliseconds(startTimer), reportPath)
-    Call StoreLastRunResult(runId, resultJson, reportPath)
+    Call FinalizeRunToolCallsResult(runId, False, mode, totalCount, appliedCount, skippedCount, failedCount + 1, runtimeErr, outcomes, startedAt, startTimer)
     If Not automationMode Then
         MsgBox "Error in V4 processing: " & runtimeErr, vbCritical, "V4 Error"
     End If
@@ -8795,19 +9036,145 @@ End Sub
 ' These subs read/write JSON to a temp folder instead of clipboard/form,
 ' enabling automated review via Claude Code's report-checking skill.
 '
-' Exchange folder: %TEMP%\claude_review\
+' Exchange folder: G:\My Drive\ai-skills\projects\{job folder}\ when job context is available.
+' Fallback folder: %TEMP%\claude_review\
 ' Export files:    {doc_stem}_dsm.md / {doc_stem}_dsm.json
 ' Import file:     {doc_stem}_toolcalls.json  (LLM-generated tool calls)
 ' Backup file:     {doc_stem}_backup_YYYYMMDD_HHMMSS.docx (pre-review safety copy)
+'
+' This is now a general LLM review exchange folder rather than a Claude-specific temp folder.
+' Keep the resolver simple and defensive because this code is maintained inside a Word template.
 
-Private Function GetClaudeReviewFolder() As String
-    ' Returns the temp exchange folder path, creating it if needed.
-    Dim folderPath As String
-    folderPath = Environ("TEMP") & "\claude_review"
-    If Dir(folderPath, vbDirectory) = "" Then
-        MkDir folderPath
+Private Function EnsureTrailingSlash(ByVal folderPath As String) As String
+    If Len(folderPath) = 0 Then
+        EnsureTrailingSlash = ""
+    ElseIf Right$(folderPath, 1) = "\" Then
+        EnsureTrailingSlash = folderPath
+    Else
+        EnsureTrailingSlash = folderPath & "\"
     End If
-    GetClaudeReviewFolder = folderPath & "\"
+End Function
+
+Private Function EnsureFolderExists(ByVal folderPath As String) As Boolean
+    On Error GoTo Fail
+
+    Dim normalizedPath As String
+    normalizedPath = folderPath
+    If Right$(normalizedPath, 1) = "\" Then
+        normalizedPath = Left$(normalizedPath, Len(normalizedPath) - 1)
+    End If
+
+    If Len(normalizedPath) = 0 Then Exit Function
+
+    If Dir(normalizedPath, vbDirectory) = "" Then
+        MkDir normalizedPath
+    End If
+
+    EnsureFolderExists = True
+    Exit Function
+
+Fail:
+    EnsureFolderExists = False
+End Function
+
+Private Function GetLegacyLlmReviewFolder() As String
+    GetLegacyLlmReviewFolder = EnsureTrailingSlash(Environ("TEMP") & "\claude_review")
+End Function
+
+Private Function GetActiveDocJobNumber() As String
+    Dim docName As String
+    Dim re As Object
+
+    If ActiveDocument Is Nothing Then Exit Function
+
+    docName = ActiveDocument.Name
+
+    Set re = CreateObject("VBScript.RegExp")
+    re.Pattern = "^(\d{4})"
+
+    If re.Test(docName) Then
+        GetActiveDocJobNumber = re.Execute(docName)(0).SubMatches(0)
+    End If
+End Function
+
+Private Function GetJobFolderNameFromDocumentPath() As String
+    Dim docPath As String
+    Dim pathParts() As String
+    Dim i As Long
+
+    If ActiveDocument Is Nothing Then Exit Function
+
+    docPath = ActiveDocument.FullName
+    pathParts = Split(docPath, "\")
+
+    For i = 0 To UBound(pathParts) - 1
+        If LCase$(pathParts(i)) = "jobs" Then
+            GetJobFolderNameFromDocumentPath = pathParts(i + 1)
+            Exit Function
+        End If
+    Next i
+End Function
+
+Private Function FindExistingAiProjectFolderName(ByVal projectsRoot As String, ByVal jobNumber As String) As String
+    On Error GoTo Fail
+
+    Dim folderName As String
+    folderName = Dir(EnsureTrailingSlash(projectsRoot) & jobNumber & "*", vbDirectory)
+
+    Do While Len(folderName) > 0
+        If folderName <> "." And folderName <> ".." Then
+            If (GetAttr(EnsureTrailingSlash(projectsRoot) & folderName) And vbDirectory) = vbDirectory Then
+                FindExistingAiProjectFolderName = folderName
+                Exit Function
+            End If
+        End If
+        folderName = Dir()
+    Loop
+
+    Exit Function
+
+Fail:
+    FindExistingAiProjectFolderName = ""
+End Function
+
+Private Function GetAiProjectFolder() As String
+    Const PROJECTS_ROOT As String = "G:\My Drive\ai-skills\projects\"
+
+    Dim projectsRoot As String
+    Dim jobNumber As String
+    Dim jobFolderName As String
+    Dim projectFolderPath As String
+
+    projectsRoot = EnsureTrailingSlash(PROJECTS_ROOT)
+    If Not EnsureFolderExists(projectsRoot) Then Exit Function
+
+    jobNumber = GetActiveDocJobNumber()
+    If Len(jobNumber) = 0 Then Exit Function
+
+    jobFolderName = GetJobFolderNameFromDocumentPath()
+    If Len(jobFolderName) = 0 Then
+        jobFolderName = FindExistingAiProjectFolderName(projectsRoot, jobNumber)
+    End If
+    If Len(jobFolderName) = 0 Then
+        jobFolderName = jobNumber
+    End If
+
+    projectFolderPath = projectsRoot & jobFolderName
+    If EnsureFolderExists(projectFolderPath) Then
+        GetAiProjectFolder = EnsureTrailingSlash(projectFolderPath)
+    End If
+End Function
+
+Private Function GetLlmReviewFolder() As String
+    Dim folderPath As String
+
+    folderPath = GetAiProjectFolder()
+    If Len(folderPath) = 0 Then
+        folderPath = GetLegacyLlmReviewFolder()
+        Call EnsureFolderExists(folderPath)
+    End If
+
+    GetLlmReviewFolder = EnsureTrailingSlash(folderPath)
 End Function
 
 Private Function GetDocStem() As String
@@ -8827,7 +9194,7 @@ Private Function GetTimestampSlug() As String
 End Function
 
 Public Function V4_ExportDocumentMapToFileEx(Optional ByVal copyToClipboard As Boolean = True, Optional ByVal showMessages As Boolean = False) As String
-    ' Exports DSM markdown + JSON to %TEMP%\claude_review\ and returns the markdown path.
+    ' Exports DSM markdown + JSON to the LLM review exchange folder and returns the markdown path.
     On Error GoTo ErrorHandler
 
     If ActiveDocument.Path = "" Then
@@ -8851,8 +9218,8 @@ Public Function V4_ExportDocumentMapToFileEx(Optional ByVal copyToClipboard As B
 
     Dim markdownPath As String
     Dim jsonPath As String
-    markdownPath = GetClaudeReviewFolder() & GetDocStem() & "_dsm.md"
-    jsonPath = GetClaudeReviewFolder() & GetDocStem() & "_dsm.json"
+    markdownPath = GetLlmReviewFolder() & GetDocStem() & "_dsm.md"
+    jsonPath = GetLlmReviewFolder() & GetDocStem() & "_dsm.json"
 
     Dim fileNum As Integer
 
@@ -8865,6 +9232,9 @@ Public Function V4_ExportDocumentMapToFileEx(Optional ByVal copyToClipboard As B
     Open jsonPath For Output As #fileNum
     Print #fileNum, mapJson
     Close #fileNum
+
+    Debug.Print "V4 DSM export markdown: " & markdownPath
+    Debug.Print "V4 DSM export json: " & jsonPath
 
     If copyToClipboard Then
         Dim dataObj As Object
@@ -8896,7 +9266,7 @@ End Sub
 Public Function V4_ImportAndApplyToolCallsEx(Optional ByVal interactive As Boolean = False, _
     Optional ByVal runId As String = "", Optional ByVal showMessages As Boolean = False, _
     Optional ByVal saveAfterApply As Boolean = False) As String
-    ' Reads tool_calls JSON from %TEMP%\claude_review\{stem}_toolcalls.json and returns run result JSON.
+    ' Reads tool_calls JSON from the LLM review exchange folder and returns run result JSON.
     On Error GoTo ErrorHandler
 
     If ActiveDocument.Path = "" Then
@@ -8906,7 +9276,7 @@ Public Function V4_ImportAndApplyToolCallsEx(Optional ByVal interactive As Boole
     End If
 
     Dim toolCallsPath As String
-    toolCallsPath = GetClaudeReviewFolder() & GetDocStem() & "_toolcalls.json"
+    toolCallsPath = GetLlmReviewFolder() & GetDocStem() & "_toolcalls.json"
     If Dir(toolCallsPath) = "" Then
         If showMessages Then MsgBox "Tool calls file not found:" & vbCrLf & toolCallsPath, vbExclamation, "V4 Import"
         V4_ImportAndApplyToolCallsEx = ""
@@ -8914,7 +9284,7 @@ Public Function V4_ImportAndApplyToolCallsEx(Optional ByVal interactive As Boole
     End If
 
     Dim backupPath As String
-    backupPath = GetClaudeReviewFolder() & GetDocStem() & "_backup_" & GetTimestampSlug() & ".docx"
+    backupPath = GetLlmReviewFolder() & GetDocStem() & "_backup_" & GetTimestampSlug() & ".docx"
     ActiveDocument.Save ' Save current state first
     
     ' Safely copy the file using FileSystemObject to avoid Word/Cloud sync locks (Error 70)

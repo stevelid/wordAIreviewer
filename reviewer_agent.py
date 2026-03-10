@@ -132,21 +132,47 @@ def normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def get_temp_dir(custom_temp_dir):
-    if custom_temp_dir:
-        return Path(custom_temp_dir).expanduser().resolve()
+PROJECTS_ROOT = Path(r"G:\My Drive\ai-skills\projects")
+
+
+def get_default_exchange_dir(custom_exchange_dir):
+    if custom_exchange_dir:
+        return Path(custom_exchange_dir).expanduser().resolve()
     return Path(os.environ.get("TEMP", tempfile.gettempdir())) / "claude_review"
 
 
-def resolve_dsm_input(file_arg, temp_dir):
+def extract_job_number(text):
+    match = re.match(r"^(\d{4})", text.strip())
+    return match.group(1) if match else ""
+
+
+def find_project_dsm_path(file_arg):
+    candidate = Path(file_arg)
+    dsm_name = candidate.name if candidate.suffix.lower() == ".md" else f"{file_arg}_dsm.md"
+    job_number = extract_job_number(candidate.stem if candidate.suffix.lower() == ".md" else file_arg)
+    if not job_number or not PROJECTS_ROOT.exists():
+        return None
+
+    matches = sorted(
+        project_dir / dsm_name
+        for project_dir in PROJECTS_ROOT.glob(f"{job_number}*")
+        if project_dir.is_dir() and (project_dir / dsm_name).exists()
+    )
+    return matches[0].resolve() if matches else None
+
+
+def resolve_dsm_input(file_arg, default_exchange_dir):
     candidate = Path(file_arg).expanduser()
     if candidate.exists():
         dsm_path = candidate.resolve()
     else:
-        if candidate.suffix.lower() == ".md":
-            dsm_path = (temp_dir / candidate.name).resolve()
+        project_path = find_project_dsm_path(file_arg)
+        if project_path is not None:
+            dsm_path = project_path
+        elif candidate.suffix.lower() == ".md":
+            dsm_path = (default_exchange_dir / candidate.name).resolve()
         else:
-            dsm_path = (temp_dir / f"{file_arg}_dsm.md").resolve()
+            dsm_path = (default_exchange_dir / f"{file_arg}_dsm.md").resolve()
 
     if not dsm_path.exists():
         raise FileNotFoundError(f"DSM markdown not found: {dsm_path}")
@@ -569,13 +595,13 @@ def call_runner(input_text, runner, model, cwd, system_prompt):
     raise RuntimeError(f"Unsupported runner: {runner}")
 
 
-def run_llm_two_pass(markdown_text, runner, model, cwd, temp_dir, stem):
+def run_llm_two_pass(markdown_text, runner, model, cwd, exchange_dir, stem):
     """Run the two-pass LLM review: plan first, execute second."""
     plan_prompt = load_prompt("plan")
     print("  Pass 1/2: Generating review plan...")
     plan_output, used_runner = call_runner(markdown_text, runner, model, cwd, plan_prompt)
 
-    plan_path = temp_dir / f"{stem}_plan.txt"
+    plan_path = exchange_dir / f"{stem}_plan.txt"
     write_text_file(plan_path, plan_output)
     print(f"  Plan saved: {plan_path}")
 
@@ -610,7 +636,13 @@ def parse_args():
         help="LLM runner for automatic mode (default: auto).",
     )
     parser.add_argument("--model", default="", help="Optional model override for codex/claude.")
-    parser.add_argument("--temp-dir", default="", help="Override temp exchange directory.")
+    parser.add_argument(
+        "--exchange-dir",
+        "--temp-dir",
+        dest="exchange_dir",
+        default="",
+        help="Override LLM review exchange directory.",
+    )
     parser.add_argument("--manual-output-file", default="", help="Parse saved LLM output text file.")
     parser.add_argument(
         "--manual-paste",
@@ -634,14 +666,17 @@ def main():
         print("ERROR: Use either --manual-output-file or --manual-paste, not both.", file=sys.stderr)
         return 2
 
-    temp_dir = get_temp_dir(args.temp_dir)
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    default_exchange_dir = get_default_exchange_dir(args.exchange_dir)
+    default_exchange_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        dsm_path, stem = resolve_dsm_input(args.file, temp_dir)
+        dsm_path, stem = resolve_dsm_input(args.file, default_exchange_dir)
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+
+    exchange_dir = default_exchange_dir if args.exchange_dir else dsm_path.parent
+    exchange_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         print(f"[1/4] Reading DSM markdown: {dsm_path}")
@@ -650,8 +685,8 @@ def main():
         print(f"ERROR: failed reading DSM markdown: {exc}", file=sys.stderr)
         return 2
 
-    raw_output_path = Path(args.raw_output) if args.raw_output else (temp_dir / f"{stem}_llm_response.txt")
-    toolcalls_path = Path(args.toolcalls_out) if args.toolcalls_out else (temp_dir / f"{stem}_toolcalls.json")
+    raw_output_path = Path(args.raw_output) if args.raw_output else (exchange_dir / f"{stem}_llm_response.txt")
+    toolcalls_path = Path(args.toolcalls_out) if args.toolcalls_out else (exchange_dir / f"{stem}_toolcalls.json")
 
     manual_mode = bool(args.manual_output_file or args.manual_paste)
     llm_output = ""
@@ -676,7 +711,7 @@ def main():
             else:
                 print(f"[2/4] Running two-pass LLM review via runner='{args.runner}'...")
                 llm_output, used_runner = run_llm_two_pass(
-                    markdown_text, args.runner, args.model.strip(), dsm_path.parent, temp_dir, stem
+                    markdown_text, args.runner, args.model.strip(), dsm_path.parent, exchange_dir, stem
                 )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -700,7 +735,7 @@ def main():
         return 1
 
     # Write failure report if there were any warnings
-    failures_path = temp_dir / f"{stem}_failures.txt"
+    failures_path = exchange_dir / f"{stem}_failures.txt"
     if warnings:
         failure_lines = [
             f"V5 Parse Failures for: {stem}",
