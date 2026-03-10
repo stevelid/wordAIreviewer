@@ -12,8 +12,8 @@ This avoids large JSON generation directly from the model while preserving deter
 
 ## What Is Already Implemented
 - `wordAIreviewer.bas` now exports both:
-  - `G:\My Drive\ai-skills\projects\{job folder}\{doc_stem}_dsm.md` when job context is available
-  - `G:\My Drive\ai-skills\projects\{job folder}\{doc_stem}_dsm.json` when job context is available
+  - `G:\My Drive\Venta AI\projects\{job folder}\{doc_stem}_dsm.md` when job context is available
+  - `G:\My Drive\Venta AI\projects\{job folder}\{doc_stem}_dsm.json` when job context is available
   - `%TEMP%\claude_review\...` as the legacy fallback when no project folder can be resolved
 - Paragraph lines in markdown are annotated as `[P#] ...`.
 - Table cells in markdown are annotated as `[T#.H.C#]` and `[T#.R#.C#]`.
@@ -69,7 +69,7 @@ python reviewer_agent.py --file 6246.260211.NIA --runner claude --model sonnet
 - document stem (`6246.260211.NIA`) or
 - full path to a `_dsm.md` file.
 
-If the stem starts with a 4-digit job number, `reviewer_agent.py` now also searches `G:\My Drive\ai-skills\projects\{job}*\` before falling back to `%TEMP%\claude_review\`.
+If the stem starts with a 4-digit job number, `reviewer_agent.py` now also searches `G:\My Drive\Venta AI\projects\{job}*\` before falling back to `%TEMP%\claude_review\`.
 
 ### 2B. Run Manual Mode (No API/No Auto CLI Run)
 Use this when you already have model output text from another interface.

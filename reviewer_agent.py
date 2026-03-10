@@ -132,7 +132,7 @@ def normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-PROJECTS_ROOT = Path(r"G:\My Drive\ai-skills\projects")
+PROJECTS_ROOT = Path(r"G:\My Drive\Venta AI\projects")
 
 
 def get_default_exchange_dir(custom_exchange_dir):

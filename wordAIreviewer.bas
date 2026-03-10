@@ -245,7 +245,7 @@ Private Function GetTableTitleBelow(ByVal tbl As Table) As String
             GoTo ContinueLoop
         End If
 
-        t = Trim$(NormalizeForDocument(GetParagraphTextFinalView(p)))
+        t = Trim$(VAHelpers.NormalizeForDocument(GetParagraphTextFinalView(p)))
 
         ' Skip empty paragraphs and very short ones
         If Len(t) > 3 Then
@@ -288,7 +288,7 @@ Private Function GetTableCaptionAbove(ByVal tbl As Table) As String
             GoTo ContinueLoop
         End If
 
-        t = Trim$(NormalizeForDocument(GetParagraphTextFinalView(p)))
+        t = Trim$(VAHelpers.NormalizeForDocument(GetParagraphTextFinalView(p)))
 
         ' Skip empty paragraphs
         If Len(t) > 3 Then
@@ -322,7 +322,7 @@ Private Function GetTableHeaderRowText(ByVal tbl As Table) As String
     For Each c In tbl.Range.Cells
         If c.RowIndex = 1 Then
             hasRow1Cell = True
-            result = result & " " & Trim$(NormalizeForDocument(GetCellTextFinalView(c)))
+            result = result & " " & Trim$(VAHelpers.NormalizeForDocument(GetCellTextFinalView(c)))
         End If
     Next c
 
@@ -387,7 +387,7 @@ Private Function FindTableByTitle(ByVal tableTitle As String, ByRef matchCount A
     Dim matches As New Collection
     Dim normalizedTitle As String
 
-    normalizedTitle = NormalizeForDocument(tableTitle)
+    normalizedTitle = VAHelpers.NormalizeForDocument(tableTitle)
 
     ' First pass: exact match on title below
     For i = 1 To g_TableIndexCount
@@ -436,7 +436,7 @@ Private Function GetMatchingTableCandidates(ByVal tableTitle As String) As Colle
     Dim matches As New Collection
     Dim normalizedTitle As String
 
-    normalizedTitle = NormalizeForDocument(tableTitle)
+    normalizedTitle = VAHelpers.NormalizeForDocument(tableTitle)
 
     ' Check title below
     For i = 1 To g_TableIndexCount
@@ -1323,13 +1323,13 @@ Private Function ExportStructureMapAsMarkdown() As String
         
         If elem.ElementType = "paragraph" Then
             Set paraRange = ActiveDocument.Range(elem.StartPos, elem.EndPos)
-            paraText = Trim$(NormalizeForDocument(GetRangeTextFinalView(paraRange)))
+            paraText = Trim$(VAHelpers.NormalizeForDocument(GetRangeTextFinalView(paraRange)))
             output = output & "[" & elem.ElementID & "] " & paraText & vbCrLf & vbCrLf
             
         ElseIf elem.ElementType = "table" Then
             output = output & "## Table " & elem.ElementID
             If Len(elem.TextPreview) > 0 Then
-                output = output & ": " & NormalizeForDocument(elem.TextPreview)
+                output = output & ": " & VAHelpers.NormalizeForDocument(elem.TextPreview)
             End If
             output = output & vbCrLf
             output = output & ExportTableContentPreview(elem.ElementID) & vbCrLf & vbCrLf
@@ -1395,7 +1395,7 @@ End Sub
 Private Function EscapeMarkdownCellPreview(ByVal cellValue As String) As String
     Dim normalized As String
 
-    normalized = NormalizeForDocument(cellValue)
+    normalized = VAHelpers.NormalizeForDocument(cellValue)
     normalized = Replace(normalized, vbCrLf, " ")
     normalized = Replace(normalized, vbCr, " ")
     normalized = Replace(normalized, vbLf, " ")
@@ -2061,7 +2061,7 @@ Private Function ExecuteReplaceActionV4(ByVal targetRange As Range, ByVal findTe
     On Error GoTo ErrorHandler
     
     Dim actionRange As Range
-    Set actionRange = FindLongString(NormalizeForDocument(findText), targetRange, matchCase)
+    Set actionRange = FindLongString(VAHelpers.NormalizeForDocument(findText), targetRange, matchCase)
     If actionRange Is Nothing Then
         TraceLog "  -> Replace action: text not found in target range"
         SetLastActionError "TEXT_NOT_FOUND", "Find text was not found inside the resolved target."
@@ -2422,7 +2422,8 @@ Private Sub ApplyLlmReview_V4()
     
     On Error GoTo ErrorHandler
     
-    Dim inputForm As New frmJsonInput
+    Dim inputForm As Object
+    Set inputForm = CreateNamedUserForm("frmJsonInput")
     Dim jsonString As String
     Dim suggestions As Object
     Dim suggestion As Object
@@ -2498,7 +2499,8 @@ Private Sub RunInteractiveReview_V4()
     
     On Error GoTo ErrorHandler
     
-    Dim inputForm As New frmJsonInput
+    Dim inputForm As Object
+    Set inputForm = CreateNamedUserForm("frmJsonInput")
     Dim jsonString As String
     Dim suggestions As Object
     Dim suggestion As Object
@@ -2627,7 +2629,7 @@ ErrorHandler:
     MsgBox "Error in RunInteractiveReview_V4: " & Err.Description, vbCritical, "Error"
 End Sub
 
-Private Function WaitForPreviewFormAction(ByVal previewForm As frmSuggestionPreview, ByVal contextLabel As String, Optional ByVal logProgress As Boolean = False) As String
+Private Function WaitForPreviewFormAction(ByVal previewForm As Object, ByVal contextLabel As String, Optional ByVal logProgress As Boolean = False) As String
     Dim waitCounter As Long
     waitCounter = 0
 
@@ -2650,6 +2652,10 @@ Private Function WaitForPreviewFormAction(ByVal previewForm As frmSuggestionPrev
     WaitForPreviewFormAction = previewForm.UserAction
 End Function
 
+Private Function CreateNamedUserForm(ByVal formName As String) As Object
+    Set CreateNamedUserForm = VBA.UserForms.Add(formName)
+End Function
+
 Private Function ShowSuggestionPreviewV4(ByVal suggestion As Object, ByVal index As Long, ByVal total As Long) As String
     ' V4 Preview function - shows target reference and resolved range
     
@@ -2659,7 +2665,7 @@ Private Function ShowSuggestionPreviewV4(ByVal suggestion As Object, ByVal index
     Dim action As String
     Dim explanation As String
     Dim targetRange As Range
-    Dim previewForm As frmSuggestionPreview
+    Dim previewForm As Object
     Dim findText As String
     Dim replaceText As String
     Dim styleKey As String
@@ -2673,7 +2679,7 @@ Private Function ShowSuggestionPreviewV4(ByVal suggestion As Object, ByVal index
     Set targetRange = ResolveTargetToRange(targetRef)
     
     ' Create preview form
-    Set previewForm = New frmSuggestionPreview
+    Set previewForm = CreateNamedUserForm("frmSuggestionPreview")
     
     If targetRange Is Nothing Then
         ' Target not found - show error in preview
@@ -2967,8 +2973,8 @@ End Function
 Private Function TextMatchesHeuristic(ByVal expected As String, ByVal actual As String) As Boolean
     Dim e As String
     Dim a As String
-    e = NormalizeForDocument(Trim$(expected))
-    a = NormalizeForDocument(Trim$(actual))
+    e = VAHelpers.NormalizeForDocument(Trim$(expected))
+    a = VAHelpers.NormalizeForDocument(Trim$(actual))
 
     If Len(e) = 0 Then
         TextMatchesHeuristic = True
@@ -3036,9 +3042,9 @@ Private Function PreflightAnalyze(ByVal suggestions As Object, ByVal docRange As
                     End If
                     If Len(Trim$(usedTableAnchor)) > 0 Then
                         Dim cacheKey As String
-                        cacheKey = NormalizeForDocument(usedTableAnchor)
+                        cacheKey = VAHelpers.NormalizeForDocument(usedTableAnchor)
                         Dim captionKey As String
-                        captionKey = NormalizeForDocument(StripTableNumberPrefix(usedTableAnchor))
+                        captionKey = VAHelpers.NormalizeForDocument(StripTableNumberPrefix(usedTableAnchor))
                         If Len(Trim$(captionKey)) > 0 Then
                             If Not usedCaptionKeys.Exists(captionKey) Then usedCaptionKeys.Add captionKey, True
                         End If
@@ -3058,8 +3064,8 @@ Private Function PreflightAnalyze(ByVal suggestions As Object, ByVal docRange As
                 usedTableAnchor = GetSuggestionText(suggestion, "context", "")
             End If
             If Len(Trim$(usedTableAnchor)) > 0 Then
-                cacheKey = NormalizeForDocument(usedTableAnchor)
-                captionKey = NormalizeForDocument(StripTableNumberPrefix(usedTableAnchor))
+                cacheKey = VAHelpers.NormalizeForDocument(usedTableAnchor)
+                captionKey = VAHelpers.NormalizeForDocument(StripTableNumberPrefix(usedTableAnchor))
                 If Len(Trim$(captionKey)) > 0 Then
                     If Not usedCaptionKeys.Exists(captionKey) Then usedCaptionKeys.Add captionKey, True
                 End If
@@ -3088,7 +3094,7 @@ Private Function PreflightAnalyze(ByVal suggestions As Object, ByVal docRange As
             On Error GoTo ErrorHandler
         End If
         Dim ctxNorm As String
-        ctxNorm = NormalizeForDocument(context)
+        ctxNorm = VAHelpers.NormalizeForDocument(context)
         Dim ctxRange As Range
         Set ctxRange = FindWithProgressiveFallback(ctxNorm, docRange, effMatch, suggestion)
         If ctxRange Is Nothing Then
@@ -3106,7 +3112,7 @@ Private Function PreflightAnalyze(ByVal suggestions As Object, ByVal docRange As
             tgt = GetSuggestionText(suggestion, "target", "")
             If Len(tgt) > 0 Then
                 Dim occ As Long
-                occ = CountOccurrencesInRange(NormalizeForDocument(tgt), ctxRange, effMatch)
+                occ = CountOccurrencesInRange(VAHelpers.NormalizeForDocument(tgt), ctxRange, effMatch)
                 If occ > 1 Then isAmbiguous = True
             End If
         End If
@@ -3205,7 +3211,7 @@ Private Function IsActionNoOp(ByVal actionObject As Object, ByVal topSuggestion 
     Dim actionRange As Range
     If Len(target) > 0 Then
         Dim tNorm As String
-        tNorm = NormalizeForDocument(target)
+        tNorm = VAHelpers.NormalizeForDocument(target)
         Dim occ As Long
         occ = 1
         If HasDictionaryKey(actionObject, "occurrenceIndex") Then occ = CLng(Val(CStr(actionObject("occurrenceIndex"))))
@@ -3249,7 +3255,8 @@ End Function
 Private Sub ApplyLlmReview_V3()
     ' This sub now only serves to launch the UserForm.
     ' The form's code-behind now controls the workflow.
-    Dim inputForm As New frmJsonInput
+    Dim inputForm As Object
+    Set inputForm = CreateNamedUserForm("frmJsonInput")
     Debug.Print vbCrLf & "================ RUN START: " & Now() & " ================"
     inputForm.Show vbModal
     Unload inputForm
@@ -3261,7 +3268,7 @@ End Sub
 
 ' =========================================================================================
 
-Private Sub RunReviewProcess(ByVal TheForm As frmJsonInput)
+Private Sub RunReviewProcess(ByVal TheForm As Object)
     ' *** WORKFLOW SELECTOR ***
     ' Set to True for INTERACTIVE mode (new), False for TRACKED CHANGES mode (old)
     ' Disable (False) pros: Applies all suggestions in one pass with summary/fallback comments.
@@ -3457,7 +3464,7 @@ Private Function ShowSuggestionPreview(ByVal suggestion As Object, ByVal index A
     On Error GoTo ErrorHandler
     
     ' Declare form once at the top
-    Dim previewForm As frmSuggestionPreview
+    Dim previewForm As Object
     Dim context As String
     Dim contextForSearch As String
     Dim contextRange As Range
@@ -3474,13 +3481,13 @@ Private Function ShowSuggestionPreview(ByVal suggestion As Object, ByVal index A
     End If
     ' Find the context and action ranges
     context = GetSuggestionContextText(suggestion)
-    contextForSearch = NormalizeForDocument(context)
+    contextForSearch = VAHelpers.NormalizeForDocument(context)
     Set contextRange = FindWithProgressiveFallback(contextForSearch, searchRange, effectiveMatchCase, suggestion)
 
     If contextRange Is Nothing Then
         ' Context not found - show error in form
         ' even if autoAccept is True, because we can't apply it automatically.
-        Set previewForm = New frmSuggestionPreview
+        Set previewForm = CreateNamedUserForm("frmSuggestionPreview")
         previewForm.LoadSuggestion suggestion, index, total, Nothing, Nothing
         previewForm.Show vbModeless
 
@@ -3499,7 +3506,7 @@ Private Function ShowSuggestionPreview(ByVal suggestion As Object, ByVal index A
     If suggestion.Exists("target") Then
         target = GetSuggestionText(suggestion, "target", "")
         If Len(target) > 0 Then
-            targetForSearch = NormalizeForDocument(target)
+            targetForSearch = VAHelpers.NormalizeForDocument(target)
             Set actionRange = FindWithProgressiveFallback(targetForSearch, contextRange, effectiveMatchCase, suggestion)
         End If
     End If
@@ -3509,7 +3516,7 @@ Private Function ShowSuggestionPreview(ByVal suggestion As Object, ByVal index A
     End If
     
     ' Show the form modeless (allows document interaction)
-    Set previewForm = New frmSuggestionPreview
+    Set previewForm = CreateNamedUserForm("frmSuggestionPreview")
     previewForm.LoadSuggestion suggestion, index, total, contextRange, actionRange
     previewForm.Show vbModeless
 
@@ -3526,7 +3533,7 @@ End Function
 ' === OLD: TRACKED CHANGES REVIEW WORKFLOW (PRESERVED) ===================================
 ' =========================================================================================
 
-Private Sub RunTrackedChangesReview(ByVal TheForm As frmJsonInput, ByVal suggestions As Object, ByVal startTime As Single)
+Private Sub RunTrackedChangesReview(ByVal TheForm As Object, ByVal suggestions As Object, ByVal startTime As Single)
     ' This is the ORIGINAL workflow that applies all changes as tracked changes,
     ' then opens the review form. Preserved for fallback/comparison.
     
@@ -3666,7 +3673,7 @@ Private Function ProcessSuggestion(ByRef searchRange As Range, ByVal suggestion 
     context = suggestion("context")
 
     Dim contextForSearch As String
-    contextForSearch = NormalizeForDocument(context)
+    contextForSearch = VAHelpers.NormalizeForDocument(context)
     Dim effectiveMatchCase As Boolean
     effectiveMatchCase = matchCase
     If HasDictionaryKey(suggestion, "matchCase") Then
@@ -3817,7 +3824,7 @@ Private Function HandleNotFoundContext(ByVal searchRange As Range, ByVal suggest
     ' 2. Search for this keyword in the document.
     Dim keywordRange As Range
     Dim keywordForSearch As String
-    keywordForSearch = NormalizeForDocument(keyword)
+    keywordForSearch = VAHelpers.NormalizeForDocument(keyword)
 
     ' IMPORTANT: We search from the START of the main searchRange, not from a previous find.
     ' This ensures we find the first available anchor point for our fallback comment.
@@ -3890,7 +3897,7 @@ Private Sub ExecuteSingleAction(ByRef overallContextRange As Range, ByVal action
     End If
 
     targetForSearch = ""
-    If Len(target) > 0 Then targetForSearch = NormalizeForDocument(target)
+    If Len(target) > 0 Then targetForSearch = VAHelpers.NormalizeForDocument(target)
 
     occurrenceIndex = 1
     If actionObject.Exists("occurrenceIndex") Then
@@ -4469,7 +4476,7 @@ Private Function GetCellText(ByVal c As Cell) As String
     txt = GetCellTextFinalView(c)
 
     ' Normalize whitespace
-    txt = NormalizeForDocument(txt)
+    txt = VAHelpers.NormalizeForDocument(txt)
 
     GetCellText = txt
 End Function
@@ -4937,7 +4944,7 @@ Private Function CollectTablesByCaptionAnchor(ByVal contextAnchor As String, ByV
         On Error GoTo Fail
         For i = 1 To 3
             If p Is Nothing Then Exit For
-            t = Trim$(NormalizeForDocument(p.Range.Text))
+            t = Trim$(VAHelpers.NormalizeForDocument(p.Range.Text))
             If Len(t) > 0 Then
                 If TextMatchesHeuristic(contextAnchor, t) Then
                     foundCaption = True
@@ -4955,7 +4962,7 @@ Private Function CollectTablesByCaptionAnchor(ByVal contextAnchor As String, ByV
             On Error GoTo Fail
             For i = 1 To 3
                 If p Is Nothing Then Exit For
-                t = Trim$(NormalizeForDocument(p.Range.Text))
+                t = Trim$(VAHelpers.NormalizeForDocument(p.Range.Text))
                 If Len(t) > 0 Then
                     If TextMatchesHeuristic(contextAnchor, t) Then
                         foundCaption = True
@@ -5005,9 +5012,9 @@ Private Function ResolveTableFromContextAnchor(ByVal contextAnchor As String, By
             Dim pp As Paragraph
             On Error Resume Next
             Set pp = t.Range.Paragraphs(1).Previous
-            If Not pp Is Nothing Then bt = Trim$(NormalizeForDocument(pp.Range.Text))
+            If Not pp Is Nothing Then bt = Trim$(VAHelpers.NormalizeForDocument(pp.Range.Text))
             Set pp = t.Range.Paragraphs(t.Range.Paragraphs.Count).Next
-            If Not pp Is Nothing Then at = Trim$(NormalizeForDocument(pp.Range.Text))
+            If Not pp Is Nothing Then at = Trim$(VAHelpers.NormalizeForDocument(pp.Range.Text))
             On Error GoTo Fail
             If Len(bt) > 0 Then Debug.Print "       candidate caption(before): " & Left$(bt, 120) & IIf(Len(bt) > 120, "...", "")
             If Len(at) > 0 Then Debug.Print "       candidate caption(after):  " & Left$(at, 120) & IIf(Len(at) > 120, "...", "")
@@ -5016,7 +5023,7 @@ Private Function ResolveTableFromContextAnchor(ByVal contextAnchor As String, By
     End If
 
     Dim normAnchor As String
-    normAnchor = NormalizeForDocument(contextAnchor)
+    normAnchor = VAHelpers.NormalizeForDocument(contextAnchor)
 
     Dim work As Range
     Set work = searchRange.Duplicate
@@ -5118,7 +5125,7 @@ End Function
 Private Function StripTableNumberPrefix(ByVal captionText As String) As String
     On Error GoTo CleanFail
     Dim s As String
-    s = Trim$(NormalizeForDocument(captionText))
+    s = Trim$(VAHelpers.NormalizeForDocument(captionText))
     If Len(s) = 0 Then
         StripTableNumberPrefix = ""
         Exit Function
@@ -5160,13 +5167,13 @@ Private Function StripTableNumberPrefix(ByVal captionText As String) As String
     Loop
 
     If Len(s) = 0 Then
-        StripTableNumberPrefix = Trim$(NormalizeForDocument(captionText))
+        StripTableNumberPrefix = Trim$(VAHelpers.NormalizeForDocument(captionText))
     Else
         StripTableNumberPrefix = s
     End If
     Exit Function
 CleanFail:
-    StripTableNumberPrefix = Trim$(NormalizeForDocument(captionText))
+    StripTableNumberPrefix = Trim$(VAHelpers.NormalizeForDocument(captionText))
 End Function
 
 Private Sub WarnUnusedAmbiguousTableTitles(ByVal searchRange As Range, ByVal usedCaptionKeys As Object)
@@ -5205,9 +5212,9 @@ Private Function BuildCaptionKeyCounts(ByVal searchRange As Range) As Object
         On Error GoTo Fail
         For i = 1 To 3
             If p Is Nothing Then Exit For
-            t = Trim$(NormalizeForDocument(p.Range.Text))
+            t = Trim$(VAHelpers.NormalizeForDocument(p.Range.Text))
             If Len(t) > 0 Then
-                keyText = Trim$(NormalizeForDocument(StripTableNumberPrefix(t)))
+                keyText = Trim$(VAHelpers.NormalizeForDocument(StripTableNumberPrefix(t)))
                 If Len(keyText) > 0 Then
                     If Not seen.Exists(keyText) Then
                         seen.Add keyText, True
@@ -5225,9 +5232,9 @@ Private Function BuildCaptionKeyCounts(ByVal searchRange As Range) As Object
         On Error GoTo Fail
         For i = 1 To 3
             If p Is Nothing Then Exit For
-            t = Trim$(NormalizeForDocument(p.Range.Text))
+            t = Trim$(VAHelpers.NormalizeForDocument(p.Range.Text))
             If Len(t) > 0 Then
-                keyText = Trim$(NormalizeForDocument(StripTableNumberPrefix(t)))
+                keyText = Trim$(VAHelpers.NormalizeForDocument(StripTableNumberPrefix(t)))
                 If Len(keyText) > 0 Then
                     If Not seen.Exists(keyText) Then
                         seen.Add keyText, True
@@ -5250,7 +5257,7 @@ Private Sub IncrementDictCount(ByVal d As Object, ByVal keyText As String)
     On Error GoTo CleanExit
     If d Is Nothing Then Exit Sub
     Dim k As String
-    k = Trim$(NormalizeForDocument(keyText))
+    k = Trim$(VAHelpers.NormalizeForDocument(keyText))
     If Len(k) = 0 Then Exit Sub
     If d.Exists(k) Then
         d(k) = CLng(d(k)) + 1
@@ -5337,7 +5344,7 @@ Private Function FindPipeDelimitedContext(ByVal searchString As String, ByVal se
     Dim firstSeg As String
     firstSeg = segments(1)
     Dim firstSegNorm As String
-    firstSegNorm = NormalizeForDocument(firstSeg)
+    firstSegNorm = VAHelpers.NormalizeForDocument(firstSeg)
     
     Dim searchCursor As Range
     Set searchCursor = searchRange.Duplicate
@@ -5367,7 +5374,7 @@ Private Function FindPipeDelimitedContext(ByVal searchString As String, ByVal se
         Debug.Print "    [PipeSearch] Iter=" & loopCounter & " cursor=" & searchCursor.Start & "-" & searchCursor.End
         Set matchStart = FindLongString(firstSegNorm, searchCursor, matchCase)
         If matchStart Is Nothing Then Exit Do
-        Debug.Print "    [PipeSearch]  firstMatch=" & matchStart.Start & "-" & matchStart.End & " text='" & Replace(Left$(NormalizeForDocument(matchStart.Text), 80), Chr(13), "\\r") & IIf(Len(matchStart.Text) > 80, "...", "") & "'"
+        Debug.Print "    [PipeSearch]  firstMatch=" & matchStart.Start & "-" & matchStart.End & " text='" & Replace(Left$(VAHelpers.NormalizeForDocument(matchStart.Text), 80), Chr(13), "\\r") & IIf(Len(matchStart.Text) > 80, "...", "") & "'"
 
         ' Check if this match is within TOC - skip if so
         If IsRangeInTOC(matchStart) Then
@@ -5420,7 +5427,7 @@ Private Function FindPipeDelimitedContext(ByVal searchString As String, ByVal se
         If segments.Count > 1 Then
             For seqIdx = 2 To segments.Count
                 Dim nextSeg As String
-                nextSeg = NormalizeForDocument(segments(seqIdx))
+                nextSeg = VAHelpers.NormalizeForDocument(segments(seqIdx))
                 Debug.Print "    [PipeSearch]   seek seg(" & seqIdx & ")='" & Left$(nextSeg, 80) & IIf(Len(nextSeg) > 80, "...", "") & "'"
                 
                 ' Look ahead from currentPos.End
@@ -5438,7 +5445,7 @@ Private Function FindPipeDelimitedContext(ByVal searchString As String, ByVal se
                 If lookAhead.End - lookAhead.Start > 500 Then
                     lookAhead.End = lookAhead.Start + 500
                 End If
-                Debug.Print "    [PipeSearch]    lookAhead=" & lookAhead.Start & "-" & lookAhead.End & " preview='" & Replace(Left$(NormalizeForDocument(lookAhead.Text), 120), Chr(13), "\\r") & IIf(Len(lookAhead.Text) > 120, "...", "") & "'"
+                Debug.Print "    [PipeSearch]    lookAhead=" & lookAhead.Start & "-" & lookAhead.End & " preview='" & Replace(Left$(VAHelpers.NormalizeForDocument(lookAhead.Text), 120), Chr(13), "\\r") & IIf(Len(lookAhead.Text) > 120, "...", "") & "'"
 
                 If IsSkippablePipeSegment(nextSeg) Then
                     Debug.Print "    [PipeSearch]    SKIP seg(" & seqIdx & ") (skippable)"
@@ -5780,8 +5787,8 @@ Private Function FindLongString(ByVal searchString As String, ByVal searchRange 
             ' Normalize both strings for comparison to handle whitespace variations
             Dim normalizedCheck As String
             Dim normalizedEnd As String
-            normalizedCheck = NormalizeForDocument(checkRange.Text)
-            normalizedEnd = NormalizeForDocument(endPart)
+            normalizedCheck = VAHelpers.NormalizeForDocument(checkRange.Text)
+            normalizedEnd = VAHelpers.NormalizeForDocument(endPart)
 
             ' Use a direct string comparison
             If normalizedCheck = normalizedEnd Then
@@ -5877,8 +5884,8 @@ Private Function FuzzyFindString(ByVal searchString As String, ByVal searchRange
             ' Normalize both strings and compare
             Dim normalizedTest As String
             Dim normalizedSearch As String
-            normalizedTest = NormalizeForDocument(testRange.Text)
-            normalizedSearch = NormalizeForDocument(searchString)
+            normalizedTest = VAHelpers.NormalizeForDocument(testRange.Text)
+            normalizedSearch = VAHelpers.NormalizeForDocument(searchString)
 
             ' Check if the search string is contained in the test range
             If InStr(1, normalizedTest, normalizedSearch, IIf(matchCase, vbBinaryCompare, vbTextCompare)) > 0 Then
@@ -5932,8 +5939,8 @@ Private Function CalculateWordOverlap(ByVal searchText As String, ByVal foundTex
     commonWords = "|the|and|for|with|from|that|this|have|been|were|will|would|could|should|are|was|has|had|"
 
     ' Clean and normalize both texts
-    cleanSearch = NormalizeForDocument(searchText)
-    cleanFound = NormalizeForDocument(foundText)
+    cleanSearch = VAHelpers.NormalizeForDocument(searchText)
+    cleanFound = VAHelpers.NormalizeForDocument(foundText)
 
     ' Remove punctuation
     cleanSearch = Replace(cleanSearch, ",", " ")
@@ -6144,7 +6151,7 @@ Private Function IsFormattingAlreadyApplied(ByVal targetRange As Range, ByVal re
     ParseFormattingTags replaceText, plainText, segments
     
     ' First check: Does the plain text match (normalized, case-insensitive)?
-    If NormalizeForDocument(targetRange.Text) <> NormalizeForDocument(plainText) Then
+    If VAHelpers.NormalizeForDocument(targetRange.Text) <> VAHelpers.NormalizeForDocument(plainText) Then
         ' Text content is different, so we need to apply the change
         Debug.Print "    - Text differs: '" & targetRange.Text & "' vs '" & plainText & "'"
         IsFormattingAlreadyApplied = False
@@ -7182,7 +7189,7 @@ Private Sub InsertTableRow(ByVal actionObject As Object, _
     Dim context As String
     context = GetSuggestionContextText(topLevelSuggestion)
     Dim contextForSearch As String
-    contextForSearch = NormalizeForDocument(context)
+    contextForSearch = VAHelpers.NormalizeForDocument(context)
 
     Dim searchRange As Range
     Set searchRange = ActiveDocument.Content
@@ -7292,7 +7299,7 @@ Private Sub DeleteTableRow(ByVal actionObject As Object, _
     Dim context As String
     context = GetSuggestionContextText(topLevelSuggestion)
     Dim contextForSearch As String
-    contextForSearch = NormalizeForDocument(context)
+    contextForSearch = VAHelpers.NormalizeForDocument(context)
 
     Dim searchRange As Range
     Set searchRange = ActiveDocument.Content
@@ -7434,7 +7441,8 @@ Private Sub StartAiReview()
 
     ' This sub launches the modeless review form.
 
-    Dim reviewForm As New frmReviewer
+    Dim reviewForm As Object
+    Set reviewForm = CreateNamedUserForm("frmReviewer")
     reviewForm.Show
 End Sub
 
@@ -8441,11 +8449,11 @@ Private Function IsToolCallNoOp(ByVal callObj As Object, ByVal targetRange As Ra
     If HasDictionaryKey(argsObj, "match_case") Then matchCase = CBool(argsObj("match_case"))
 
     Dim foundRange As Range
-    Set foundRange = FindLongString(NormalizeForDocument(findText), targetRange, matchCase)
+    Set foundRange = FindLongString(VAHelpers.NormalizeForDocument(findText), targetRange, matchCase)
     If foundRange Is Nothing Then
         ' Safe rerun path: if the replacement text is already present in the target,
         ' treat this as a no-op rather than a failure on subsequent apply_all passes.
-        Set foundRange = FindLongString(NormalizeForDocument(replaceText), targetRange, matchCase)
+        Set foundRange = FindLongString(VAHelpers.NormalizeForDocument(replaceText), targetRange, matchCase)
         If foundRange Is Nothing Then Exit Function
     End If
 
@@ -8971,7 +8979,8 @@ Public Sub V4_CopyDocumentMapToClipboard()
 End Sub
 
 Public Sub V4_ValidateToolCallsJson()
-    Dim inputForm As New frmJsonInput
+    Dim inputForm As Object
+    Set inputForm = CreateNamedUserForm("frmJsonInput")
     inputForm.Show vbModal
     If Len(Trim$(inputForm.txtJson.Value)) = 0 Then Exit Sub
     Call V4_ValidateToolCallsJsonText(inputForm.txtJson.Value, True)
@@ -9008,14 +9017,16 @@ Public Function V4_GetLastRunReportPath() As String
 End Function
 
 Public Sub V4_ApplyToolCalls()
-    Dim inputForm As New frmJsonInput
+    Dim inputForm As Object
+    Set inputForm = CreateNamedUserForm("frmJsonInput")
     inputForm.Show vbModal
     If Len(Trim$(inputForm.txtJson.Value)) = 0 Then Exit Sub
     Call RunToolCallsInternal(inputForm.txtJson.Value, False)
 End Sub
 
 Public Sub V4_RunInteractiveReview()
-    Dim inputForm As New frmJsonInput
+    Dim inputForm As Object
+    Set inputForm = CreateNamedUserForm("frmJsonInput")
     inputForm.Show vbModal
     If Len(Trim$(inputForm.txtJson.Value)) = 0 Then Exit Sub
     Call RunToolCallsInternal(inputForm.txtJson.Value, True)
@@ -9036,7 +9047,7 @@ End Sub
 ' These subs read/write JSON to a temp folder instead of clipboard/form,
 ' enabling automated review via Claude Code's report-checking skill.
 '
-' Exchange folder: G:\My Drive\ai-skills\projects\{job folder}\ when job context is available.
+' Exchange folder: G:\My Drive\Venta AI\projects\{job folder}\ when job context is available.
 ' Fallback folder: %TEMP%\claude_review\
 ' Export files:    {doc_stem}_dsm.md / {doc_stem}_dsm.json
 ' Import file:     {doc_stem}_toolcalls.json  (LLM-generated tool calls)
@@ -9138,7 +9149,7 @@ Fail:
 End Function
 
 Private Function GetAiProjectFolder() As String
-    Const PROJECTS_ROOT As String = "G:\My Drive\ai-skills\projects\"
+    Const PROJECTS_ROOT As String = "G:\My Drive\Venta AI\projects\"
 
     Dim projectsRoot As String
     Dim jobNumber As String
