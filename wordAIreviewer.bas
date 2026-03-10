@@ -943,6 +943,163 @@ Fail:
     Set GetCellContentRange = Nothing
 End Function
 
+Private Function GetParagraphContentRange(ByVal para As Paragraph) As Range
+    ' Returns paragraph content without the trailing paragraph mark.
+
+    On Error GoTo Fail
+
+    Dim rng As Range
+    Set rng = para.Range.Duplicate
+
+    Do While rng.End > rng.Start
+        If Right$(rng.Text, 1) = Chr$(13) Then
+            rng.End = rng.End - 1
+        Else
+            Exit Do
+        End If
+    Loop
+
+    Set GetParagraphContentRange = rng
+    Exit Function
+
+Fail:
+    Set GetParagraphContentRange = Nothing
+End Function
+
+Private Function NormalizeForInlineComparison(ByVal value As String) As String
+    Dim result As String
+
+    result = VAHelpers.NormalizeForDocument(value)
+    result = Replace(result, Chr$(13), " ")
+
+    Do While InStr(result, "  ") > 0
+        result = Replace(result, "  ", " ")
+    Loop
+
+    NormalizeForInlineComparison = Trim$(result)
+End Function
+
+Private Function TextEqualsForComparison(ByVal leftText As String, ByVal rightText As String, ByVal matchCase As Boolean) As Boolean
+    TextEqualsForComparison = (StrComp(leftText, rightText, IIf(matchCase, vbBinaryCompare, vbTextCompare)) = 0)
+End Function
+
+Private Sub ComputeSimpleTextDelta(ByVal oldText As String, ByVal newText As String, ByRef oldMiddle As String, ByRef newMiddle As String)
+    Dim prefixLen As Long
+    Dim suffixLen As Long
+    Dim oldLen As Long
+    Dim newLen As Long
+
+    oldLen = Len(oldText)
+    newLen = Len(newText)
+
+    Do While prefixLen < oldLen And prefixLen < newLen
+        If Mid$(oldText, prefixLen + 1, 1) <> Mid$(newText, prefixLen + 1, 1) Then Exit Do
+        prefixLen = prefixLen + 1
+    Loop
+
+    Do While suffixLen < (oldLen - prefixLen) And suffixLen < (newLen - prefixLen)
+        If Mid$(oldText, oldLen - suffixLen, 1) <> Mid$(newText, newLen - suffixLen, 1) Then Exit Do
+        suffixLen = suffixLen + 1
+    Loop
+
+    oldMiddle = Mid$(oldText, prefixLen + 1, oldLen - prefixLen - suffixLen)
+    newMiddle = Mid$(newText, prefixLen + 1, newLen - prefixLen - suffixLen)
+End Sub
+
+Private Function TryResolveDirectReplaceFallback(ByVal targetRange As Range, _
+                                                 ByVal findText As String, _
+                                                 ByVal replaceText As String, _
+                                                 ByVal matchCase As Boolean, _
+                                                 ByRef actionRange As Range, _
+                                                 ByRef effectiveReplaceText As String) As Boolean
+    ' Fallback for resolved targets when Word Find cannot match the exact range text.
+    ' This covers:
+    ' 1) single-cell values like "47 dB" where .Find fails on a trimmed content range
+    ' 2) multi-line cells where the toolcall flattened paragraph breaks into spaces
+
+    On Error GoTo Fail
+
+    Dim targetText As String
+    Dim targetNorm As String
+    Dim findNorm As String
+    Dim targetInline As String
+    Dim findInline As String
+    Dim replaceInline As String
+
+    targetText = GetRangeTextFinalView(targetRange)
+    targetNorm = VAHelpers.NormalizeForDocument(targetText)
+    findNorm = VAHelpers.NormalizeForDocument(findText)
+
+    effectiveReplaceText = replaceText
+
+    If TextEqualsForComparison(targetNorm, findNorm, matchCase) Then
+        Set actionRange = targetRange.Duplicate
+        TryResolveDirectReplaceFallback = True
+        Exit Function
+    End If
+
+    targetInline = NormalizeForInlineComparison(targetText)
+    findInline = NormalizeForInlineComparison(findText)
+
+    If Not TextEqualsForComparison(targetInline, findInline, matchCase) Then Exit Function
+
+    If InStr(targetText, Chr$(13)) = 0 Then
+        Set actionRange = targetRange.Duplicate
+        TryResolveDirectReplaceFallback = True
+        Exit Function
+    End If
+
+    replaceInline = NormalizeForInlineComparison(replaceText)
+
+    Dim oldDelta As String
+    Dim newDelta As String
+    ComputeSimpleTextDelta findInline, replaceInline, oldDelta, newDelta
+    If Len(oldDelta) = 0 Then Exit Function
+
+    Dim para As Paragraph
+    Dim paraRange As Range
+    Dim paraText As String
+    Dim compareMode As Long
+    compareMode = IIf(matchCase, vbBinaryCompare, vbTextCompare)
+
+    For Each para In targetRange.Paragraphs
+        Set paraRange = GetParagraphContentRange(para)
+        If paraRange Is Nothing Then GoTo NextParagraph
+
+        paraText = paraRange.Text
+        If InStr(1, NormalizeForInlineComparison(paraText), oldDelta, compareMode) > 0 Then
+            Dim deltaRange As Range
+            Set deltaRange = FindLongString(VAHelpers.NormalizeForDocument(oldDelta), paraRange, matchCase)
+
+            If deltaRange Is Nothing Then
+                Dim rawPos As Long
+                rawPos = InStr(1, paraText, oldDelta, compareMode)
+                If rawPos > 0 Then
+                    Set deltaRange = paraRange.Duplicate
+                    deltaRange.Start = deltaRange.Start + rawPos - 1
+                    deltaRange.End = deltaRange.Start + Len(oldDelta)
+                End If
+            End If
+
+            If Not deltaRange Is Nothing Then
+                Set actionRange = deltaRange
+                effectiveReplaceText = newDelta
+                TryResolveDirectReplaceFallback = True
+                Exit Function
+            End If
+        End If
+
+NextParagraph:
+    Next para
+
+    Exit Function
+
+Fail:
+    Set actionRange = Nothing
+    effectiveReplaceText = replaceText
+    TryResolveDirectReplaceFallback = False
+End Function
+
 ' =========================================================================================
 ' === DOCUMENT STRUCTURE MAP (DSM) FUNCTIONS =============================================
 ' =========================================================================================
@@ -2061,35 +2218,42 @@ Private Function ExecuteReplaceActionV4(ByVal targetRange As Range, ByVal findTe
     On Error GoTo ErrorHandler
     
     Dim actionRange As Range
+    Dim effectiveReplaceText As String
+    effectiveReplaceText = replaceText
+
     Set actionRange = FindLongString(VAHelpers.NormalizeForDocument(findText), targetRange, matchCase)
     If actionRange Is Nothing Then
-        TraceLog "  -> Replace action: text not found in target range"
-        SetLastActionError "TEXT_NOT_FOUND", "Find text was not found inside the resolved target."
-        ExecuteReplaceActionV4 = False
-        Exit Function
+        If TryResolveDirectReplaceFallback(targetRange, findText, replaceText, matchCase, actionRange, effectiveReplaceText) Then
+            TraceLog "  -> Replace action: using direct target fallback"
+        Else
+            TraceLog "  -> Replace action: text not found in target range"
+            SetLastActionError "TEXT_NOT_FOUND", "Find text was not found inside the resolved target."
+            ExecuteReplaceActionV4 = False
+            Exit Function
+        End If
     End If
 
     ' Skip formatting-only changes if target already matches formatting and text.
-    If IsFormattingAlreadyApplied(actionRange, replaceText) Then
+    If IsFormattingAlreadyApplied(actionRange, effectiveReplaceText) Then
         TraceLog "  -> Replace action skipped (already matches): '" & findText & "'"
         ExecuteReplaceActionV4 = True
         Exit Function
     End If
 
-    If InStr(1, replaceText, "<", vbBinaryCompare) > 0 Then
+    If InStr(1, effectiveReplaceText, "<", vbBinaryCompare) > 0 Then
         ' Formatted replacement - parse tags and apply with granular diff
-        ApplyFormattedReplacement actionRange, replaceText
-    ElseIf USE_GRANULAR_DIFF And Len(actionRange.Text) <= 1000 And Len(replaceText) <= 1000 Then
+        ApplyFormattedReplacement actionRange, effectiveReplaceText
+    ElseIf USE_GRANULAR_DIFF And Len(actionRange.Text) <= 1000 And Len(effectiveReplaceText) <= 1000 Then
         ' Plain text - use granular diff for minimal tracked changes
         Dim diffOps As Collection
-        Set diffOps = ComputeDiff(actionRange.Text, replaceText)
+        Set diffOps = ComputeDiff(actionRange.Text, effectiveReplaceText)
         ApplyDiffOperations actionRange, diffOps, Nothing
     Else
         ' Fallback for very long text - wholesale replacement
-        actionRange.Text = replaceText
+        actionRange.Text = effectiveReplaceText
     End If
 
-    TraceLog "  -> Replace action executed: '" & findText & "' -> '" & replaceText & "'"
+    TraceLog "  -> Replace action executed: '" & findText & "' -> '" & effectiveReplaceText & "'"
     ClearLastActionError
     ExecuteReplaceActionV4 = True
     Exit Function
