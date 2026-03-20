@@ -1367,6 +1367,196 @@ Private Function LimitPreviewText(ByVal text As String, ByVal maxChars As Long) 
     End If
 End Function
 
+Private Function GetHighlightColorName(ByVal highlightIndex As WdColorIndex) As String
+    Select Case highlightIndex
+        Case wdYellow
+            GetHighlightColorName = "yellow"
+        Case wdBrightGreen
+            GetHighlightColorName = "green"
+        Case wdTurquoise
+            GetHighlightColorName = "turquoise"
+        Case wdPink
+            GetHighlightColorName = "pink"
+        Case wdBlue
+            GetHighlightColorName = "blue"
+        Case wdRed
+            GetHighlightColorName = "red"
+        Case wdDarkBlue
+            GetHighlightColorName = "dark_blue"
+        Case wdTeal
+            GetHighlightColorName = "teal"
+        Case wdGreen
+            GetHighlightColorName = "dark_green"
+        Case wdViolet
+            GetHighlightColorName = "violet"
+        Case wdDarkRed
+            GetHighlightColorName = "dark_red"
+        Case wdDarkYellow
+            GetHighlightColorName = "dark_yellow"
+        Case wdGray50
+            GetHighlightColorName = "gray50"
+        Case wdGray25
+            GetHighlightColorName = "gray25"
+        Case Else
+            GetHighlightColorName = ""
+    End Select
+End Function
+
+Private Function RangeHasAnyHighlight(ByVal sourceRange As Range) As Boolean
+    On Error GoTo Fail
+
+    If sourceRange Is Nothing Then Exit Function
+    RangeHasAnyHighlight = (sourceRange.HighlightColorIndex <> wdNoHighlight)
+    Exit Function
+
+Fail:
+    RangeHasAnyHighlight = True
+End Function
+
+Private Function BuildMarkedTextFromRange(ByVal sourceRange As Range) As String
+    On Error GoTo Fail
+
+    Dim plainText As String
+    plainText = sourceRange.Text
+    If Len(plainText) = 0 Then Exit Function
+
+    If Not RangeHasAnyHighlight(sourceRange) Then
+        BuildMarkedTextFromRange = plainText
+        Exit Function
+    End If
+
+    Dim i As Long
+    Dim out As String
+    Dim inMark As Boolean
+
+    For i = 1 To Len(plainText)
+        Dim chRange As Range
+        Set chRange = sourceRange.Duplicate
+        chRange.Start = sourceRange.Start + i - 1
+        chRange.End = chRange.Start + 1
+
+        Dim isHighlighted As Boolean
+        isHighlighted = (chRange.HighlightColorIndex <> wdNoHighlight)
+
+        If inMark And Not isHighlighted Then
+            out = out & "</mark>"
+            inMark = False
+        End If
+        If isHighlighted And Not inMark Then
+            out = out & "<mark>"
+            inMark = True
+        End If
+
+        out = out & Mid$(plainText, i, 1)
+    Next i
+
+    If inMark Then out = out & "</mark>"
+    BuildMarkedTextFromRange = out
+    Exit Function
+
+Fail:
+    BuildMarkedTextFromRange = sourceRange.Text
+End Function
+
+Private Function BuildMarkedTextFromRangeFinalView(ByVal sourceRange As Range) As String
+    On Error GoTo Fail
+
+    If RangeHasDeletionRevisions(sourceRange) Then
+        BuildMarkedTextFromRangeFinalView = GetRangeTextFinalView(sourceRange)
+    Else
+        BuildMarkedTextFromRangeFinalView = BuildMarkedTextFromRange(sourceRange)
+    End If
+    Exit Function
+
+Fail:
+    BuildMarkedTextFromRangeFinalView = GetRangeTextFinalView(sourceRange)
+End Function
+
+Private Function BuildHighlightSpansJson(ByVal sourceRange As Range) As String
+    On Error GoTo Fail
+
+    Dim plainText As String
+    plainText = sourceRange.Text
+    If Len(plainText) = 0 Then
+        BuildHighlightSpansJson = "[]"
+        Exit Function
+    End If
+
+    If Not RangeHasAnyHighlight(sourceRange) Then
+        BuildHighlightSpansJson = "[]"
+        Exit Function
+    End If
+
+    Dim i As Long
+    Dim spans As String
+    Dim hasRun As Boolean
+    Dim runStart As Long
+    Dim runLen As Long
+    Dim runColor As String
+
+    For i = 1 To Len(plainText)
+        Dim chRange As Range
+        Set chRange = sourceRange.Duplicate
+        chRange.Start = sourceRange.Start + i - 1
+        chRange.End = chRange.Start + 1
+
+        Dim colorName As String
+        colorName = GetHighlightColorName(chRange.HighlightColorIndex)
+
+        If Len(colorName) = 0 Then
+            If hasRun Then
+                spans = spans & IIf(Len(spans) > 0, ",", "") & _
+                    "{""start"":" & runStart & ",""length"":" & runLen & ",""color"":""" & JsonEscape(runColor) & """}"
+                hasRun = False
+            End If
+            GoTo ContinueLoop
+        End If
+
+        If Not hasRun Then
+            runStart = i
+            runLen = 1
+            runColor = colorName
+            hasRun = True
+        ElseIf StrComp(runColor, colorName, vbTextCompare) = 0 Then
+            runLen = runLen + 1
+        Else
+            spans = spans & IIf(Len(spans) > 0, ",", "") & _
+                "{""start"":" & runStart & ",""length"":" & runLen & ",""color"":""" & JsonEscape(runColor) & """}"
+            runStart = i
+            runLen = 1
+            runColor = colorName
+            hasRun = True
+        End If
+
+ContinueLoop:
+    Next i
+
+    If hasRun Then
+        spans = spans & IIf(Len(spans) > 0, ",", "") & _
+            "{""start"":" & runStart & ",""length"":" & runLen & ",""color"":""" & JsonEscape(runColor) & """}"
+    End If
+
+    BuildHighlightSpansJson = "[" & spans & "]"
+    Exit Function
+
+Fail:
+    BuildHighlightSpansJson = "[]"
+End Function
+
+Private Function BuildHighlightSpansJsonFinalView(ByVal sourceRange As Range) As String
+    On Error GoTo Fail
+
+    If RangeHasDeletionRevisions(sourceRange) Then
+        BuildHighlightSpansJsonFinalView = "[]"
+    Else
+        BuildHighlightSpansJsonFinalView = BuildHighlightSpansJson(sourceRange)
+    End If
+    Exit Function
+
+Fail:
+    BuildHighlightSpansJsonFinalView = "[]"
+End Function
+
 Private Function ResolveBodyParagraphRange(ByVal paragraphNum As Long) As Range
     On Error GoTo Fail
 
@@ -1451,6 +1641,121 @@ Private Sub ClearDocumentStructureMap()
     ClearTocFieldRangeCache
 End Sub
 
+Private Sub IncrementStyleCount(ByVal styleCounts As Object, ByVal styleName As String)
+    Dim normalizedStyle As String
+
+    normalizedStyle = Trim$(styleName)
+    If Len(normalizedStyle) = 0 Then Exit Sub
+
+    If styleCounts.Exists(normalizedStyle) Then
+        styleCounts(normalizedStyle) = CLng(styleCounts(normalizedStyle)) + 1
+    Else
+        styleCounts.Add normalizedStyle, 1
+    End If
+End Sub
+
+Private Function GetMostCommonStyleName(ByVal styleCounts As Object) As String
+    Dim key As Variant
+    Dim bestStyle As String
+    Dim bestCount As Long
+    Dim currentCount As Long
+
+    If styleCounts Is Nothing Then Exit Function
+
+    bestStyle = ""
+    bestCount = 0
+
+    For Each key In styleCounts.Keys
+        currentCount = CLng(styleCounts(key))
+        If currentCount > bestCount Then
+            bestCount = currentCount
+            bestStyle = CStr(key)
+        End If
+    Next key
+
+    GetMostCommonStyleName = bestStyle
+End Function
+
+Private Function GetStandardBodyStyleName() As String
+    Dim styleCounts As Object
+    Dim i As Long
+    Dim elem As DocumentElement
+
+    Set styleCounts = NewDictionary()
+
+    For i = 1 To g_DocumentMapCount
+        elem = g_DocumentMap(i)
+        If elem.ElementType = "paragraph" Then
+            If (Not elem.WithinTable) And elem.HeadingLevel = 0 Then
+                IncrementStyleCount styleCounts, elem.StyleName
+            End If
+        End If
+    Next i
+
+    GetStandardBodyStyleName = GetMostCommonStyleName(styleCounts)
+End Function
+
+Private Function GetCellStyleName(ByVal tblCell As Cell) As String
+    On Error GoTo Fail
+
+    Dim para As Paragraph
+    Dim styleStr As String
+
+    For Each para In tblCell.Range.Paragraphs
+        styleStr = ""
+        On Error Resume Next
+        styleStr = para.Style.NameLocal
+        If Err.Number <> 0 Then styleStr = ""
+        Err.Clear
+        On Error GoTo Fail
+
+        styleStr = Trim$(styleStr)
+        If Len(styleStr) > 0 Then
+            GetCellStyleName = styleStr
+            Exit Function
+        End If
+    Next para
+
+    GetCellStyleName = ""
+    Exit Function
+
+Fail:
+    GetCellStyleName = ""
+End Function
+
+Private Function GetStandardTableStyleName(ByVal doc As Document) As String
+    Dim styleCounts As Object
+    Dim tbl As Table
+    Dim tblCell As Cell
+
+    Set styleCounts = NewDictionary()
+
+    For Each tbl In doc.Tables
+        For Each tblCell In tbl.Range.Cells
+            IncrementStyleCount styleCounts, GetCellStyleName(tblCell)
+        Next tblCell
+    Next tbl
+
+    GetStandardTableStyleName = GetMostCommonStyleName(styleCounts)
+End Function
+
+Private Function BuildAnnotatedTag(ByVal elementID As String, ByVal styleName As String, ByVal standardStyleName As String) As String
+    Dim normalizedStyle As String
+    Dim normalizedStandard As String
+
+    normalizedStyle = Trim$(styleName)
+    normalizedStandard = Trim$(standardStyleName)
+
+    If Len(normalizedStyle) > 0 Then
+        If StrComp(normalizedStyle, normalizedStandard, vbTextCompare) <> 0 Then
+            BuildAnnotatedTag = "[" & elementID & "|" & normalizedStyle & "]"
+            Exit Function
+        End If
+    End If
+
+    BuildAnnotatedTag = "[" & elementID & "]"
+End Function
+
 Private Function ExportStructureMapAsMarkdown() As String
     ' Exports the structure map as annotated markdown for the V5 search/replace workflow.
     
@@ -1470,18 +1775,38 @@ Private Function ExportStructureMapAsMarkdown() As String
     Dim elem As DocumentElement
     Dim paraRange As Range
     Dim paraText As String
+    Dim standardBodyStyle As String
+    Dim standardTableStyle As String
+    Dim docHasRevisions As Boolean
     
+    standardBodyStyle = GetStandardBodyStyleName()
+    standardTableStyle = GetStandardTableStyleName(ActiveDocument)
+    docHasRevisions = False
+    On Error Resume Next
+    docHasRevisions = (ActiveDocument.Revisions.Count > 0)
+    Err.Clear
+    On Error GoTo ErrorHandler
+
     output = output & "# DOCUMENT STRUCTURE MAP" & vbCrLf
     output = output & "Generated: " & Format(Now, "yyyy-mm-dd hh:nn:ss") & vbCrLf & vbCrLf
-    output = output & "## Annotated Content" & vbCrLf & vbCrLf
+    output = output & "## Annotated Content" & vbCrLf
+    output = output & "<!-- style:body=" & standardBodyStyle & " | style:table=" & standardTableStyle & " -->" & vbCrLf & vbCrLf
     
     For i = 1 To g_DocumentMapCount
         elem = g_DocumentMap(i)
         
         If elem.ElementType = "paragraph" Then
             Set paraRange = ActiveDocument.Range(elem.StartPos, elem.EndPos)
-            paraText = Trim$(VAHelpers.NormalizeForDocument(GetRangeTextFinalView(paraRange)))
-            output = output & "[" & elem.ElementID & "] " & paraText & vbCrLf & vbCrLf
+            If docHasRevisions Then
+                paraText = Trim$(VAHelpers.NormalizeForDocument(BuildMarkedTextFromRangeFinalView(paraRange)))
+            Else
+                paraText = Trim$(VAHelpers.NormalizeForDocument(BuildMarkedTextFromRange(paraRange)))
+            End If
+            If elem.WithinTable Then
+                output = output & BuildAnnotatedTag(elem.ElementID, elem.StyleName, standardTableStyle) & " " & paraText & vbCrLf & vbCrLf
+            Else
+                output = output & BuildAnnotatedTag(elem.ElementID, elem.StyleName, standardBodyStyle) & " " & paraText & vbCrLf & vbCrLf
+            End If
             
         ElseIf elem.ElementType = "table" Then
             output = output & "## Table " & elem.ElementID
@@ -1489,7 +1814,7 @@ Private Function ExportStructureMapAsMarkdown() As String
                 output = output & ": " & VAHelpers.NormalizeForDocument(elem.TextPreview)
             End If
             output = output & vbCrLf
-            output = output & ExportTableContentPreview(elem.ElementID) & vbCrLf & vbCrLf
+            output = output & ExportTableContentPreview(elem.ElementID, standardTableStyle) & vbCrLf & vbCrLf
         End If
     Next i
     
@@ -1500,278 +1825,7 @@ ErrorHandler:
     ExportStructureMapAsMarkdown = "# ERROR" & vbCrLf & "Failed to export structure map: " & Err.Description
 End Function
 
-Private Sub ExportStructureMapToFile()
-    ' Exports the structure map to a text file in the document's parent folder
-    ' File is named: [DocumentName]_StructureMap.txt
-    
-    On Error GoTo ErrorHandler
-    
-    Dim markdown As String
-    Dim filePath As String
-    Dim docPath As String
-    Dim docName As String
-    Dim parentFolder As String
-    Dim fso As Object
-    Dim fileNum As Integer
-    
-    ' Check if document is saved
-    If ActiveDocument.Path = "" Then
-        MsgBox "Please save the document first before exporting the structure map.", vbExclamation, "Document Not Saved"
-        Exit Sub
-    End If
-    
-    ' Get document path and name
-    docPath = ActiveDocument.FullName
-    docName = ActiveDocument.Name
-    
-    ' Remove extension from document name
-    If InStrRev(docName, ".") > 0 Then
-        docName = Left$(docName, InStrRev(docName, ".") - 1)
-    End If
-    
-    ' Build file path in parent folder
-    parentFolder = ActiveDocument.Path
-    filePath = parentFolder & "\" & docName & "_StructureMap.txt"
-    
-    ' Generate the markdown content
-    markdown = ExportStructureMapAsMarkdown()
-    
-    ' Write to file
-    fileNum = FreeFile
-    Open filePath For Output As #fileNum
-    Print #fileNum, markdown
-    Close #fileNum
-    
-    MsgBox "Structure map exported to:" & vbCrLf & filePath, vbInformation, "Export Complete"
-    Exit Sub
-    
-ErrorHandler:
-    MsgBox "Error exporting structure map: " & Err.Description, vbCritical, "Export Error"
-End Sub
-
-Private Function EscapeMarkdownCellPreview(ByVal cellValue As String) As String
-    Dim normalized As String
-
-    normalized = VAHelpers.NormalizeForDocument(cellValue)
-    normalized = Replace(normalized, vbCrLf, " ")
-    normalized = Replace(normalized, vbCr, " ")
-    normalized = Replace(normalized, vbLf, " ")
-    normalized = Replace(normalized, "|", "\|")
-    normalized = Trim$(normalized)
-
-    EscapeMarkdownCellPreview = normalized
-End Function
-
-Private Function BuildTableRowColKey(ByVal rowNum As Long, ByVal colNum As Long) As String
-    BuildTableRowColKey = CStr(rowNum) & ":" & CStr(colNum)
-End Function
-
-Private Sub ParseTableRowColKey(ByVal key As String, ByRef rowNum As Long, ByRef colNum As Long)
-    On Error GoTo Fail
-
-    Dim parts() As String
-    rowNum = 0
-    colNum = 0
-    parts = Split(key, ":")
-    If UBound(parts) >= 1 Then
-        rowNum = CLng(Val(parts(0)))
-        colNum = CLng(Val(parts(1)))
-    End If
-    Exit Sub
-
-Fail:
-    rowNum = 0
-    colNum = 0
-End Sub
-
-Private Function BuildTableCellTargetID(ByVal tableID As String, ByVal rowNum As Long, ByVal colNum As Long, Optional ByVal forceRowToken As Boolean = False) As String
-    If rowNum = 1 And (Not forceRowToken) Then
-        BuildTableCellTargetID = tableID & ".H.C" & colNum
-    Else
-        BuildTableCellTargetID = tableID & ".R" & rowNum & ".C" & colNum
-    End If
-End Function
-
-Private Function BuildMergedSlotMarker(ByVal anchorTarget As String) As String
-    BuildMergedSlotMarker = DSM_MERGED_SLOT_PREFIX & anchorTarget & DSM_MERGED_SLOT_SUFFIX
-End Function
-
-Private Function IsMergedSlotMarker(ByVal value As String) As Boolean
-    Dim trimmedValue As String
-
-    trimmedValue = Trim$(value)
-    IsMergedSlotMarker = (Left$(trimmedValue, Len(DSM_MERGED_SLOT_PREFIX)) = DSM_MERGED_SLOT_PREFIX And _
-        Right$(trimmedValue, Len(DSM_MERGED_SLOT_SUFFIX)) = DSM_MERGED_SLOT_SUFFIX)
-End Function
-
-Private Function BuildTableSlotAnchorMap(ByVal tbl As Table, ByRef slotAnchorLookup As Object, ByRef anchorSpanLookup As Object, ByRef actualRows As Long, ByRef actualCols As Long) As Boolean
-    On Error GoTo Fail
-
-    Set slotAnchorLookup = NewDictionary()
-    Set anchorSpanLookup = NewDictionary()
-
-    actualRows = GetSafeTableRowCount(tbl)
-    actualCols = GetSafeTableColCount(tbl)
-
-    If actualRows <= 0 Or actualCols <= 0 Then
-        BuildTableSlotAnchorMap = False
-        Exit Function
-    End If
-
-    Dim minRowByAnchor As Object
-    Dim maxRowByAnchor As Object
-    Dim minColByAnchor As Object
-    Dim maxColByAnchor As Object
-    Set minRowByAnchor = NewDictionary()
-    Set maxRowByAnchor = NewDictionary()
-    Set minColByAnchor = NewDictionary()
-    Set maxColByAnchor = NewDictionary()
-
-    Dim r As Long
-    Dim c As Long
-    For r = 1 To actualRows
-        For c = 1 To actualCols
-            Dim resolvedCell As Cell
-            If TryGetTableCell(tbl, r, c, resolvedCell) Then
-                Dim slotKey As String
-                Dim anchorKey As String
-                slotKey = BuildTableRowColKey(r, c)
-                anchorKey = BuildTableRowColKey(resolvedCell.RowIndex, resolvedCell.ColumnIndex)
-
-                If slotAnchorLookup.Exists(slotKey) Then
-                    slotAnchorLookup(slotKey) = anchorKey
-                Else
-                    slotAnchorLookup.Add slotKey, anchorKey
-                End If
-
-                If Not minRowByAnchor.Exists(anchorKey) Then
-                    minRowByAnchor.Add anchorKey, r
-                    maxRowByAnchor.Add anchorKey, r
-                    minColByAnchor.Add anchorKey, c
-                    maxColByAnchor.Add anchorKey, c
-                Else
-                    If CLng(minRowByAnchor(anchorKey)) > r Then minRowByAnchor(anchorKey) = r
-                    If CLng(maxRowByAnchor(anchorKey)) < r Then maxRowByAnchor(anchorKey) = r
-                    If CLng(minColByAnchor(anchorKey)) > c Then minColByAnchor(anchorKey) = c
-                    If CLng(maxColByAnchor(anchorKey)) < c Then maxColByAnchor(anchorKey) = c
-                End If
-            End If
-        Next c
-
-        If r Mod 20 = 0 Then DoEvents
-    Next r
-
-    Dim anchorKeyVar As Variant
-    For Each anchorKeyVar In minRowByAnchor.Keys
-        Dim rowSpan As Long
-        Dim colSpan As Long
-        rowSpan = CLng(maxRowByAnchor(anchorKeyVar)) - CLng(minRowByAnchor(anchorKeyVar)) + 1
-        colSpan = CLng(maxColByAnchor(anchorKeyVar)) - CLng(minColByAnchor(anchorKeyVar)) + 1
-        anchorSpanLookup.Add CStr(anchorKeyVar), CStr(rowSpan) & "x" & CStr(colSpan)
-    Next anchorKeyVar
-
-    BuildTableSlotAnchorMap = True
-    Exit Function
-
-Fail:
-    Set slotAnchorLookup = Nothing
-    Set anchorSpanLookup = Nothing
-    actualRows = 0
-    actualCols = 0
-    BuildTableSlotAnchorMap = False
-End Function
-
-Private Function GetAnchorSpanForKey(ByVal anchorSpanLookup As Object, ByVal anchorKey As String) As String
-    On Error GoTo Fail
-
-    If Not anchorSpanLookup Is Nothing Then
-        If anchorSpanLookup.Exists(anchorKey) Then
-            GetAnchorSpanForKey = CStr(anchorSpanLookup(anchorKey))
-            Exit Function
-        End If
-    End If
-
-Fail:
-    GetAnchorSpanForKey = "1x1"
-End Function
-
-Private Sub ParseTableSpanToken(ByVal spanToken As String, ByRef rowSpan As Long, ByRef colSpan As Long)
-    On Error GoTo Fail
-
-    Dim parts() As String
-    rowSpan = 1
-    colSpan = 1
-
-    parts = Split(LCase$(Trim$(spanToken)), "x")
-    If UBound(parts) >= 1 Then
-        rowSpan = CLng(Val(parts(0)))
-        colSpan = CLng(Val(parts(1)))
-    End If
-
-    If rowSpan <= 0 Then rowSpan = 1
-    If colSpan <= 0 Then colSpan = 1
-    Exit Sub
-
-Fail:
-    rowSpan = 1
-    colSpan = 1
-End Sub
-
-Private Function BuildTableSlotPreviewValue(ByVal tableID As String, ByVal rowNum As Long, ByVal colNum As Long, ByVal anchorTextLookup As Object, ByVal slotAnchorLookup As Object) As String
-    On Error GoTo Fail
-
-    Dim slotKey As String
-    slotKey = BuildTableRowColKey(rowNum, colNum)
-
-    If slotAnchorLookup Is Nothing Then
-        BuildTableSlotPreviewValue = ""
-        Exit Function
-    End If
-
-    If Not slotAnchorLookup.Exists(slotKey) Then
-        If Not anchorTextLookup Is Nothing Then
-            If anchorTextLookup.Exists(slotKey) Then
-                BuildTableSlotPreviewValue = CStr(anchorTextLookup(slotKey))
-            Else
-                BuildTableSlotPreviewValue = ""
-            End If
-        Else
-            BuildTableSlotPreviewValue = ""
-        End If
-        Exit Function
-    End If
-
-    Dim anchorKey As String
-    anchorKey = CStr(slotAnchorLookup(slotKey))
-
-    If StrComp(anchorKey, slotKey, vbBinaryCompare) = 0 Then
-        If Not anchorTextLookup Is Nothing Then
-            If anchorTextLookup.Exists(anchorKey) Then
-                BuildTableSlotPreviewValue = CStr(anchorTextLookup(anchorKey))
-            Else
-                BuildTableSlotPreviewValue = ""
-            End If
-        Else
-            BuildTableSlotPreviewValue = ""
-        End If
-        Exit Function
-    End If
-
-    Dim anchorRow As Long
-    Dim anchorCol As Long
-    ParseTableRowColKey anchorKey, anchorRow, anchorCol
-    If anchorRow > 0 And anchorCol > 0 Then
-        BuildTableSlotPreviewValue = BuildMergedSlotMarker(BuildTableCellTargetID(tableID, anchorRow, anchorCol))
-    Else
-        BuildTableSlotPreviewValue = ""
-    End If
-    Exit Function
-
-Fail:
-    BuildTableSlotPreviewValue = ""
-End Function
-
-Private Function ExportTableContentPreview(ByVal tableID As String) As String
+Private Function ExportTableContentPreview(ByVal tableID As String, ByVal standardTableStyle As String) As String
     ' Exports table content in markdown format for preview
     ' Uses bounded previews to keep DSM generation responsive on large tables.
     
@@ -1796,6 +1850,11 @@ Private Function ExportTableContentPreview(ByVal tableID As String) As String
     Dim cellTarget As String
     Dim mergedSlotCount As Long
     Dim tableKey As Variant
+    Dim anchorStyleLookup As Object
+    Dim cellStyleName As String
+    Dim cellRange As Range
+    Dim cellPreviewText As String
+    Dim docHasRevisions As Boolean
     
     ' Find the table
     Set tbl = ResolveTableByID(tableID)
@@ -1805,11 +1864,27 @@ Private Function ExportTableContentPreview(ByVal tableID As String) As String
     End If
     
     Set anchorTextLookup = NewDictionary()
+    Set anchorStyleLookup = NewDictionary()
+    docHasRevisions = False
+    On Error Resume Next
+    docHasRevisions = (ActiveDocument.Revisions.Count > 0)
+    Err.Clear
+    On Error GoTo Fail
     cellCounter = 0
     For Each tblCell In tbl.Range.Cells
         anchorKey = BuildTableRowColKey(tblCell.RowIndex, tblCell.ColumnIndex)
         If Not anchorTextLookup.Exists(anchorKey) Then
-            anchorTextLookup.Add anchorKey, EscapeMarkdownCellPreview(LimitPreviewText(GetCellTextFinalView(tblCell), DSM_TABLE_CELL_PREVIEW_MAX_CHARS))
+            Set cellRange = GetCellContentRange(tblCell)
+            If cellRange Is Nothing Then
+                cellPreviewText = GetCellTextFinalView(tblCell)
+            ElseIf docHasRevisions Then
+                cellPreviewText = Trim$(BuildMarkedTextFromRangeFinalView(cellRange))
+            Else
+                cellPreviewText = Trim$(BuildMarkedTextFromRange(cellRange))
+            End If
+            anchorTextLookup.Add anchorKey, EscapeMarkdownCellPreview(LimitPreviewText(VAHelpers.NormalizeForDocument(cellPreviewText), DSM_TABLE_CELL_PREVIEW_MAX_CHARS))
+            cellStyleName = GetCellStyleName(tblCell)
+            If Len(cellStyleName) > 0 Then anchorStyleLookup.Add anchorKey, cellStyleName
         End If
         cellCounter = cellCounter + 1
         If cellCounter Mod 100 = 0 Then DoEvents
@@ -1842,7 +1917,10 @@ Private Function ExportTableContentPreview(ByVal tableID As String) As String
         cellTarget = BuildTableCellTargetID(tableID, 1, c)
         cellText = BuildTableSlotPreviewValue(tableID, 1, c, anchorTextLookup, slotAnchorLookup)
         If IsMergedSlotMarker(cellText) Then mergedSlotCount = mergedSlotCount + 1
-        output = output & " [" & cellTarget & "] " & cellText & " |"
+        anchorKey = BuildTableRowColKey(1, c)
+        cellStyleName = ""
+        If anchorStyleLookup.Exists(anchorKey) Then cellStyleName = CStr(anchorStyleLookup(anchorKey))
+        output = output & " " & BuildAnnotatedTag(cellTarget, cellStyleName, standardTableStyle) & " " & cellText & " |"
     Next c
     output = output & vbCrLf & "|"
     For c = 1 To maxCols
@@ -1856,7 +1934,10 @@ Private Function ExportTableContentPreview(ByVal tableID As String) As String
             cellTarget = BuildTableCellTargetID(tableID, r, c)
             cellText = BuildTableSlotPreviewValue(tableID, r, c, anchorTextLookup, slotAnchorLookup)
             If IsMergedSlotMarker(cellText) Then mergedSlotCount = mergedSlotCount + 1
-            output = output & " [" & cellTarget & "] " & cellText & " |"
+            anchorKey = BuildTableRowColKey(r, c)
+            cellStyleName = ""
+            If anchorStyleLookup.Exists(anchorKey) Then cellStyleName = CStr(anchorStyleLookup(anchorKey))
+            output = output & " " & BuildAnnotatedTag(cellTarget, cellStyleName, standardTableStyle) & " " & cellText & " |"
         Next c
         output = output & vbCrLf
         If r Mod 10 = 0 Then DoEvents
@@ -2333,6 +2414,148 @@ ErrorHandler:
     ExecuteDeleteActionV4 = False
 End Function
 
+Private Function NormalizeHighlightFilter(ByVal colorName As String) As String
+    Dim normalized As String
+    normalized = LCase$(Trim$(colorName))
+    normalized = Replace(normalized, "-", "_")
+    normalized = Replace(normalized, " ", "_")
+    NormalizeHighlightFilter = normalized
+End Function
+
+Private Function RangeContainsHighlightColor(ByVal targetRange As Range, ByVal colorFilter As String) As Boolean
+    On Error GoTo Fail
+
+    Dim normalizedFilter As String
+    normalizedFilter = NormalizeHighlightFilter(colorFilter)
+    If Len(normalizedFilter) = 0 Then
+        RangeContainsHighlightColor = RangeHasAnyHighlight(targetRange)
+        Exit Function
+    End If
+
+    Dim i As Long
+    For i = 1 To Len(targetRange.Text)
+        Dim chRange As Range
+        Set chRange = targetRange.Duplicate
+        chRange.Start = targetRange.Start + i - 1
+        chRange.End = chRange.Start + 1
+        If StrComp(GetHighlightColorName(chRange.HighlightColorIndex), normalizedFilter, vbTextCompare) = 0 Then
+            RangeContainsHighlightColor = True
+            Exit Function
+        End If
+    Next i
+    Exit Function
+
+Fail:
+    RangeContainsHighlightColor = False
+End Function
+
+Private Sub ClearHighlightInRange(ByVal targetRange As Range, ByVal colorFilter As String)
+    On Error GoTo Fail
+
+    Dim normalizedFilter As String
+    normalizedFilter = NormalizeHighlightFilter(colorFilter)
+
+    If Len(normalizedFilter) = 0 Then
+        targetRange.HighlightColorIndex = wdNoHighlight
+        Exit Sub
+    End If
+
+    Dim i As Long
+    Dim runStart As Long
+    Dim runLen As Long
+    Dim inRun As Boolean
+
+    For i = 1 To Len(targetRange.Text)
+        Dim chRange As Range
+        Set chRange = targetRange.Duplicate
+        chRange.Start = targetRange.Start + i - 1
+        chRange.End = chRange.Start + 1
+
+        Dim matchesFilter As Boolean
+        matchesFilter = (StrComp(GetHighlightColorName(chRange.HighlightColorIndex), normalizedFilter, vbTextCompare) = 0)
+
+        If matchesFilter Then
+            If Not inRun Then
+                runStart = chRange.Start
+                runLen = 1
+                inRun = True
+            Else
+                runLen = runLen + 1
+            End If
+        ElseIf inRun Then
+            ActiveDocument.Range(runStart, runStart + runLen).HighlightColorIndex = wdNoHighlight
+            inRun = False
+        End If
+    Next i
+
+    If inRun Then
+        ActiveDocument.Range(runStart, runStart + runLen).HighlightColorIndex = wdNoHighlight
+    End If
+    Exit Sub
+
+Fail:
+    targetRange.HighlightColorIndex = wdNoHighlight
+End Sub
+
+Private Function ExecuteClearHighlightActionV4(ByVal targetRange As Range, ByVal findText As String, ByVal colorName As String, _
+    Optional ByVal matchCase As Boolean = False) As Boolean
+    On Error GoTo ErrorHandler
+
+    Dim actionRange As Range
+    If Len(Trim$(findText)) > 0 Then
+        Set actionRange = FindLongString(VAHelpers.NormalizeForDocument(findText), targetRange, matchCase)
+        If actionRange Is Nothing Then
+            SetLastActionError "TEXT_NOT_FOUND", "Find text was not found inside the resolved target."
+            ExecuteClearHighlightActionV4 = False
+            Exit Function
+        End If
+    Else
+        Set actionRange = targetRange.Duplicate
+    End If
+
+    If Len(Trim$(colorName)) > 0 Then
+        If Not RangeContainsHighlightColor(actionRange, colorName) Then
+            SetLastActionError "HIGHLIGHT_NOT_FOUND", "Requested highlight color was not found inside the resolved target."
+            ExecuteClearHighlightActionV4 = False
+            Exit Function
+        End If
+    ElseIf Not RangeHasAnyHighlight(actionRange) Then
+        ClearLastActionError
+        ExecuteClearHighlightActionV4 = True
+        Exit Function
+    End If
+
+    ClearHighlightInRange actionRange, colorName
+    ClearLastActionError
+    ExecuteClearHighlightActionV4 = True
+    Exit Function
+
+ErrorHandler:
+    SetLastActionError "EXECUTION_ERROR", Err.Description
+    ExecuteClearHighlightActionV4 = False
+End Function
+
+Private Function ExecuteDeleteTableActionV4(ByVal targetRange As Range) As Boolean
+    On Error GoTo ErrorHandler
+
+    Dim tbl As Table
+    If targetRange.Tables.Count = 0 Then
+        SetLastActionError "TARGET_NOT_FOUND", "Target does not resolve to a table."
+        ExecuteDeleteTableActionV4 = False
+        Exit Function
+    End If
+
+    Set tbl = targetRange.Tables(1)
+    tbl.Delete
+    ClearLastActionError
+    ExecuteDeleteTableActionV4 = True
+    Exit Function
+
+ErrorHandler:
+    SetLastActionError "EXECUTION_ERROR", Err.Description
+    ExecuteDeleteTableActionV4 = False
+End Function
+
 Private Function ExecuteReplaceTableActionV4(ByVal targetRange As Range, ByVal markdownTable As String) As Boolean
     ' V4 Replace Table action - replaces entire table with new markdown table
     
@@ -2485,6 +2708,7 @@ Private Function ProcessSuggestionV4(ByVal suggestion As Object) As Boolean
     Dim explanation As String
     Dim matchCase As Boolean
     Dim success As Boolean
+    Dim colorName As String
 
     ClearLastActionError
     
@@ -2546,6 +2770,20 @@ Private Function ProcessSuggestionV4(ByVal suggestion As Object) As Boolean
             
         Case "delete"
             success = ExecuteDeleteActionV4(targetRange)
+
+        Case "clear_highlight"
+            findText = GetSuggestionText(suggestion, "find", "")
+            colorName = GetSuggestionText(suggestion, "color", "")
+            matchCase = False
+            If HasDictionaryKey(suggestion, "match_case") Then
+                On Error Resume Next
+                matchCase = CBool(suggestion("match_case"))
+                On Error GoTo ErrorHandler
+            End If
+            success = ExecuteClearHighlightActionV4(targetRange, findText, colorName, matchCase)
+
+        Case "delete_table"
+            success = ExecuteDeleteTableActionV4(targetRange)
             
         Case "replace_table"
             replaceText = GetSuggestionText(suggestion, "replace", "")
@@ -6366,6 +6604,14 @@ Private Function IsFormattingAlreadyApplied(ByVal targetRange As Range, ByVal re
                 IsFormattingAlreadyApplied = False
                 Exit Function
             End If
+
+            If CBool(segment("Highlight")) Then
+                If .HighlightColorIndex = wdNoHighlight Then
+                    Debug.Print "    - Highlight formatting missing at position " & segment("Start")
+                    IsFormattingAlreadyApplied = False
+                    Exit Function
+                End If
+            End If
         End With
     Next segment
     
@@ -6965,6 +7211,7 @@ Private Sub ApplyFormattingToSegments(ByVal targetRange As Range, ByVal segments
                 If segment("Subscript") Then .Subscript = True
                 If segment("Superscript") Then .Superscript = True
             End If
+            If segment("Highlight") Then .HighlightColorIndex = wdYellow
         End With
     Next segment
 
@@ -6991,6 +7238,7 @@ Private Sub ParseFormattingTags(ByVal source As String, ByRef plainText As Strin
     Dim italicLevel As Long
     Dim subLevel As Long
     Dim supLevel As Long
+    Dim markLevel As Long
     plainText = ""
     Set segments = New Collection
     i = 1
@@ -7000,7 +7248,7 @@ Private Sub ParseFormattingTags(ByVal source As String, ByRef plainText As Strin
             closePos = InStr(i, source, ">")
             If closePos = 0 Then
                 plainText = plainText & ch
-                AddFormattedChar segments, Len(plainText), (boldLevel > 0), (italicLevel > 0), (subLevel > 0), (supLevel > 0)
+                AddFormattedChar segments, Len(plainText), (boldLevel > 0), (italicLevel > 0), (subLevel > 0), (supLevel > 0), (markLevel > 0)
                 i = i + 1
             Else
                 tagContent = Mid$(source, i + 1, closePos - i - 1)
@@ -7029,9 +7277,15 @@ Private Sub ParseFormattingTags(ByVal source As String, ByRef plainText As Strin
                     Case "/sup"
                         If supLevel > 0 Then supLevel = supLevel - 1
                         i = closePos + 1
+                    Case "mark"
+                        markLevel = markLevel + 1
+                        i = closePos + 1
+                    Case "/mark"
+                        If markLevel > 0 Then markLevel = markLevel - 1
+                        i = closePos + 1
                     Case Else
                         plainText = plainText & ch
-                        AddFormattedChar segments, Len(plainText), (boldLevel > 0), (italicLevel > 0), (subLevel > 0), (supLevel > 0)
+                        AddFormattedChar segments, Len(plainText), (boldLevel > 0), (italicLevel > 0), (subLevel > 0), (supLevel > 0), (markLevel > 0)
                         i = i + 1
                     End Select
 
@@ -7039,16 +7293,16 @@ Private Sub ParseFormattingTags(ByVal source As String, ByRef plainText As Strin
 
         Else
             plainText = plainText & ch
-            AddFormattedChar segments, Len(plainText), (boldLevel > 0), (italicLevel > 0), (subLevel > 0), (supLevel > 0)
+            AddFormattedChar segments, Len(plainText), (boldLevel > 0), (italicLevel > 0), (subLevel > 0), (supLevel > 0), (markLevel > 0)
             i = i + 1
         End If
 
     Loop
 End Sub
 
-Private Sub AddFormattedChar(ByRef segments As Collection, ByVal charIndex As Long, ByVal isBold As Boolean, ByVal isItalic As Boolean, ByVal isSubscript As Boolean, ByVal isSuperscript As Boolean)
+Private Sub AddFormattedChar(ByRef segments As Collection, ByVal charIndex As Long, ByVal isBold As Boolean, ByVal isItalic As Boolean, ByVal isSubscript As Boolean, ByVal isSuperscript As Boolean, ByVal isHighlight As Boolean)
     If segments Is Nothing Then Exit Sub
-    If Not (isBold Or isItalic Or isSubscript Or isSuperscript) Then Exit Sub
+    If Not (isBold Or isItalic Or isSubscript Or isSuperscript Or isHighlight) Then Exit Sub
     Dim segment As Object
     If segments.Count > 0 Then
         Set segment = segments(segments.Count)
@@ -7056,7 +7310,8 @@ Private Sub AddFormattedChar(ByRef segments As Collection, ByVal charIndex As Lo
             And CBool(segment("Bold")) = isBold _
             And CBool(segment("Italic")) = isItalic _
             And CBool(segment("Subscript")) = isSubscript _
-            And CBool(segment("Superscript")) = isSuperscript Then
+            And CBool(segment("Superscript")) = isSuperscript _
+            And CBool(segment("Highlight")) = isHighlight Then
             segment("Length") = CLng(segment("Length")) + 1
             Exit Sub
         End If
@@ -7070,6 +7325,7 @@ Private Sub AddFormattedChar(ByRef segments As Collection, ByVal charIndex As Lo
     segment("Italic") = isItalic
     segment("Subscript") = isSubscript
     segment("Superscript") = isSuperscript
+    segment("Highlight") = isHighlight
     segments.Add segment
 End Sub
 
@@ -7790,7 +8046,7 @@ Private Function RangeHasAnyInlineFormatting(ByVal sourceRange As Range) As Bool
     End If
 
     With sourceRange.Font
-        If .Bold = 0 And .Italic = 0 And .Subscript = 0 And .Superscript = 0 Then
+        If .Bold = 0 And .Italic = 0 And .Subscript = 0 And .Superscript = 0 And .HighlightColorIndex = wdNoHighlight Then
             RangeHasAnyInlineFormatting = False
         Else
             RangeHasAnyInlineFormatting = True
@@ -7827,6 +8083,7 @@ Private Sub BuildTaggedAndSpansFromRange(ByVal sourceRange As Range, ByRef tagge
     Dim inSup As Boolean
     Dim inBold As Boolean
     Dim inItalic As Boolean
+    Dim inMark As Boolean
     Dim hasRun As Boolean
     Dim runStart As Long
     Dim runLen As Long
@@ -7834,6 +8091,7 @@ Private Sub BuildTaggedAndSpansFromRange(ByVal sourceRange As Range, ByRef tagge
     Dim runSup As Boolean
     Dim runBold As Boolean
     Dim runItalic As Boolean
+    Dim runHighlight As Boolean
 
     For i = 1 To Len(plainText)
         Dim chRange As Range
@@ -7845,18 +8103,22 @@ Private Sub BuildTaggedAndSpansFromRange(ByVal sourceRange As Range, ByRef tagge
         Dim isSup As Boolean
         Dim isBold As Boolean
         Dim isItalic As Boolean
+        Dim isHighlight As Boolean
 
         isSub = (chRange.Font.Subscript = True)
         isSup = (chRange.Font.Superscript = True)
         isBold = (chRange.Font.Bold = True)
         isItalic = (chRange.Font.Italic = True)
+        isHighlight = (chRange.Font.HighlightColorIndex <> wdNoHighlight)
 
         ' Build tagged text.
+        If inMark And Not isHighlight Then out = out & "</mark>": inMark = False
         If inSub And Not isSub Then out = out & "</sub>": inSub = False
         If inSup And Not isSup Then out = out & "</sup>": inSup = False
         If inBold And Not isBold Then out = out & "</b>": inBold = False
         If inItalic And Not isItalic Then out = out & "</i>": inItalic = False
 
+        If isHighlight And Not inMark Then out = out & "<mark>": inMark = True
         If isItalic And Not inItalic Then out = out & "<i>": inItalic = True
         If isBold And Not inBold Then out = out & "<b>": inBold = True
         If isSup And Not inSup Then out = out & "<sup>": inSup = True
@@ -7865,12 +8127,12 @@ Private Sub BuildTaggedAndSpansFromRange(ByVal sourceRange As Range, ByRef tagge
         out = out & Mid$(plainText, i, 1)
 
         ' Build spans.
-        If Not (isSub Or isSup Or isBold Or isItalic) Then
+        If Not (isSub Or isSup Or isBold Or isItalic Or isHighlight) Then
             If hasRun Then
                 spans = spans & IIf(Len(spans) > 0, ",", "") & _
                     "{""start"":" & runStart & ",""length"":" & runLen & ",""subscript"":" & LCase$(CStr(runSub)) & _
                     ",""superscript"":" & LCase$(CStr(runSup)) & ",""bold"":" & LCase$(CStr(runBold)) & _
-                    ",""italic"":" & LCase$(CStr(runItalic)) & "}"
+                    ",""italic"":" & LCase$(CStr(runItalic)) & ",""highlight"":" & LCase$(CStr(runHighlight)) & "}"
                 hasRun = False
             End If
             GoTo ContinueLoop
@@ -7883,26 +8145,29 @@ Private Sub BuildTaggedAndSpansFromRange(ByVal sourceRange As Range, ByRef tagge
             runSup = isSup
             runBold = isBold
             runItalic = isItalic
+            runHighlight = isHighlight
             hasRun = True
-        ElseIf runSub = isSub And runSup = isSup And runBold = isBold And runItalic = isItalic Then
+        ElseIf runSub = isSub And runSup = isSup And runBold = isBold And runItalic = isItalic And runHighlight = isHighlight Then
             runLen = runLen + 1
         Else
             spans = spans & IIf(Len(spans) > 0, ",", "") & _
                 "{""start"":" & runStart & ",""length"":" & runLen & ",""subscript"":" & LCase$(CStr(runSub)) & _
                 ",""superscript"":" & LCase$(CStr(runSup)) & ",""bold"":" & LCase$(CStr(runBold)) & _
-                ",""italic"":" & LCase$(CStr(runItalic)) & "}"
+                ",""italic"":" & LCase$(CStr(runItalic)) & ",""highlight"":" & LCase$(CStr(runHighlight)) & "}"
             runStart = i
             runLen = 1
             runSub = isSub
             runSup = isSup
             runBold = isBold
             runItalic = isItalic
+            runHighlight = isHighlight
             hasRun = True
         End If
 
 ContinueLoop:
     Next i
 
+    If inMark Then out = out & "</mark>"
     If inSub Then out = out & "</sub>"
     If inSup Then out = out & "</sup>"
     If inBold Then out = out & "</b>"
@@ -7912,7 +8177,7 @@ ContinueLoop:
         spans = spans & IIf(Len(spans) > 0, ",", "") & _
             "{""start"":" & runStart & ",""length"":" & runLen & ",""subscript"":" & LCase$(CStr(runSub)) & _
             ",""superscript"":" & LCase$(CStr(runSup)) & ",""bold"":" & LCase$(CStr(runBold)) & _
-            ",""italic"":" & LCase$(CStr(runItalic)) & "}"
+            ",""italic"":" & LCase$(CStr(runItalic)) & ",""highlight"":" & LCase$(CStr(runHighlight)) & "}"
     End If
 
     taggedText = out
@@ -8052,6 +8317,17 @@ Private Sub InitializeToolRegistry()
         Array("Supported tokens appear in the tooling.style_tokens list (e.g., heading_l2, table_heading).", _
               "If a VA macro is unavailable the macro falls back to direct Word style application.")
 
+    AddToolDefinition "clear_highlight", "clear_highlight", _
+        "Remove Word highlight from the resolved target or from a specific substring inside it.", _
+        "Target can be any paragraph or table cell reference.", _
+        Empty, _
+        Array("find", "color", "match_case"), _
+        "P12", _
+        "{""find"":""draft only""}", _
+        "Clear editorial highlighting while keeping the text itself unchanged.", _
+        Array("If args.find is omitted the macro clears all highlight in the resolved target.", _
+              "If args.color is supplied it must match a visible highlight color such as yellow or green.")
+
     AddToolDefinition "add_comment", "comment", _
         "Insert a Word comment anchored to the target range.", _
         "Target can be any paragraph, table, row, or cell reference.", _
@@ -8071,6 +8347,16 @@ Private Sub InitializeToolRegistry()
         "{}", _
         "Remove duplicated sentences or redundant cells.", _
         Array("Use sparingly—deleting entire sections should be accompanied by a comment explaining the rationale.")
+
+    AddToolDefinition "delete_table", "delete_table", _
+        "Delete an entire table.", _
+        "Target must be the table ID (T#).", _
+        Empty, _
+        Empty, _
+        "T2", _
+        "{}", _
+        "Remove obsolete or duplicated tables when the whole structure should be deleted.", _
+        Array("Prefer this over delete_range when the intent is to remove the full table object.")
 
     AddToolDefinition "replace_table", "replace_table", _
         "Replace an entire table with markdown content that will be converted to a Word table.", _
@@ -8239,6 +8525,7 @@ Private Function BuildToolingDocumentationJson() As String
         "Paragraph IDs refer to body paragraphs; table cell text should be targeted with T#.R#.C# references.", _
         "Merged-table covered slots may appear as {MERGED->T#.R#.C#}; treat these as pointers and edit the anchor cell target.", _
         "Favour table-specific tools (replace_table, insert_table_row, delete_table_row) for structured data changes.", _
+        "Highlighted text may appear as <mark>...</mark> in DSM markdown; use clear_highlight when highlight should be removed but the text should remain.", _
         "Add comments when recommending manual review steps or when data is missing.", _
         "Keep tool calls atomic—one logical change per entry." _
     )
@@ -8297,17 +8584,20 @@ Private Function ExportStructureMapAsJsonV42() As String
             Dim pFinalText As String
             Dim pTaggedText As String
             Dim pSpansJson As String
+            Dim pHighlightSpansJson As String
             Set pRange = ActiveDocument.Range(elem.StartPos, elem.EndPos)
             If docHasRevisions Then
                 pFinalText = GetRangeTextFinalView(pRange)
                 BuildTaggedAndSpansFromRangeFinalView pRange, pTaggedText, pSpansJson
+                pHighlightSpansJson = BuildHighlightSpansJsonFinalView(pRange)
             Else
                 pFinalText = pRange.Text
                 BuildTaggedAndSpansFromRange pRange, pTaggedText, pSpansJson
+                pHighlightSpansJson = BuildHighlightSpansJson(pRange)
             End If
             elementJson = "{""id"":""" & elem.ElementID & """,""kind"":""paragraph"",""style"":""" & JsonEscape(elem.StyleName) & """,""text_plain"":""" & _
                           JsonEscape(pFinalText) & """,""text_tagged"":""" & JsonEscape(pTaggedText) & _
-                          """,""format_spans"":" & pSpansJson & ",""range"":{""start"":" & elem.StartPos & _
+                          """,""format_spans"":" & pSpansJson & ",""highlight_spans"":" & pHighlightSpansJson & ",""range"":{""start"":" & elem.StartPos & _
                           ",""end"":" & elem.EndPos & "},""section_number"":" & elem.SectionNumber & ",""page_number"":" & elem.PageNumber & _
                           ",""heading_level"":" & elem.HeadingLevel & ",""within_table"":" & LCase$(CStr(elem.WithinTable)) & "}"
         ElseIf elem.ElementType = "table" Then
@@ -8321,6 +8611,7 @@ Private Function ExportStructureMapAsJsonV42() As String
             Dim exportedCellCount As Long
             Dim cellTagged As String
             Dim cellSpans As String
+            Dim cellHighlightSpans As String
             Dim cellTaggedAll As String
             Dim cellSpansAll As String
             Dim slotAnchorLookup As Object
@@ -8353,6 +8644,12 @@ Private Function ExportStructureMapAsJsonV42() As String
                         End If
                         cellTagged = ""
                         cellSpans = "[]"
+                        cellHighlightSpans = "[]"
+                        If docHasRevisions Then
+                            cellHighlightSpans = BuildHighlightSpansJsonFinalView(cellRange)
+                        Else
+                            cellHighlightSpans = BuildHighlightSpansJson(cellRange)
+                        End If
                         If DSM_INCLUDE_TABLE_CELL_TAGGED_TEXT Or DSM_INCLUDE_TABLE_CELL_FORMAT_SPANS Then
                             If docHasRevisions Then
                                 BuildTaggedAndSpansFromRangeFinalView cellRange, cellTaggedAll, cellSpansAll
@@ -8368,7 +8665,7 @@ Private Function ExportStructureMapAsJsonV42() As String
 
                         cellsJson = cellsJson & IIf(Len(cellsJson) > 0, ",", "") & _
                             "{""id"":""" & elem.ElementID & ".R" & tableCell.RowIndex & ".C" & tableCell.ColumnIndex & """,""text_plain"":""" & JsonEscape(cellFinalText) & _
-                            """,""text_tagged"":""" & JsonEscape(cellTagged) & """,""format_spans"":" & cellSpans & ",""rowspan"":" & spanRow & ",""colspan"":" & spanCol & "}"
+                            """,""text_tagged"":""" & JsonEscape(cellTagged) & """,""format_spans"":" & cellSpans & ",""highlight_spans"":" & cellHighlightSpans & ",""rowspan"":" & spanRow & ",""colspan"":" & spanCol & "}"
                     End If
 
                     exportedCellCount = exportedCellCount + 1
@@ -8608,9 +8905,14 @@ Private Function ConvertToolCallToSuggestion(ByVal callObj As Object) As Object
             If HasDictionaryKey(argsObj, "match_case") Then suggestion("match_case") = CBool(argsObj("match_case"))
         Case "apply_style"
             suggestion("style") = GetSuggestionText(argsObj, "style", "")
+        Case "clear_highlight"
+            suggestion("find") = GetSuggestionText(argsObj, "find", "")
+            suggestion("color") = GetSuggestionText(argsObj, "color", "")
+            If HasDictionaryKey(argsObj, "match_case") Then suggestion("match_case") = CBool(argsObj("match_case"))
         Case "add_comment"
             If HasDictionaryKey(argsObj, "text") Then suggestion("explanation") = GetSuggestionText(argsObj, "text", "")
         Case "delete_range"
+        Case "delete_table"
         Case "replace_table"
             suggestion("replace") = GetSuggestionText(argsObj, "markdown", "")
         Case "insert_table_row"
