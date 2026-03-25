@@ -883,6 +883,228 @@ Fail:
     TryGetTableRowRange = False
 End Function
 
+Private Function EscapeMarkdownCellPreview(ByVal cellValue As String) As String
+    Dim normalized As String
+
+    normalized = VAHelpers.NormalizeForDocument(cellValue)
+    normalized = Replace(normalized, vbCrLf, " ")
+    normalized = Replace(normalized, vbCr, " ")
+    normalized = Replace(normalized, vbLf, " ")
+    normalized = Replace(normalized, "|", "\|")
+    normalized = Trim$(normalized)
+
+    EscapeMarkdownCellPreview = normalized
+End Function
+
+Private Function BuildTableRowColKey(ByVal rowNum As Long, ByVal colNum As Long) As String
+    BuildTableRowColKey = CStr(rowNum) & ":" & CStr(colNum)
+End Function
+
+Private Sub ParseTableRowColKey(ByVal key As String, ByRef rowNum As Long, ByRef colNum As Long)
+    On Error GoTo Fail
+
+    Dim parts() As String
+    rowNum = 0
+    colNum = 0
+    parts = Split(key, ":")
+    If UBound(parts) >= 1 Then
+        rowNum = CLng(Val(parts(0)))
+        colNum = CLng(Val(parts(1)))
+    End If
+    Exit Sub
+
+Fail:
+    rowNum = 0
+    colNum = 0
+End Sub
+
+Private Function BuildTableCellTargetID(ByVal tableID As String, ByVal rowNum As Long, ByVal colNum As Long, Optional ByVal forceRowToken As Boolean = False) As String
+    If rowNum = 1 And (Not forceRowToken) Then
+        BuildTableCellTargetID = tableID & ".H.C" & colNum
+    Else
+        BuildTableCellTargetID = tableID & ".R" & rowNum & ".C" & colNum
+    End If
+End Function
+
+Private Function BuildMergedSlotMarker(ByVal anchorTarget As String) As String
+    BuildMergedSlotMarker = DSM_MERGED_SLOT_PREFIX & anchorTarget & DSM_MERGED_SLOT_SUFFIX
+End Function
+
+Private Function IsMergedSlotMarker(ByVal value As String) As Boolean
+    Dim trimmedValue As String
+
+    trimmedValue = Trim$(value)
+    IsMergedSlotMarker = (Left$(trimmedValue, Len(DSM_MERGED_SLOT_PREFIX)) = DSM_MERGED_SLOT_PREFIX And _
+        Right$(trimmedValue, Len(DSM_MERGED_SLOT_SUFFIX)) = DSM_MERGED_SLOT_SUFFIX)
+End Function
+
+Private Function BuildTableSlotAnchorMap(ByVal tbl As Table, ByRef slotAnchorLookup As Object, ByRef anchorSpanLookup As Object, ByRef actualRows As Long, ByRef actualCols As Long) As Boolean
+    On Error GoTo Fail
+
+    Set slotAnchorLookup = NewDictionary()
+    Set anchorSpanLookup = NewDictionary()
+
+    actualRows = GetSafeTableRowCount(tbl)
+    actualCols = GetSafeTableColCount(tbl)
+
+    If actualRows <= 0 Or actualCols <= 0 Then
+        BuildTableSlotAnchorMap = False
+        Exit Function
+    End If
+
+    Dim minRowByAnchor As Object
+    Dim maxRowByAnchor As Object
+    Dim minColByAnchor As Object
+    Dim maxColByAnchor As Object
+    Set minRowByAnchor = NewDictionary()
+    Set maxRowByAnchor = NewDictionary()
+    Set minColByAnchor = NewDictionary()
+    Set maxColByAnchor = NewDictionary()
+
+    Dim r As Long
+    Dim c As Long
+    For r = 1 To actualRows
+        For c = 1 To actualCols
+            Dim resolvedCell As Cell
+            If TryGetTableCell(tbl, r, c, resolvedCell) Then
+                Dim slotKey As String
+                Dim anchorKey As String
+                slotKey = BuildTableRowColKey(r, c)
+                anchorKey = BuildTableRowColKey(resolvedCell.RowIndex, resolvedCell.ColumnIndex)
+
+                If slotAnchorLookup.Exists(slotKey) Then
+                    slotAnchorLookup(slotKey) = anchorKey
+                Else
+                    slotAnchorLookup.Add slotKey, anchorKey
+                End If
+
+                If Not minRowByAnchor.Exists(anchorKey) Then
+                    minRowByAnchor.Add anchorKey, r
+                    maxRowByAnchor.Add anchorKey, r
+                    minColByAnchor.Add anchorKey, c
+                    maxColByAnchor.Add anchorKey, c
+                Else
+                    If CLng(minRowByAnchor(anchorKey)) > r Then minRowByAnchor(anchorKey) = r
+                    If CLng(maxRowByAnchor(anchorKey)) < r Then maxRowByAnchor(anchorKey) = r
+                    If CLng(minColByAnchor(anchorKey)) > c Then minColByAnchor(anchorKey) = c
+                    If CLng(maxColByAnchor(anchorKey)) < c Then maxColByAnchor(anchorKey) = c
+                End If
+            End If
+        Next c
+
+        If r Mod 20 = 0 Then DoEvents
+    Next r
+
+    Dim anchorKeyVar As Variant
+    For Each anchorKeyVar In minRowByAnchor.Keys
+        Dim rowSpan As Long
+        Dim colSpan As Long
+        rowSpan = CLng(maxRowByAnchor(anchorKeyVar)) - CLng(minRowByAnchor(anchorKeyVar)) + 1
+        colSpan = CLng(maxColByAnchor(anchorKeyVar)) - CLng(minColByAnchor(anchorKeyVar)) + 1
+        anchorSpanLookup.Add CStr(anchorKeyVar), CStr(rowSpan) & "x" & CStr(colSpan)
+    Next anchorKeyVar
+
+    BuildTableSlotAnchorMap = True
+    Exit Function
+
+Fail:
+    Set slotAnchorLookup = Nothing
+    Set anchorSpanLookup = Nothing
+    actualRows = 0
+    actualCols = 0
+    BuildTableSlotAnchorMap = False
+End Function
+
+Private Function GetAnchorSpanForKey(ByVal anchorSpanLookup As Object, ByVal anchorKey As String) As String
+    On Error GoTo Fail
+
+    If Not anchorSpanLookup Is Nothing Then
+        If anchorSpanLookup.Exists(anchorKey) Then
+            GetAnchorSpanForKey = CStr(anchorSpanLookup(anchorKey))
+            Exit Function
+        End If
+    End If
+
+Fail:
+    GetAnchorSpanForKey = "1x1"
+End Function
+
+Private Sub ParseTableSpanToken(ByVal spanToken As String, ByRef rowSpan As Long, ByRef colSpan As Long)
+    On Error GoTo Fail
+
+    Dim parts() As String
+    rowSpan = 1
+    colSpan = 1
+
+    parts = Split(LCase$(Trim$(spanToken)), "x")
+    If UBound(parts) >= 1 Then
+        rowSpan = CLng(Val(parts(0)))
+        colSpan = CLng(Val(parts(1)))
+    End If
+
+    If rowSpan <= 0 Then rowSpan = 1
+    If colSpan <= 0 Then colSpan = 1
+    Exit Sub
+
+Fail:
+    rowSpan = 1
+    colSpan = 1
+End Sub
+
+Private Function BuildTableSlotPreviewValue(ByVal tableID As String, ByVal rowNum As Long, ByVal colNum As Long, ByVal anchorTextLookup As Object, ByVal slotAnchorLookup As Object) As String
+    On Error GoTo Fail
+
+    Dim slotKey As String
+    slotKey = BuildTableRowColKey(rowNum, colNum)
+
+    If slotAnchorLookup Is Nothing Then
+        BuildTableSlotPreviewValue = ""
+        Exit Function
+    End If
+
+    If Not slotAnchorLookup.Exists(slotKey) Then
+        If Not anchorTextLookup Is Nothing Then
+            If anchorTextLookup.Exists(slotKey) Then
+                BuildTableSlotPreviewValue = CStr(anchorTextLookup(slotKey))
+            Else
+                BuildTableSlotPreviewValue = ""
+            End If
+        Else
+            BuildTableSlotPreviewValue = ""
+        End If
+        Exit Function
+    End If
+
+    Dim anchorKey As String
+    anchorKey = CStr(slotAnchorLookup(slotKey))
+
+    If StrComp(anchorKey, slotKey, vbBinaryCompare) = 0 Then
+        If Not anchorTextLookup Is Nothing Then
+            If anchorTextLookup.Exists(anchorKey) Then
+                BuildTableSlotPreviewValue = CStr(anchorTextLookup(anchorKey))
+            Else
+                BuildTableSlotPreviewValue = ""
+            End If
+        Else
+            BuildTableSlotPreviewValue = ""
+        End If
+        Exit Function
+    End If
+
+    Dim anchorRow As Long
+    Dim anchorCol As Long
+    ParseTableRowColKey anchorKey, anchorRow, anchorCol
+    If anchorRow > 0 And anchorCol > 0 Then
+        BuildTableSlotPreviewValue = BuildMergedSlotMarker(BuildTableCellTargetID(tableID, anchorRow, anchorCol))
+    Else
+        BuildTableSlotPreviewValue = ""
+    End If
+    Exit Function
+
+Fail:
+    BuildTableSlotPreviewValue = ""
+End Function
+
 Private Function TryGetFirstCellInRow(ByVal tbl As Table, ByVal rowNum As Long, ByRef outCell As Cell) As Boolean
     ' Returns the left-most anchor cell on a logical row.
 
@@ -2324,7 +2546,7 @@ Private Function ExecuteReplaceActionV4(ByVal targetRange As Range, ByVal findTe
     If InStr(1, effectiveReplaceText, "<", vbBinaryCompare) > 0 Then
         ' Formatted replacement - parse tags and apply with granular diff
         ApplyFormattedReplacement actionRange, effectiveReplaceText
-    ElseIf USE_GRANULAR_DIFF And Len(actionRange.Text) <= 1000 And Len(effectiveReplaceText) <= 1000 Then
+    ElseIf USE_GRANULAR_DIFF And ActiveDocument.TrackRevisions And Len(actionRange.Text) <= 1000 And Len(effectiveReplaceText) <= 1000 Then
         ' Plain text - use granular diff for minimal tracked changes
         Dim diffOps As Collection
         Set diffOps = ComputeDiff(actionRange.Text, effectiveReplaceText)
@@ -2690,6 +2912,48 @@ ErrorHandler:
     ExecuteDeleteRowActionV4 = False
 End Function
 
+Private Function ExecuteSetTableCellTextActionV4(ByVal targetRange As Range, ByVal replaceText As String) As Boolean
+    ' V4 Set Table Cell Text action - updates a single cell without changing the table structure
+
+    On Error GoTo ErrorHandler
+
+    Dim cellRange As Range
+
+    If targetRange Is Nothing Then
+        SetLastActionError "TARGET_NOT_FOUND", "Target does not resolve to a table cell."
+        ExecuteSetTableCellTextActionV4 = False
+        Exit Function
+    End If
+
+    If Not targetRange.Information(wdWithinTable) Then
+        SetLastActionError "TARGET_NOT_FOUND", "Target does not resolve to a table cell."
+        ExecuteSetTableCellTextActionV4 = False
+        Exit Function
+    End If
+
+    If targetRange.Cells.Count <> 1 Then
+        SetLastActionError "TARGET_NOT_FOUND", "Target must resolve to a single table cell."
+        ExecuteSetTableCellTextActionV4 = False
+        Exit Function
+    End If
+
+    Set cellRange = GetCellContentRange(targetRange.Cells(1))
+    If cellRange Is Nothing Then
+        SetLastActionError "TARGET_NOT_FOUND", "Target does not resolve to editable cell content."
+        ExecuteSetTableCellTextActionV4 = False
+        Exit Function
+    End If
+
+    cellRange.Text = replaceText
+    ClearLastActionError
+    ExecuteSetTableCellTextActionV4 = True
+    Exit Function
+
+ErrorHandler:
+    SetLastActionError "EXECUTION_ERROR", Err.Description
+    ExecuteSetTableCellTextActionV4 = False
+End Function
+
 ' =========================================================================================
 ' === V4 MAIN PROCESSING FUNCTIONS =======================================================
 ' =========================================================================================
@@ -2781,6 +3045,10 @@ Private Function ProcessSuggestionV4(ByVal suggestion As Object) As Boolean
                 On Error GoTo ErrorHandler
             End If
             success = ExecuteClearHighlightActionV4(targetRange, findText, colorName, matchCase)
+
+        Case "set_table_cell_text"
+            replaceText = GetSuggestionText(suggestion, "replace", "")
+            success = ExecuteSetTableCellTextActionV4(targetRange, replaceText)
 
         Case "delete_table"
             success = ExecuteDeleteTableActionV4(targetRange)
@@ -4269,6 +4537,7 @@ Private Sub ExecuteSingleAction(ByRef overallContextRange As Range, ByVal action
     Dim targetStyle As Style
     Dim styleLookupError As Long
     Dim newTable As Table
+    Dim cellTextRange As Range
     Dim actionValue As Variant, targetValue As Variant, replaceValue As Variant, explanationValue As Variant
     Dim occurrenceIndex As Long
     Dim targetForSearch As String
@@ -4510,6 +4779,23 @@ Private Sub ExecuteSingleAction(ByRef overallContextRange As Range, ByVal action
             If explanation <> "" Then
                 'ActiveDocument.Comments.Add Range:=actionRange, Text:="AI Suggestion: " & explanation
             End If
+
+        Case "set_table_cell_text"
+            Debug.Print "Action 'set_table_cell_text': Updating a single table cell."
+            If Not HasDictionaryKey(actionObject, "tableCell") Then
+                Err.Raise vbObjectError + 524, "ExecuteSingleAction", "set_table_cell_text requires 'tableCell' structure."
+            End If
+            If Not actionRange.Information(wdWithinTable) Then
+                Err.Raise vbObjectError + 524, "ExecuteSingleAction", "set_table_cell_text requires a table cell target."
+            End If
+            If actionRange.Cells.Count <> 1 Then
+                Err.Raise vbObjectError + 524, "ExecuteSingleAction", "set_table_cell_text requires a single table cell target."
+            End If
+            Set cellTextRange = GetCellContentRange(actionRange.Cells(1))
+            If cellTextRange Is Nothing Then
+                Err.Raise vbObjectError + 524, "ExecuteSingleAction", "Unable to resolve editable cell content."
+            End If
+            cellTextRange.Text = replaceText
 
         Case "insert_table_row"
             Debug.Print "Action 'insert_table_row': Adding new row to table."
@@ -6081,7 +6367,7 @@ Private Function TrimToWordBoundary(ByVal text As String) As String
     TrimToWordBoundary = Trim$(text)
 End Function
 
-Private Function FindLongString(ByVal searchString As String, ByVal searchRange As Range, _
+Private Function FindLongStringExact(ByVal searchString As String, ByVal searchRange As Range, _
     Optional ByVal matchCase As Boolean = False) As Range
 
     On Error GoTo ErrorHandler
@@ -6121,15 +6407,14 @@ Private Function FindLongString(ByVal searchString As String, ByVal searchRange 
                 ' Check if this match is within a TOC
                 If Not IsRangeInTOC(findInRange) Then
                     ' Valid match outside TOC
-                    Set FindLongString = findInRange
+                    Set FindLongStringExact = findInRange
                     Exit Function
                 End If
                 ' Continue searching past this TOC match
                 findInRange.Collapse wdCollapseEnd
             Loop
 
-            ' No valid match found outside TOC, try fuzzy matching
-            Set FindLongString = FuzzyFindString(searchString, searchRange, matchCase)
+            Set FindLongStringExact = Nothing
         End With
         Exit Function
     End If
@@ -6196,7 +6481,7 @@ Private Function FindLongString(ByVal searchString As String, ByVal searchRange 
             If normalizedCheck = normalizedEnd Then
                 ' Success! Combine the ranges.
                 findInRange.End = checkRange.End
-                Set FindLongString = findInRange
+                Set FindLongStringExact = findInRange
                 Exit Function
             End If
 
@@ -6206,7 +6491,46 @@ ContinueLoop:
         Loop
     End With
 
-    ' If exact match failed, try fuzzy matching for long strings
+    Set FindLongStringExact = Nothing
+    Exit Function
+
+ErrorHandler:
+    Debug.Print "An error occurred in FindLongStringExact: " & Err.Description
+    Set FindLongStringExact = Nothing
+End Function
+
+Private Function FindLongString(ByVal searchString As String, ByVal searchRange As Range, _
+    Optional ByVal matchCase As Boolean = False) As Range
+
+    On Error GoTo ErrorHandler
+
+    Dim exactResult As Range
+    Set exactResult = FindLongStringExact(searchString, searchRange, matchCase)
+    If Not exactResult Is Nothing Then
+        Set FindLongString = exactResult
+        Exit Function
+    End If
+
+    Dim altSearch As String
+
+    altSearch = Replace(searchString, ChrW(8230), "...")
+    If altSearch <> searchString Then
+        Set exactResult = FindLongStringExact(altSearch, searchRange, matchCase)
+        If Not exactResult Is Nothing Then
+            Set FindLongString = exactResult
+            Exit Function
+        End If
+    End If
+
+    altSearch = Replace(searchString, "...", ChrW(8230))
+    If altSearch <> searchString Then
+        Set exactResult = FindLongStringExact(altSearch, searchRange, matchCase)
+        If Not exactResult Is Nothing Then
+            Set FindLongString = exactResult
+            Exit Function
+        End If
+    End If
+
     Set FindLongString = FuzzyFindString(searchString, searchRange, matchCase)
     Exit Function
 
@@ -6606,7 +6930,7 @@ Private Function IsFormattingAlreadyApplied(ByVal targetRange As Range, ByVal re
             End If
 
             If CBool(segment("Highlight")) Then
-                If .HighlightColorIndex = wdNoHighlight Then
+                If checkRange.HighlightColorIndex = wdNoHighlight Then
                     Debug.Print "    - Highlight formatting missing at position " & segment("Start")
                     IsFormattingAlreadyApplied = False
                     Exit Function
@@ -7211,8 +7535,8 @@ Private Sub ApplyFormattingToSegments(ByVal targetRange As Range, ByVal segments
                 If segment("Subscript") Then .Subscript = True
                 If segment("Superscript") Then .Superscript = True
             End If
-            If segment("Highlight") Then .HighlightColorIndex = wdYellow
         End With
+        If segment("Highlight") Then formattedRange.HighlightColorIndex = wdYellow
     Next segment
 
     TraceLog "    [ApplyFormattingToSegments] Formatting applied."
@@ -8046,7 +8370,7 @@ Private Function RangeHasAnyInlineFormatting(ByVal sourceRange As Range) As Bool
     End If
 
     With sourceRange.Font
-        If .Bold = 0 And .Italic = 0 And .Subscript = 0 And .Superscript = 0 And .HighlightColorIndex = wdNoHighlight Then
+        If .Bold = 0 And .Italic = 0 And .Subscript = 0 And .Superscript = 0 And sourceRange.HighlightColorIndex = wdNoHighlight Then
             RangeHasAnyInlineFormatting = False
         Else
             RangeHasAnyInlineFormatting = True
@@ -8109,7 +8433,7 @@ Private Sub BuildTaggedAndSpansFromRange(ByVal sourceRange As Range, ByRef tagge
         isSup = (chRange.Font.Superscript = True)
         isBold = (chRange.Font.Bold = True)
         isItalic = (chRange.Font.Italic = True)
-        isHighlight = (chRange.Font.HighlightColorIndex <> wdNoHighlight)
+        isHighlight = (chRange.HighlightColorIndex <> wdNoHighlight)
 
         ' Build tagged text.
         If inMark And Not isHighlight Then out = out & "</mark>": inMark = False
@@ -8327,6 +8651,16 @@ Private Sub InitializeToolRegistry()
         "Clear editorial highlighting while keeping the text itself unchanged.", _
         Array("If args.find is omitted the macro clears all highlight in the resolved target.", _
               "If args.color is supplied it must match a visible highlight color such as yellow or green.")
+
+    AddToolDefinition "set_table_cell_text", "set_table_cell_text", _
+        "Set the text in a single table cell without changing the table structure.", _
+        "Target must be a table cell reference such as T4.R3.C2.", _
+        Array("text"), _
+        Empty, _
+        "T4.R3.C2", _
+        "{""text"":""Updated cell text""}", _
+        "Use for precise cell updates when row or table replacement would be too blunt.", _
+        Array("Only the resolved cell content is updated; surrounding rows and merges are preserved.")
 
     AddToolDefinition "add_comment", "comment", _
         "Insert a Word comment anchored to the target range.", _
@@ -8909,6 +9243,8 @@ Private Function ConvertToolCallToSuggestion(ByVal callObj As Object) As Object
             suggestion("find") = GetSuggestionText(argsObj, "find", "")
             suggestion("color") = GetSuggestionText(argsObj, "color", "")
             If HasDictionaryKey(argsObj, "match_case") Then suggestion("match_case") = CBool(argsObj("match_case"))
+        Case "set_table_cell_text"
+            suggestion("replace") = GetSuggestionText(argsObj, "text", "")
         Case "add_comment"
             If HasDictionaryKey(argsObj, "text") Then suggestion("explanation") = GetSuggestionText(argsObj, "text", "")
         Case "delete_range"
@@ -9698,6 +10034,19 @@ Private Function GetTimestampSlug() As String
     GetTimestampSlug = Format(Now, "yyyymmdd_hhnnss")
 End Function
 
+Private Sub WriteTextFileUtf8(ByVal filePath As String, ByVal content As String)
+    Dim textStream As Object
+
+    Set textStream = CreateObject("ADODB.Stream")
+    textStream.Type = 2          ' adTypeText
+    textStream.Charset = "utf-8"
+    textStream.Open
+    textStream.WriteText content
+    textStream.SaveToFile filePath, 2  ' adSaveCreateOverWrite
+    textStream.Close
+    Set textStream = Nothing
+End Sub
+
 Public Function V4_ExportDocumentMapToFileEx(Optional ByVal copyToClipboard As Boolean = True, Optional ByVal showMessages As Boolean = False) As String
     ' Exports DSM markdown + JSON to the LLM review exchange folder and returns the markdown path.
     On Error GoTo ErrorHandler
@@ -9726,17 +10075,8 @@ Public Function V4_ExportDocumentMapToFileEx(Optional ByVal copyToClipboard As B
     markdownPath = GetLlmReviewFolder() & GetDocStem() & "_dsm.md"
     jsonPath = GetLlmReviewFolder() & GetDocStem() & "_dsm.json"
 
-    Dim fileNum As Integer
-
-    fileNum = FreeFile
-    Open markdownPath For Output As #fileNum
-    Print #fileNum, markdown
-    Close #fileNum
-
-    fileNum = FreeFile
-    Open jsonPath For Output As #fileNum
-    Print #fileNum, mapJson
-    Close #fileNum
+    WriteTextFileUtf8 markdownPath, markdown
+    WriteTextFileUtf8 jsonPath, mapJson
 
     Debug.Print "V4 DSM export markdown: " & markdownPath
     Debug.Print "V4 DSM export json: " & jsonPath
@@ -9770,7 +10110,8 @@ End Sub
 
 Public Function V4_ImportAndApplyToolCallsEx(Optional ByVal interactive As Boolean = False, _
     Optional ByVal runId As String = "", Optional ByVal showMessages As Boolean = False, _
-    Optional ByVal saveAfterApply As Boolean = False) As String
+    Optional ByVal saveAfterApply As Boolean = False, _
+    Optional ByVal trackChanges As Boolean = True) As String
     ' Reads tool_calls JSON from the LLM review exchange folder and returns run result JSON.
     On Error GoTo ErrorHandler
 
@@ -9817,13 +10158,13 @@ Public Function V4_ImportAndApplyToolCallsEx(Optional ByVal interactive As Boole
 
     Dim previousTrackState As Boolean
     previousTrackState = ActiveDocument.TrackRevisions
-    ActiveDocument.TrackRevisions = True
+    ActiveDocument.TrackRevisions = trackChanges
 
     If showMessages Then
         Dim msg As String
         msg = "Ready to apply tool calls from:" & vbCrLf & toolCallsPath & vbCrLf & vbCrLf & _
               "Backup saved to:" & vbCrLf & backupPath & vbCrLf & vbCrLf & _
-              "Tracked changes: ON" & vbCrLf & vbCrLf & _
+              "Tracked changes: " & IIf(trackChanges, "ON", "OFF") & vbCrLf & vbCrLf & _
               "Run interactive review (Yes) or apply all (No)?"
         Dim result As VbMsgBoxResult
         result = MsgBox(msg, vbYesNoCancel + vbQuestion, "V4 Import & Apply")
@@ -9851,18 +10192,25 @@ Public Function V4_ImportAndApplyToolCallsEx(Optional ByVal interactive As Boole
     V4_ImportAndApplyToolCallsEx = g_LastRunResultJson
 
     If showMessages Then
-        MsgBox "Review complete. Tracked changes are ON." & vbCrLf & _
+        MsgBox "Review complete. Tracked changes were " & IIf(trackChanges, "ON", "OFF") & "." & vbCrLf & _
                "Backup at: " & backupPath, vbInformation, "V4 Import Done"
     End If
+    ActiveDocument.TrackRevisions = previousTrackState
     Exit Function
 
 ErrorHandler:
+    On Error Resume Next
+    ActiveDocument.TrackRevisions = previousTrackState
     If showMessages Then MsgBox "Error importing tool calls: " & Err.Description, vbCritical, "V4 Import Error"
     V4_ImportAndApplyToolCallsEx = ""
 End Function
 
 Public Sub V4_ImportAndApplyToolCalls()
-    Call V4_ImportAndApplyToolCallsEx(interactive:=True, runId:="", showMessages:=True, saveAfterApply:=False)
+    Call V4_ImportAndApplyToolCallsEx(interactive:=True, runId:="", showMessages:=True, saveAfterApply:=False, trackChanges:=True)
+End Sub
+
+Public Sub V4_ImportAndApplyToolCallsNoTrackChanges()
+    Call V4_ImportAndApplyToolCallsEx(interactive:=True, runId:="", showMessages:=True, saveAfterApply:=False, trackChanges:=False)
 End Sub
 
 Public Sub V4_ExportDocumentMap()
@@ -9878,5 +10226,11 @@ End Function
 Public Function V4_ImportAndApplyToolCallsSilent(Optional ByVal runId As String = "") As String
     ' COM-safe import+apply: no message boxes, non-interactive, returns run result JSON or empty string.
     V4_ImportAndApplyToolCallsSilent = V4_ImportAndApplyToolCallsEx( _
-        interactive:=False, runId:=runId, showMessages:=False, saveAfterApply:=True)
+        interactive:=False, runId:=runId, showMessages:=False, saveAfterApply:=True, trackChanges:=True)
+End Function
+
+Public Function V4_ImportAndApplyToolCallsSilentNoTrackChanges(Optional ByVal runId As String = "") As String
+    ' COM-safe import+apply for draft iteration: no message boxes, non-interactive, tracked changes OFF.
+    V4_ImportAndApplyToolCallsSilentNoTrackChanges = V4_ImportAndApplyToolCallsEx( _
+        interactive:=False, runId:=runId, showMessages:=False, saveAfterApply:=True, trackChanges:=False)
 End Function

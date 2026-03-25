@@ -131,6 +131,7 @@ Public Function NormalizeForDocument(ByVal value As String) As String
     result = Replace(result, ChrW(8217), "'")
     result = Replace(result, ChrW(8211), "-")
     result = Replace(result, ChrW(8212), "-")
+    result = Replace(result, ChrW(8230), "...")
 
     Do While InStr(result, "  ") > 0
         result = Replace(result, "  ", " ")
