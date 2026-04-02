@@ -103,6 +103,8 @@ Private g_TableIndexCount As Long
 Private g_TableIndexBuilt As Boolean
 Private g_TocFieldRanges As Collection
 Private g_TocFieldCacheBuilt As Boolean
+Private g_ProtectedFieldRanges As Collection
+Private g_ProtectedFieldCacheBuilt As Boolean
 
 ' =========================================================================================
 ' === DOCUMENT STRUCTURE MAP (DSM) - V4 Architecture =====================================
@@ -477,6 +479,11 @@ Private Sub ClearTocFieldRangeCache()
     g_TocFieldCacheBuilt = False
 End Sub
 
+Private Sub ClearProtectedFieldRangeCache()
+    Set g_ProtectedFieldRanges = Nothing
+    g_ProtectedFieldCacheBuilt = False
+End Sub
+
 Private Sub EnsureTocFieldRangeCache(ByVal doc As Document)
     On Error GoTo Fail
 
@@ -499,6 +506,35 @@ Private Sub EnsureTocFieldRangeCache(ByVal doc As Document)
 Fail:
     Set g_TocFieldRanges = New Collection
     g_TocFieldCacheBuilt = True
+End Sub
+
+Private Sub EnsureProtectedFieldRangeCache(ByVal doc As Document)
+    On Error GoTo Fail
+
+    If g_ProtectedFieldCacheBuilt Then Exit Sub
+
+    Dim fld As field
+    Dim fldRange As Range
+
+    Set g_ProtectedFieldRanges = New Collection
+    For Each fld In doc.Fields
+        On Error Resume Next
+        Set fldRange = fld.Result
+        If Err.Number = 0 Then
+            If Not fldRange Is Nothing Then
+                If fldRange.End > fldRange.Start Then g_ProtectedFieldRanges.Add fldRange.Duplicate
+            End If
+        End If
+        Err.Clear
+        On Error GoTo Fail
+    Next fld
+
+    g_ProtectedFieldCacheBuilt = True
+    Exit Sub
+
+Fail:
+    Set g_ProtectedFieldRanges = New Collection
+    g_ProtectedFieldCacheBuilt = True
 End Sub
 
 ' =========================================================================================
@@ -1256,7 +1292,7 @@ Private Function TryResolveDirectReplaceFallback(ByVal targetRange As Range, _
 
     If TextEqualsForComparison(targetNorm, findNorm, matchCase) Then
         Set actionRange = targetRange.Duplicate
-        TryResolveDirectReplaceFallback = True
+        TryResolveDirectReplaceFallback = Not DoesRangeIntersectProtectedField(actionRange)
         Exit Function
     End If
 
@@ -1267,7 +1303,7 @@ Private Function TryResolveDirectReplaceFallback(ByVal targetRange As Range, _
 
     If InStr(targetText, Chr$(13)) = 0 Then
         Set actionRange = targetRange.Duplicate
-        TryResolveDirectReplaceFallback = True
+        TryResolveDirectReplaceFallback = Not DoesRangeIntersectProtectedField(actionRange)
         Exit Function
     End If
 
@@ -1304,10 +1340,12 @@ Private Function TryResolveDirectReplaceFallback(ByVal targetRange As Range, _
             End If
 
             If Not deltaRange Is Nothing Then
-                Set actionRange = deltaRange
-                effectiveReplaceText = newDelta
-                TryResolveDirectReplaceFallback = True
-                Exit Function
+                If Not DoesRangeIntersectProtectedField(deltaRange) Then
+                    Set actionRange = deltaRange
+                    effectiveReplaceText = newDelta
+                    TryResolveDirectReplaceFallback = True
+                    Exit Function
+                End If
             End If
         End If
 
@@ -1642,7 +1680,17 @@ Private Function BuildMarkedTextFromRange(ByVal sourceRange As Range) As String
     plainText = sourceRange.Text
     If Len(plainText) = 0 Then Exit Function
 
-    If Not RangeHasAnyHighlight(sourceRange) Then
+    ' Fast path: skip character scanning when no highlight, subscript, or superscript
+    Dim needsScan As Boolean
+    needsScan = RangeHasAnyHighlight(sourceRange)
+    If Not needsScan Then
+        On Error Resume Next
+        If sourceRange.Font.Subscript <> 0 Then needsScan = True
+        If sourceRange.Font.Superscript <> 0 Then needsScan = True
+        On Error GoTo Fail
+    End If
+
+    If Not needsScan Then
         BuildMarkedTextFromRange = plainText
         Exit Function
     End If
@@ -1650,6 +1698,8 @@ Private Function BuildMarkedTextFromRange(ByVal sourceRange As Range) As String
     Dim i As Long
     Dim out As String
     Dim inMark As Boolean
+    Dim inSub As Boolean
+    Dim inSup As Boolean
 
     For i = 1 To Len(plainText)
         Dim chRange As Range
@@ -1658,20 +1708,28 @@ Private Function BuildMarkedTextFromRange(ByVal sourceRange As Range) As String
         chRange.End = chRange.Start + 1
 
         Dim isHighlighted As Boolean
+        Dim isSub As Boolean
+        Dim isSup As Boolean
         isHighlighted = (chRange.HighlightColorIndex <> wdNoHighlight)
+        isSub = (chRange.Font.Subscript = True)
+        isSup = (chRange.Font.Superscript = True)
 
-        If inMark And Not isHighlighted Then
-            out = out & "</mark>"
-            inMark = False
-        End If
-        If isHighlighted And Not inMark Then
-            out = out & "<mark>"
-            inMark = True
-        End If
+        ' Close tags no longer active (inner to outer)
+        If inSub And Not isSub Then out = out & "</sub>": inSub = False
+        If inSup And Not isSup Then out = out & "</sup>": inSup = False
+        If inMark And Not isHighlighted Then out = out & "</mark>": inMark = False
+
+        ' Open newly active tags (outer to inner)
+        If isHighlighted And Not inMark Then out = out & "<mark>": inMark = True
+        If isSub And Not inSub Then out = out & "<sub>": inSub = True
+        If isSup And Not inSup Then out = out & "<sup>": inSup = True
 
         out = out & Mid$(plainText, i, 1)
     Next i
 
+    ' Close any remaining open tags
+    If inSub Then out = out & "</sub>"
+    If inSup Then out = out & "</sup>"
     If inMark Then out = out & "</mark>"
     BuildMarkedTextFromRange = out
     Exit Function
@@ -1861,6 +1919,7 @@ Private Sub ClearDocumentStructureMap()
     g_DocumentMapBuilt = False
     Erase g_DocumentMap
     ClearTocFieldRangeCache
+    ClearProtectedFieldRangeCache
 End Sub
 
 Private Sub IncrementStyleCount(ByVal styleCounts As Object, ByVal styleName As String)
@@ -2505,6 +2564,25 @@ End Function
 ' === V4 ACTION EXECUTORS (DSM-Based) ====================================================
 ' =========================================================================================
 
+Private Function StripFormattingTags(ByVal text As String) As String
+    ' Removes inline formatting tags from text, leaving only plain content.
+    ' Used to convert tagged DSM text to searchable plain text for Word Find operations,
+    ' since Word stores subscript/superscript/bold/italic as font properties, not characters.
+    Dim result As String
+    result = text
+    result = Replace(result, "<b>", "")
+    result = Replace(result, "</b>", "")
+    result = Replace(result, "<i>", "")
+    result = Replace(result, "</i>", "")
+    result = Replace(result, "<sub>", "")
+    result = Replace(result, "</sub>", "")
+    result = Replace(result, "<sup>", "")
+    result = Replace(result, "</sup>", "")
+    result = Replace(result, "<mark>", "")
+    result = Replace(result, "</mark>", "")
+    StripFormattingTags = result
+End Function
+
 Private Sub ClearLastActionError()
     g_LastActionErrorCode = ""
     g_LastActionErrorMessage = ""
@@ -2524,15 +2602,27 @@ Private Function ExecuteReplaceActionV4(ByVal targetRange As Range, ByVal findTe
     Dim effectiveReplaceText As String
     effectiveReplaceText = replaceText
 
+    ' Strip formatting tags from find text: Word stores subscript/superscript/bold/italic/highlight
+    ' as font properties, not literal characters, so tagged DSM text would not match raw Word text.
+    findText = StripFormattingTags(findText)
+
     Set actionRange = FindLongString(VAHelpers.NormalizeForDocument(findText), targetRange, matchCase)
     If actionRange Is Nothing Then
         If TryResolveDirectReplaceFallback(targetRange, findText, replaceText, matchCase, actionRange, effectiveReplaceText) Then
             TraceLog "  -> Replace action: using direct target fallback"
         Else
-            TraceLog "  -> Replace action: text not found in target range"
-            SetLastActionError "TEXT_NOT_FOUND", "Find text was not found inside the resolved target."
-            ExecuteReplaceActionV4 = False
-            Exit Function
+            ' Last resort: search the full document for unique text that should only appear once.
+            ' Handles cases where the target range is slightly misaligned (e.g. adjacent tracked changes,
+            ' formatting run boundaries, or subscript/field interactions that shift the scoped range).
+            Set actionRange = FindLongString(VAHelpers.NormalizeForDocument(findText), ActiveDocument.Content, matchCase)
+            If Not actionRange Is Nothing Then
+                TraceLog "  -> Replace action: full-document fallback used (text not found in target range)"
+            Else
+                TraceLog "  -> Replace action: text not found in target range or full document"
+                SetLastActionError "TEXT_NOT_FOUND", "Find text was not found inside the resolved target."
+                ExecuteReplaceActionV4 = False
+                Exit Function
+            End If
         End If
     End If
 
@@ -2540,6 +2630,13 @@ Private Function ExecuteReplaceActionV4(ByVal targetRange As Range, ByVal findTe
     If IsFormattingAlreadyApplied(actionRange, effectiveReplaceText) Then
         TraceLog "  -> Replace action skipped (already matches): '" & findText & "'"
         ExecuteReplaceActionV4 = True
+        Exit Function
+    End If
+
+    If DoesRangeIntersectProtectedField(actionRange) Then
+        TraceLog "  -> Replace action blocked: range intersects protected field result"
+        SetLastActionError "PROTECTED_FIELD_RANGE", "Edit would modify an automatic Word field result and was not applied."
+        ExecuteReplaceActionV4 = False
         Exit Function
     End If
 
@@ -2563,7 +2660,9 @@ Private Function ExecuteReplaceActionV4(ByVal targetRange As Range, ByVal findTe
     
 ErrorHandler:
     TraceLog "  -> Error in ExecuteReplaceActionV4: " & Err.Description
-    SetLastActionError "EXECUTION_ERROR", Err.Description
+    If Len(g_LastActionErrorCode) = 0 Then
+        SetLastActionError "EXECUTION_ERROR", Err.Description
+    End If
     ExecuteReplaceActionV4 = False
 End Function
 
@@ -2724,6 +2823,7 @@ Private Function ExecuteClearHighlightActionV4(ByVal targetRange As Range, ByVal
     On Error GoTo ErrorHandler
 
     Dim actionRange As Range
+    findText = StripFormattingTags(findText)
     If Len(Trim$(findText)) > 0 Then
         Set actionRange = FindLongString(VAHelpers.NormalizeForDocument(findText), targetRange, matchCase)
         If actionRange Is Nothing Then
@@ -3505,7 +3605,7 @@ Private Function IsRangeInTOC(ByVal testRange As Range) As Boolean
 
     Dim fieldRange As Range
     For Each fieldRange In g_TocFieldRanges
-        If testRange.Start >= fieldRange.Start And testRange.Start < fieldRange.End Then
+        If testRange.Start < fieldRange.End And testRange.End > fieldRange.Start Then
             IsRangeInTOC = True
             TraceLog "    -> Skipping match: Range is within TOC at position " & fieldRange.Start
             Exit Function
@@ -3518,6 +3618,45 @@ Private Function IsRangeInTOC(ByVal testRange As Range) As Boolean
 Fail:
     IsRangeInTOC = False
 End Function
+
+Private Function DoesRangeIntersectProtectedField(ByVal testRange As Range) As Boolean
+    On Error GoTo Fail
+
+    If testRange Is Nothing Then
+        DoesRangeIntersectProtectedField = False
+        Exit Function
+    End If
+
+    EnsureProtectedFieldRangeCache testRange.Document
+    If g_ProtectedFieldRanges Is Nothing Then
+        DoesRangeIntersectProtectedField = False
+        Exit Function
+    End If
+
+    Dim fieldRange As Range
+    For Each fieldRange In g_ProtectedFieldRanges
+        If testRange.Start < fieldRange.End And testRange.End > fieldRange.Start Then
+            DoesRangeIntersectProtectedField = True
+            TraceLog "    -> Skipping match: Range intersects protected field at position " & fieldRange.Start
+            Exit Function
+        End If
+    Next fieldRange
+
+    DoesRangeIntersectProtectedField = False
+    Exit Function
+
+Fail:
+    DoesRangeIntersectProtectedField = False
+End Function
+
+Private Sub EnsureRangeSafeForEdit(ByVal targetRange As Range)
+    If targetRange Is Nothing Then Exit Sub
+
+    If DoesRangeIntersectProtectedField(targetRange) Then
+        SetLastActionError "PROTECTED_FIELD_RANGE", "Edit would modify an automatic Word field result and was not applied."
+        Err.Raise vbObjectError + 4201, "wordAIreviewer", g_LastActionErrorMessage
+    End If
+End Sub
 
 Private Function IsSkippablePipeSegment(ByVal segment As String) As Boolean
     Dim t As String
@@ -6064,9 +6203,9 @@ Private Function FindPipeDelimitedContext(ByVal searchString As String, ByVal se
         If matchStart Is Nothing Then Exit Do
         Debug.Print "    [PipeSearch]  firstMatch=" & matchStart.Start & "-" & matchStart.End & " text='" & Replace(Left$(VAHelpers.NormalizeForDocument(matchStart.Text), 80), Chr(13), "\\r") & IIf(Len(matchStart.Text) > 80, "...", "") & "'"
 
-        ' Check if this match is within TOC - skip if so
-        If IsRangeInTOC(matchStart) Then
-            Debug.Print "    [PipeSearch]  Skipping TOC match, advancing cursor"
+        ' Check if this match intersects a protected field result - skip if so
+        If DoesRangeIntersectProtectedField(matchStart) Then
+            Debug.Print "    [PipeSearch]  Skipping protected field match, advancing cursor"
             advanceStart = matchStart.End
             If advanceStart <= searchCursor.Start Then advanceStart = searchCursor.Start + 1
             searchCursor.Start = advanceStart
@@ -6387,7 +6526,7 @@ Private Function FindLongStringExact(ByVal searchString As String, ByVal searchR
             .MatchWholeWord = False
             .MatchAllWordForms = False
 
-            ' Loop to skip TOC matches
+            ' Loop to skip protected field result matches
             Dim shortLoopCounter As Long
             Dim shortLastPos As Long
             shortLoopCounter = 0
@@ -6404,13 +6543,13 @@ Private Function FindLongStringExact(ByVal searchString As String, ByVal searchR
                     Exit Do
                 End If
                 shortLastPos = findInRange.Start
-                ' Check if this match is within a TOC
-                If Not IsRangeInTOC(findInRange) Then
-                    ' Valid match outside TOC
+                ' Check if this match intersects a protected field result
+                If Not DoesRangeIntersectProtectedField(findInRange) Then
+                    ' Valid match outside protected fields
                     Set FindLongStringExact = findInRange
                     Exit Function
                 End If
-                ' Continue searching past this TOC match
+                ' Continue searching past this protected match
                 findInRange.Collapse wdCollapseEnd
             Loop
 
@@ -6452,8 +6591,8 @@ Private Function FindLongStringExact(ByVal searchString As String, ByVal searchR
                 Exit Do
             End If
             longLastPos = findInRange.Start
-            ' Check if this match is within a TOC - skip if so
-            If IsRangeInTOC(findInRange) Then
+            ' Check if this match intersects a protected field result - skip if so
+            If DoesRangeIntersectProtectedField(findInRange) Then
                 findInRange.Collapse wdCollapseEnd
                 GoTo ContinueLoop
             End If
@@ -6481,8 +6620,10 @@ Private Function FindLongStringExact(ByVal searchString As String, ByVal searchR
             If normalizedCheck = normalizedEnd Then
                 ' Success! Combine the ranges.
                 findInRange.End = checkRange.End
-                Set FindLongStringExact = findInRange
-                Exit Function
+                If Not DoesRangeIntersectProtectedField(findInRange) Then
+                    Set FindLongStringExact = findInRange
+                    Exit Function
+                End If
             End If
 
 ContinueLoop:
@@ -6589,8 +6730,8 @@ Private Function FuzzyFindString(ByVal searchString As String, ByVal searchRange
                 Exit Do
             End If
             fuzzyLastPos = findInRange.Start
-            ' Skip if this anchor match is within TOC
-            If IsRangeInTOC(findInRange) Then
+            ' Skip if this anchor match intersects a protected field result
+            If DoesRangeIntersectProtectedField(findInRange) Then
                 findInRange.Collapse wdCollapseEnd
                 GoTo ContinueFuzzySearch
             End If
@@ -6623,8 +6764,8 @@ Private Function FuzzyFindString(ByVal searchString As String, ByVal searchRange
                 testRange.Start = testRange.Start + startPos - 1
                 testRange.End = testRange.Start + Len(searchString)
 
-                ' Double-check that the final result isn't in TOC
-                If Not IsRangeInTOC(testRange) Then
+                ' Double-check that the final result does not hit a protected field
+                If Not DoesRangeIntersectProtectedField(testRange) Then
                     Set FuzzyFindString = testRange
                     Debug.Print "  - FUZZY MATCH: Found using anchor word '" & anchorWord & "'"
                     Exit Function
@@ -6951,6 +7092,8 @@ End Function
 
 Private Sub ApplyFormattedReplacement(ByVal targetRange As Range, ByVal replaceText As String)
     Debug.Print "    - Applying formatted replacement with granular diff support..."
+
+    EnsureRangeSafeForEdit targetRange
 
     ' Step 1: Parse formatting tags from the replacement text
     Dim plainText As String
@@ -7362,6 +7505,18 @@ Private Function ComputeDiff(ByVal oldText As String, ByVal newText As String) A
 End Function
 
 ' Determines whether to use granular diff or fall back to wholesale replacement
+Private Function HasSensitiveInlineFormatting(ByVal formatSegments As Collection) As Boolean
+    If formatSegments Is Nothing Then Exit Function
+
+    Dim segment As Object
+    For Each segment In formatSegments
+        If CBool(segment("Subscript")) Or CBool(segment("Superscript")) Or CBool(segment("Highlight")) Then
+            HasSensitiveInlineFormatting = True
+            Exit Function
+        End If
+    Next segment
+End Function
+
 Private Function ShouldUseGranularDiff(ByVal oldText As String, _
                                        ByVal newText As String, _
                                        ByVal formatSegments As Collection) As Boolean
@@ -7386,14 +7541,23 @@ Private Function ShouldUseGranularDiff(ByVal oldText As String, _
         Exit Function
     End If
 
-    ' Rule 3: Simple formatting (<=  3 segments)? Use granular
+    ' Rule 3: Inline sub/superscript or highlight is fragile under tracked changes because
+    ' formatting spans are calculated against visible text while revision markup can shift the
+    ' underlying character positions. Fall back to wholesale replacement for these cases.
+    If HasSensitiveInlineFormatting(formatSegments) Then
+        TraceLog "    [ShouldUseGranularDiff] Sensitive inline formatting detected, using fallback."
+        ShouldUseGranularDiff = False
+        Exit Function
+    End If
+
+    ' Rule 4: Simple formatting (<=  3 segments)? Use granular
     If formatSegments.Count <= 3 Then
         TraceLog "    [ShouldUseGranularDiff] Simple formatting (" & formatSegments.Count & " segments), using granular diff."
         ShouldUseGranularDiff = True
         Exit Function
     End If
 
-    ' Rule 4: Complex formatting? Use fallback
+    ' Rule 5: Complex formatting? Use fallback
     TraceLog "    [ShouldUseGranularDiff] Complex formatting (" & formatSegments.Count & " segments), using fallback."
     ShouldUseGranularDiff = False
 End Function
@@ -7402,6 +7566,7 @@ End Function
 Private Sub ApplyDiffOperations(ByVal targetRange As Range, _
                                 ByVal diffOps As Collection, _
                                 ByVal formatSegments As Collection)
+    EnsureRangeSafeForEdit targetRange
     TraceLog "    [ApplyDiffOperations] Applying " & diffOps.Count & " diff operations..."
 
     ' Build edits against the ORIGINAL text coordinates, then apply them from the end
@@ -9279,11 +9444,11 @@ Private Function IsToolCallNoOp(ByVal callObj As Object, ByVal targetRange As Ra
     If HasDictionaryKey(argsObj, "match_case") Then matchCase = CBool(argsObj("match_case"))
 
     Dim foundRange As Range
-    Set foundRange = FindLongString(VAHelpers.NormalizeForDocument(findText), targetRange, matchCase)
+    Set foundRange = FindLongString(VAHelpers.NormalizeForDocument(StripFormattingTags(findText)), targetRange, matchCase)
     If foundRange Is Nothing Then
         ' Safe rerun path: if the replacement text is already present in the target,
         ' treat this as a no-op rather than a failure on subsequent apply_all passes.
-        Set foundRange = FindLongString(VAHelpers.NormalizeForDocument(replaceText), targetRange, matchCase)
+        Set foundRange = FindLongString(VAHelpers.NormalizeForDocument(StripFormattingTags(replaceText)), targetRange, matchCase)
         If foundRange Is Nothing Then Exit Function
     End If
 
@@ -9877,13 +10042,15 @@ End Sub
 ' These subs read/write JSON to a temp folder instead of clipboard/form,
 ' enabling automated review via Claude Code's report-checking skill.
 '
-' Exchange folder: G:\My Drive\Venta AI\projects\{job folder}\ when job context is available.
+' Exchange folder: G:\My Drive\Venta AI\projects\{job folder}\report-checking\ when job context is available.
 ' Fallback folder: %TEMP%\claude_review\
 ' Export files:    {doc_stem}_dsm.md / {doc_stem}_dsm.json
 ' Import file:     {doc_stem}_toolcalls.json  (LLM-generated tool calls)
 ' Backup file:     {doc_stem}_backup_YYYYMMDD_HHMMSS.docx (pre-review safety copy)
 '
-' This is now a general LLM review exchange folder rather than a Claude-specific temp folder.
+' The COM-callable Silent functions accept an optional exchangeDir as their first argument so
+' that PowerShell wrapper scripts can pass the resolved path directly. When exchangeDir is
+' omitted (interactive/ribbon use), GetLlmReviewFolder() is used as a fallback.
 ' Keep the resolver simple and defensive because this code is maintained inside a Word template.
 
 Private Function EnsureTrailingSlash(ByVal folderPath As String) As String
@@ -10000,7 +10167,7 @@ Private Function GetAiProjectFolder() As String
         jobFolderName = jobNumber
     End If
 
-    projectFolderPath = projectsRoot & jobFolderName
+    projectFolderPath = projectsRoot & jobFolderName & "\report-checking"
     If EnsureFolderExists(projectFolderPath) Then
         GetAiProjectFolder = EnsureTrailingSlash(projectFolderPath)
     End If
@@ -10047,7 +10214,7 @@ Private Sub WriteTextFileUtf8(ByVal filePath As String, ByVal content As String)
     Set textStream = Nothing
 End Sub
 
-Public Function V4_ExportDocumentMapToFileEx(Optional ByVal copyToClipboard As Boolean = True, Optional ByVal showMessages As Boolean = False) As String
+Public Function V4_ExportDocumentMapToFileEx(Optional ByVal copyToClipboard As Boolean = True, Optional ByVal showMessages As Boolean = False, Optional ByVal exchangeDir As String = "") As String
     ' Exports DSM markdown + JSON to the LLM review exchange folder and returns the markdown path.
     On Error GoTo ErrorHandler
 
@@ -10056,6 +10223,9 @@ Public Function V4_ExportDocumentMapToFileEx(Optional ByVal copyToClipboard As B
         V4_ExportDocumentMapToFileEx = ""
         Exit Function
     End If
+
+    If Len(exchangeDir) = 0 Then exchangeDir = GetLlmReviewFolder()
+    EnsureFolderExists exchangeDir
 
     ClearDocumentStructureMap
     BuildDocumentStructureMap ActiveDocument
@@ -10072,8 +10242,8 @@ Public Function V4_ExportDocumentMapToFileEx(Optional ByVal copyToClipboard As B
 
     Dim markdownPath As String
     Dim jsonPath As String
-    markdownPath = GetLlmReviewFolder() & GetDocStem() & "_dsm.md"
-    jsonPath = GetLlmReviewFolder() & GetDocStem() & "_dsm.json"
+    markdownPath = EnsureTrailingSlash(exchangeDir) & GetDocStem() & "_dsm.md"
+    jsonPath = EnsureTrailingSlash(exchangeDir) & GetDocStem() & "_dsm.json"
 
     WriteTextFileUtf8 markdownPath, markdown
     WriteTextFileUtf8 jsonPath, mapJson
@@ -10111,7 +10281,8 @@ End Sub
 Public Function V4_ImportAndApplyToolCallsEx(Optional ByVal interactive As Boolean = False, _
     Optional ByVal runId As String = "", Optional ByVal showMessages As Boolean = False, _
     Optional ByVal saveAfterApply As Boolean = False, _
-    Optional ByVal trackChanges As Boolean = True) As String
+    Optional ByVal trackChanges As Boolean = True, _
+    Optional ByVal exchangeDir As String = "") As String
     ' Reads tool_calls JSON from the LLM review exchange folder and returns run result JSON.
     On Error GoTo ErrorHandler
 
@@ -10121,16 +10292,33 @@ Public Function V4_ImportAndApplyToolCallsEx(Optional ByVal interactive As Boole
         Exit Function
     End If
 
+    If Len(exchangeDir) = 0 Then exchangeDir = GetLlmReviewFolder()
+
+    Dim previousTrackState As Boolean
+    Dim previousDisplayAlerts As WdAlertLevel
+    Dim previousSaveNormalPrompt As Boolean
+    Dim restoreAlertState As Boolean
+
+    previousDisplayAlerts = Application.DisplayAlerts
+    previousSaveNormalPrompt = Options.SaveNormalPrompt
+    Application.DisplayAlerts = wdAlertsNone
+    Options.SaveNormalPrompt = False
+    restoreAlertState = True
+
     Dim toolCallsPath As String
-    toolCallsPath = GetLlmReviewFolder() & GetDocStem() & "_toolcalls.json"
+    toolCallsPath = EnsureTrailingSlash(exchangeDir) & GetDocStem() & "_toolcalls.json"
     If Dir(toolCallsPath) = "" Then
         If showMessages Then MsgBox "Tool calls file not found:" & vbCrLf & toolCallsPath, vbExclamation, "V4 Import"
+        If restoreAlertState Then
+            Application.DisplayAlerts = previousDisplayAlerts
+            Options.SaveNormalPrompt = previousSaveNormalPrompt
+        End If
         V4_ImportAndApplyToolCallsEx = ""
         Exit Function
     End If
 
     Dim backupPath As String
-    backupPath = GetLlmReviewFolder() & GetDocStem() & "_backup_" & GetTimestampSlug() & ".docx"
+    backupPath = EnsureTrailingSlash(exchangeDir) & GetDocStem() & "_backup_" & GetTimestampSlug() & ".docx"
     ActiveDocument.Save ' Save current state first
     
     ' Safely copy the file using FileSystemObject to avoid Word/Cloud sync locks (Error 70)
@@ -10156,7 +10344,6 @@ Public Function V4_ImportAndApplyToolCallsEx(Optional ByVal interactive As Boole
     adStream.Close
     Set adStream = Nothing
 
-    Dim previousTrackState As Boolean
     previousTrackState = ActiveDocument.TrackRevisions
     ActiveDocument.TrackRevisions = trackChanges
 
@@ -10171,6 +10358,10 @@ Public Function V4_ImportAndApplyToolCallsEx(Optional ByVal interactive As Boole
 
         If result = vbCancel Then
             ActiveDocument.TrackRevisions = previousTrackState
+            If restoreAlertState Then
+                Application.DisplayAlerts = previousDisplayAlerts
+                Options.SaveNormalPrompt = previousSaveNormalPrompt
+            End If
             V4_ImportAndApplyToolCallsEx = ""
             Exit Function
         End If
@@ -10196,11 +10387,19 @@ Public Function V4_ImportAndApplyToolCallsEx(Optional ByVal interactive As Boole
                "Backup at: " & backupPath, vbInformation, "V4 Import Done"
     End If
     ActiveDocument.TrackRevisions = previousTrackState
+    If restoreAlertState Then
+        Application.DisplayAlerts = previousDisplayAlerts
+        Options.SaveNormalPrompt = previousSaveNormalPrompt
+    End If
     Exit Function
 
 ErrorHandler:
     On Error Resume Next
     ActiveDocument.TrackRevisions = previousTrackState
+    If restoreAlertState Then
+        Application.DisplayAlerts = previousDisplayAlerts
+        Options.SaveNormalPrompt = previousSaveNormalPrompt
+    End If
     If showMessages Then MsgBox "Error importing tool calls: " & Err.Description, vbCritical, "V4 Import Error"
     V4_ImportAndApplyToolCallsEx = ""
 End Function
@@ -10218,19 +10417,25 @@ Public Sub V4_ExportDocumentMap()
 End Sub
 
 
-Public Function V4_ExportDocumentMapSilent() As String
+Public Function V4_ExportDocumentMapSilent(Optional ByVal exchangeDir As String = "") As String
     ' COM-safe export: no message boxes, no clipboard, returns markdown path or empty string.
-    V4_ExportDocumentMapSilent = V4_ExportDocumentMapToFileEx(copyToClipboard:=False, showMessages:=False)
+    ' exchangeDir: optional path to the exchange folder. Passed from PS scripts; falls back to
+    '              GetLlmReviewFolder() when called interactively from the ribbon.
+    V4_ExportDocumentMapSilent = V4_ExportDocumentMapToFileEx(copyToClipboard:=False, showMessages:=False, exchangeDir:=exchangeDir)
 End Function
 
-Public Function V4_ImportAndApplyToolCallsSilent(Optional ByVal runId As String = "") As String
+Public Function V4_ImportAndApplyToolCallsSilent(Optional ByVal exchangeDir As String = "", Optional ByVal runId As String = "") As String
     ' COM-safe import+apply: no message boxes, non-interactive, returns run result JSON or empty string.
+    ' exchangeDir: optional path to the exchange folder. Passed from PS scripts; falls back to
+    '              GetLlmReviewFolder() when called interactively from the ribbon.
     V4_ImportAndApplyToolCallsSilent = V4_ImportAndApplyToolCallsEx( _
-        interactive:=False, runId:=runId, showMessages:=False, saveAfterApply:=True, trackChanges:=True)
+        interactive:=False, runId:=runId, showMessages:=False, saveAfterApply:=True, trackChanges:=True, exchangeDir:=exchangeDir)
 End Function
 
-Public Function V4_ImportAndApplyToolCallsSilentNoTrackChanges(Optional ByVal runId As String = "") As String
+Public Function V4_ImportAndApplyToolCallsSilentNoTrackChanges(Optional ByVal exchangeDir As String = "", Optional ByVal runId As String = "") As String
     ' COM-safe import+apply for draft iteration: no message boxes, non-interactive, tracked changes OFF.
+    ' exchangeDir: optional path to the exchange folder. Passed from PS scripts; falls back to
+    '              GetLlmReviewFolder() when called interactively from the ribbon.
     V4_ImportAndApplyToolCallsSilentNoTrackChanges = V4_ImportAndApplyToolCallsEx( _
-        interactive:=False, runId:=runId, showMessages:=False, saveAfterApply:=True, trackChanges:=False)
+        interactive:=False, runId:=runId, showMessages:=False, saveAfterApply:=True, trackChanges:=False, exchangeDir:=exchangeDir)
 End Function
